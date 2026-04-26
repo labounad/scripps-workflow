@@ -347,6 +347,210 @@ def orca_terminated_normally(
 
 
 # --------------------------------------------------------------------
+# Thermochemistry block parsing
+# --------------------------------------------------------------------
+
+
+#: Pattern matching ORCA's ``G-E(el)            ...    -76.345 Eh`` line in
+#: the thermochemistry block. This is the "thermal correction to electronic
+#: energy" — the piece that, when added to a high-level SP energy, gives
+#: the composite Gibbs::
+#:
+#:     G_composite = E_SP_high + (G - E_el)_low
+G_MINUS_E_EL_RE: re.Pattern[str] = re.compile(
+    r"G-E\(el\)\s+\.{3}\s+(-?\d+\.\d+(?:[Ee][+-]?\d+)?)\s+Eh"
+)
+
+
+#: Pattern matching ORCA's ``Final Gibbs free energy   ...   -76.123 Eh``
+#: line (low-level total Gibbs). Used as a fallback when the high-level SP
+#: energy is missing — the aggregator can still publish *something*.
+FINAL_G_RE: re.Pattern[str] = re.compile(
+    r"Final\s+Gibbs\s+free\s+energy\s+\.{3}\s+(-?\d+\.\d+(?:[Ee][+-]?\d+)?)\s+Eh",
+    re.IGNORECASE,
+)
+
+
+#: Pattern matching ``Total enthalpy   ...   -76.345 Eh``.
+TOTAL_H_RE: re.Pattern[str] = re.compile(
+    r"Total\s+enthalpy\s+\.{3}\s+(-?\d+\.\d+(?:[Ee][+-]?\d+)?)\s+Eh",
+    re.IGNORECASE,
+)
+
+
+#: Pattern matching ``Total entropy correction   ...   -0.034 Eh``. Note
+#: ORCA labels this as -T*S so it is already in energy units, not entropy.
+S_CORR_RE: re.Pattern[str] = re.compile(
+    r"Total\s+entropy\s+correction\s+\.{3}\s+(-?\d+\.\d+(?:[Ee][+-]?\d+)?)\s+Eh",
+    re.IGNORECASE,
+)
+
+
+#: Pattern matching ``THERMOCHEMISTRY AT T = 298.15 K``. Used to read back
+#: the exact temperature ORCA computed thermo at, so the aggregator can
+#: warn if the operator's requested ``temperature_k`` doesn't match.
+THERMO_T_RE: re.Pattern[str] = re.compile(
+    r"THERMOCHEMISTRY\s+AT\s+T\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*K",
+    re.IGNORECASE,
+)
+
+
+def _last_float(regex: re.Pattern[str], text: str) -> Optional[float]:
+    """Return the LAST regex match converted to float, or None.
+
+    Used for thermo parsing where compound (freq + SP) outputs may print
+    overlapping markers; the last one is the value computed in the final
+    block, which is what the aggregator wants.
+    """
+    matches = regex.findall(text)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_orca_thermochem(out_path: Path) -> dict[str, Optional[float]]:
+    """Extract thermochemistry numbers from an ``orca.out``.
+
+    Returns a dict with the following keys (any value may be ``None`` if
+    the marker is missing):
+
+        * ``final_sp_energy_eh`` — last ``FINAL SINGLE POINT ENERGY``.
+        * ``g_minus_e_el_eh``   — last ``G-E(el)`` thermal correction.
+        * ``final_g_eh``        — last ``Final Gibbs free energy``.
+        * ``total_h_eh``        — last ``Total enthalpy``.
+        * ``total_entropy_corr_eh`` — last ``Total entropy correction``.
+        * ``temperature_k``     — last ``THERMOCHEMISTRY AT T = ... K``.
+
+    On read errors all values are returned as ``None``. This is the
+    parsing layer used by ``thermo_aggregate``; it is intentionally
+    silent on missing markers — the aggregator decides which combinations
+    of missing values constitute a hard failure.
+    """
+    try:
+        text = Path(out_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {
+            "final_sp_energy_eh": None,
+            "g_minus_e_el_eh": None,
+            "final_g_eh": None,
+            "total_h_eh": None,
+            "total_entropy_corr_eh": None,
+            "temperature_k": None,
+        }
+    return {
+        "final_sp_energy_eh": _last_float(FINAL_E_RE, text),
+        "g_minus_e_el_eh": _last_float(G_MINUS_E_EL_RE, text),
+        "final_g_eh": _last_float(FINAL_G_RE, text),
+        "total_h_eh": _last_float(TOTAL_H_RE, text),
+        "total_entropy_corr_eh": _last_float(S_CORR_RE, text),
+        "temperature_k": _last_float(THERMO_T_RE, text),
+    }
+
+
+def classify_orca_outfile(out_path: Path) -> tuple[bool, bool]:
+    """Inspect an ``orca.out`` and report ``(has_thermo, has_final_e)``.
+
+    ``has_thermo`` is True iff the file contains any of the canonical
+    thermochemistry markers (``GIBBS FREE ENERGY``, ``G-E(el)``, or
+    ``THERMOCHEMISTRY``). ``has_final_e`` is True iff the file contains a
+    ``FINAL SINGLE POINT ENERGY`` line.
+
+    A compound (freq + high-level SP) output has BOTH True; a pure SP
+    output has only ``has_final_e``. Used by :func:`pick_orca_outputs` to
+    pair the right thermo / SP files when a task dir contains multiple.
+    Returns ``(False, False)`` on read errors.
+    """
+    try:
+        text = Path(out_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False, False
+    has_thermo = (
+        "GIBBS FREE ENERGY" in text
+        or "G-E(el)" in text
+        or "THERMOCHEMISTRY" in text
+    )
+    has_final_e = "FINAL SINGLE POINT ENERGY" in text
+    return has_thermo, has_final_e
+
+
+def pick_orca_outputs(
+    task_dir: Path, *, glob: str = "*.out"
+) -> tuple[Optional[Path], Optional[Path]]:
+    """Choose the (thermo_out, sp_out) pair for a task directory.
+
+    Selection rules:
+
+        * If a single ``*.out`` exists it is used for both (the compound
+          freq + SP layout — :mod:`scripps_workflow.nodes.orca_thermo_array`
+          writes exactly this shape).
+        * If multiple ``*.out`` exist, prefer a file with thermo markers
+          for the thermo slot and a file with FINAL E *and no thermo
+          markers* for the SP slot. This matches the legacy
+          ``orca_thermo_aggregator`` behavior, which expected separate
+          freq + SP files when present.
+        * If only a thermo file exists (no separate SP), the thermo file
+          is reused as the SP source — its ``FINAL SINGLE POINT ENERGY``
+          is the low-level SCF energy and downstream code degrades to
+          ``G_composite = G_low``.
+        * If only an SP file exists, ``thermo_out`` falls back to the SP
+          file so the aggregator can attempt to parse — typically yields
+          ``g_minus_e_el_eh = None``, which the aggregator surfaces.
+        * Returns ``(None, None)`` when ``task_dir`` has no ``*.out``
+          files at all.
+
+    The selection is deterministic: candidates are sorted by name, and
+    ties go to the LAST in sorted order (later runs / longer compound
+    files win when an operator iterates).
+    """
+    if not task_dir.is_dir():
+        return None, None
+
+    outs = sorted(task_dir.glob(glob))
+    if not outs:
+        return None, None
+
+    thermo_candidates: list[Path] = []
+    sp_pure_candidates: list[Path] = []
+    sp_fallback: list[Path] = []
+    for p in outs:
+        has_thermo, has_final_e = classify_orca_outfile(p)
+        if has_thermo:
+            thermo_candidates.append(p)
+        if has_final_e and not has_thermo:
+            sp_pure_candidates.append(p)
+        if has_final_e:
+            sp_fallback.append(p)
+
+    thermo_out = thermo_candidates[-1] if thermo_candidates else None
+    sp_out: Optional[Path]
+    if sp_pure_candidates:
+        sp_out = sp_pure_candidates[-1]
+    elif sp_fallback:
+        sp_out = sp_fallback[-1]
+    else:
+        sp_out = None
+
+    if thermo_out is None and sp_out is not None:
+        thermo_out = sp_out
+    if sp_out is None and thermo_out is not None:
+        sp_out = thermo_out
+
+    # File(s) exist but classify found neither thermo nor FINAL E in any
+    # of them — pick the last one as both slots so the aggregator can
+    # parse, fail in a structured way, and surface
+    # ``missing_thermochem_or_energy_for_G``. Returning ``(None, None)``
+    # here would conflate "no files at all" with "files present but
+    # unparseable".
+    if thermo_out is None and sp_out is None:
+        thermo_out = sp_out = outs[-1]
+
+    return thermo_out, sp_out
+
+
+# --------------------------------------------------------------------
 # Aggregation: ensemble.xyz + orca.energies
 # --------------------------------------------------------------------
 
@@ -418,13 +622,21 @@ def write_energy_file(
 
 __all__ = [
     "FINAL_E_RE",
+    "FINAL_G_RE",
+    "G_MINUS_E_EL_RE",
     "HARTREE_TO_KCAL",
     "ORCA_NORMAL_RE",
+    "S_CORR_RE",
+    "THERMO_T_RE",
+    "TOTAL_H_RE",
+    "classify_orca_outfile",
     "concat_xyz_files",
     "make_orca_compound_input",
     "make_orca_simple_input",
     "orca_terminated_normally",
     "parse_orca_final_energy",
+    "parse_orca_thermochem",
+    "pick_orca_outputs",
     "solvent_to_orca_smd",
     "write_energy_file",
 ]

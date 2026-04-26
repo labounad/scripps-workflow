@@ -669,19 +669,304 @@ class TestWriteEnergyFile:
 # --------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------
+# Thermochem block parsing
+# --------------------------------------------------------------------
+
+
+COMPOUND_OUT_TEXT = """\
+... lots of header noise ...
+
+THERMOCHEMISTRY AT T = 298.15 K
+
+Total enthalpy                ...    -76.123456789 Eh
+Total entropy correction      ...    -0.034567890 Eh
+Final Gibbs free energy       ...    -76.158024679 Eh
+
+G-E(el)                       ...    -0.041234567 Eh
+
+------------------------- $new_job ----------------------
+
+FINAL SINGLE POINT ENERGY     -76.987654321
+
+                     ****ORCA TERMINATED NORMALLY****
+"""
+
+# A pure-SP output: no thermo markers, just FINAL E.
+SP_ONLY_OUT_TEXT = """\
+... wB97M-V SP only ...
+
+FINAL SINGLE POINT ENERGY     -76.987654321
+
+                     ****ORCA TERMINATED NORMALLY****
+"""
+
+# A pure-freq output: thermo block + ORCA's "final SCF" FINAL E line, but
+# nothing from a high-level SP job. The aggregator should treat this as
+# "fallback to G_low".
+FREQ_ONLY_OUT_TEXT = """\
+THERMOCHEMISTRY AT T = 310.0 K
+
+Total enthalpy                ...    -76.123456789 Eh
+Total entropy correction      ...    -0.034567890 Eh
+Final Gibbs free energy       ...    -76.158024679 Eh
+
+G-E(el)                       ...    -0.041234567 Eh
+
+FINAL SINGLE POINT ENERGY     -76.099999999
+                     ****ORCA TERMINATED NORMALLY****
+"""
+
+
+class TestThermoRegexes:
+    def test_g_minus_e_el(self):
+        from scripps_workflow.orca import G_MINUS_E_EL_RE
+
+        m = G_MINUS_E_EL_RE.findall(
+            "G-E(el)                       ...    -0.041234567 Eh\n"
+        )
+        assert m == ["-0.041234567"]
+
+    def test_final_g(self):
+        from scripps_workflow.orca import FINAL_G_RE
+
+        m = FINAL_G_RE.findall(
+            "Final Gibbs free energy       ...    -76.158024679 Eh\n"
+        )
+        assert m == ["-76.158024679"]
+
+    def test_total_h(self):
+        from scripps_workflow.orca import TOTAL_H_RE
+
+        m = TOTAL_H_RE.findall(
+            "Total enthalpy                ...    -76.123456789 Eh\n"
+        )
+        assert m == ["-76.123456789"]
+
+    def test_s_corr(self):
+        from scripps_workflow.orca import S_CORR_RE
+
+        m = S_CORR_RE.findall(
+            "Total entropy correction      ...    -0.034567890 Eh\n"
+        )
+        assert m == ["-0.034567890"]
+
+    def test_thermo_t(self):
+        from scripps_workflow.orca import THERMO_T_RE
+
+        m = THERMO_T_RE.findall("THERMOCHEMISTRY AT T = 298.15 K")
+        assert m == ["298.15"]
+        # Integer T (rare but allowed):
+        m2 = THERMO_T_RE.findall("THERMOCHEMISTRY AT T = 310 K")
+        assert m2 == ["310"]
+
+
+class TestParseOrcaThermochem:
+    def test_compound_output(self, tmp_path):
+        from scripps_workflow.orca import parse_orca_thermochem
+
+        p = tmp_path / "compound.out"
+        p.write_text(COMPOUND_OUT_TEXT)
+        d = parse_orca_thermochem(p)
+        assert d["final_sp_energy_eh"] == pytest.approx(-76.987654321)
+        assert d["g_minus_e_el_eh"] == pytest.approx(-0.041234567)
+        assert d["final_g_eh"] == pytest.approx(-76.158024679)
+        assert d["total_h_eh"] == pytest.approx(-76.123456789)
+        assert d["total_entropy_corr_eh"] == pytest.approx(-0.034567890)
+        assert d["temperature_k"] == pytest.approx(298.15)
+
+    def test_sp_only(self, tmp_path):
+        from scripps_workflow.orca import parse_orca_thermochem
+
+        p = tmp_path / "sp.out"
+        p.write_text(SP_ONLY_OUT_TEXT)
+        d = parse_orca_thermochem(p)
+        assert d["final_sp_energy_eh"] == pytest.approx(-76.987654321)
+        # No thermo markers in a pure-SP output.
+        assert d["g_minus_e_el_eh"] is None
+        assert d["final_g_eh"] is None
+        assert d["total_h_eh"] is None
+        assert d["temperature_k"] is None
+
+    def test_freq_only_returns_freq_t(self, tmp_path):
+        from scripps_workflow.orca import parse_orca_thermochem
+
+        p = tmp_path / "freq.out"
+        p.write_text(FREQ_ONLY_OUT_TEXT)
+        d = parse_orca_thermochem(p)
+        # Picks the freq's own SCF energy as "final SP" — but the
+        # aggregator's compound logic will degrade gracefully (G_low
+        # fallback) if no high-level SP follow-up exists.
+        assert d["final_sp_energy_eh"] == pytest.approx(-76.099999999)
+        assert d["temperature_k"] == pytest.approx(310.0)
+
+    def test_missing_file(self, tmp_path):
+        from scripps_workflow.orca import parse_orca_thermochem
+
+        d = parse_orca_thermochem(tmp_path / "nope.out")
+        # All values None on read failure — never raises.
+        assert all(v is None for v in d.values())
+
+    def test_takes_last_match(self, tmp_path):
+        # Compound outputs print FINAL E once per job; we want the LAST.
+        from scripps_workflow.orca import parse_orca_thermochem
+
+        p = tmp_path / "two.out"
+        p.write_text(
+            "FINAL SINGLE POINT ENERGY    -76.111111111\n"
+            "FINAL SINGLE POINT ENERGY    -76.222222222\n"
+        )
+        d = parse_orca_thermochem(p)
+        assert d["final_sp_energy_eh"] == pytest.approx(-76.222222222)
+
+
+class TestClassifyOrcaOutfile:
+    def test_compound_has_both(self, tmp_path):
+        from scripps_workflow.orca import classify_orca_outfile
+
+        p = tmp_path / "compound.out"
+        p.write_text(COMPOUND_OUT_TEXT)
+        assert classify_orca_outfile(p) == (True, True)
+
+    def test_pure_sp(self, tmp_path):
+        from scripps_workflow.orca import classify_orca_outfile
+
+        p = tmp_path / "sp.out"
+        p.write_text(SP_ONLY_OUT_TEXT)
+        assert classify_orca_outfile(p) == (False, True)
+
+    def test_pure_freq(self, tmp_path):
+        from scripps_workflow.orca import classify_orca_outfile
+
+        p = tmp_path / "freq.out"
+        p.write_text(FREQ_ONLY_OUT_TEXT)
+        # FREQ_ONLY_OUT_TEXT happens to contain a FINAL E line (the SCF
+        # energy from the freq job's own single-point), so the
+        # has_final_e flag is True. The thermo flag is also True via
+        # the THERMOCHEMISTRY marker.
+        assert classify_orca_outfile(p) == (True, True)
+
+    def test_missing_file(self, tmp_path):
+        from scripps_workflow.orca import classify_orca_outfile
+
+        # Read failures return (False, False) — caller treats as
+        # "nothing here", not an exception.
+        assert classify_orca_outfile(tmp_path / "nope.out") == (False, False)
+
+    def test_alternate_thermo_markers(self, tmp_path):
+        from scripps_workflow.orca import classify_orca_outfile
+
+        # Either of the three markers triggers has_thermo=True.
+        for marker in ("GIBBS FREE ENERGY", "G-E(el)", "THERMOCHEMISTRY"):
+            p = tmp_path / f"{marker.replace(' ', '_')}.out"
+            p.write_text(f"... {marker} ...\n")
+            assert classify_orca_outfile(p) == (True, False)
+
+
+class TestPickOrcaOutputs:
+    def test_single_compound_file_used_for_both(self, tmp_path):
+        from scripps_workflow.orca import pick_orca_outputs
+
+        d = tmp_path / "task_0001"
+        d.mkdir()
+        (d / "orca_thermo.out").write_text(COMPOUND_OUT_TEXT)
+
+        thermo, sp = pick_orca_outputs(d)
+        # Same file used for both — the aggregator parses thermo from
+        # the first job and FINAL E from the LAST line, which is the
+        # SP. parse_orca_thermochem already does this correctly.
+        assert thermo == sp
+        assert thermo.name == "orca_thermo.out"
+
+    def test_separate_freq_and_sp(self, tmp_path):
+        from scripps_workflow.orca import pick_orca_outputs
+
+        d = tmp_path / "task_0002"
+        d.mkdir()
+        (d / "freq.out").write_text(FREQ_ONLY_OUT_TEXT)
+        (d / "sp.out").write_text(SP_ONLY_OUT_TEXT)
+
+        thermo, sp = pick_orca_outputs(d)
+        assert thermo.name == "freq.out"
+        assert sp.name == "sp.out"
+
+    def test_only_sp_falls_back(self, tmp_path):
+        # If only an SP file exists, both slots get it (the aggregator
+        # then surfaces missing-thermo as a soft failure).
+        from scripps_workflow.orca import pick_orca_outputs
+
+        d = tmp_path / "task_0003"
+        d.mkdir()
+        (d / "sp.out").write_text(SP_ONLY_OUT_TEXT)
+
+        thermo, sp = pick_orca_outputs(d)
+        assert thermo == sp
+        assert thermo.name == "sp.out"
+
+    def test_only_freq_falls_back(self, tmp_path):
+        from scripps_workflow.orca import pick_orca_outputs
+
+        d = tmp_path / "task_0004"
+        d.mkdir()
+        (d / "freq.out").write_text(FREQ_ONLY_OUT_TEXT)
+
+        thermo, sp = pick_orca_outputs(d)
+        assert thermo == sp
+        assert thermo.name == "freq.out"
+
+    def test_no_outs(self, tmp_path):
+        from scripps_workflow.orca import pick_orca_outputs
+
+        d = tmp_path / "task_0005"
+        d.mkdir()
+        # An unrelated file that doesn't match the *.out glob.
+        (d / "input.xyz").write_text("3\nx\nC 0 0 0\nO 0 0 1.4\nH 0 0 -1\n")
+
+        assert pick_orca_outputs(d) == (None, None)
+
+    def test_missing_dir(self, tmp_path):
+        from scripps_workflow.orca import pick_orca_outputs
+
+        # Caller might pass a path that doesn't exist (upstream lied
+        # about n_tasks). Returns (None, None), never raises.
+        assert pick_orca_outputs(tmp_path / "nope") == (None, None)
+
+    def test_multiple_thermo_picks_last(self, tmp_path):
+        # Determinism: when multiple files match a slot, the last in
+        # sorted order wins (operators iterate, later files supersede).
+        from scripps_workflow.orca import pick_orca_outputs
+
+        d = tmp_path / "task_0006"
+        d.mkdir()
+        (d / "freq_v1.out").write_text(FREQ_ONLY_OUT_TEXT)
+        (d / "freq_v2.out").write_text(FREQ_ONLY_OUT_TEXT)
+
+        thermo, sp = pick_orca_outputs(d)
+        # sorted() puts v2 last.
+        assert thermo.name == "freq_v2.out"
+
+
 class TestPublicSurface:
     def test_all_exports_importable(self):
         from scripps_workflow import orca as o
 
         for name in (
             "FINAL_E_RE",
+            "FINAL_G_RE",
+            "G_MINUS_E_EL_RE",
             "HARTREE_TO_KCAL",
             "ORCA_NORMAL_RE",
+            "S_CORR_RE",
+            "THERMO_T_RE",
+            "TOTAL_H_RE",
+            "classify_orca_outfile",
             "concat_xyz_files",
             "make_orca_compound_input",
             "make_orca_simple_input",
             "orca_terminated_normally",
             "parse_orca_final_energy",
+            "parse_orca_thermochem",
+            "pick_orca_outputs",
             "solvent_to_orca_smd",
             "write_energy_file",
         ):
