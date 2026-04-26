@@ -285,7 +285,15 @@ class Node(ABC):
         # ---- finalize ----
         manifest.runtime_seconds = float(time.perf_counter() - started_at_perf)
         manifest.created_at_unix = int(time.time())
-        manifest.environment = _detect_environment().to_dict()
+        # Merge instead of overwrite: nodes can record their own environment
+        # facts (e.g. resolved binary paths, thread counts) during run(), and
+        # those should survive finalize. The framework-owned keys
+        # (python/python_exe/platform/host) take precedence on conflict so a
+        # buggy node can't lie about the interpreter it ran under.
+        manifest.environment = {
+            **manifest.environment,
+            **_detect_environment().to_dict(),
+        }
 
         try:
             manifest.write(manifest_path)
