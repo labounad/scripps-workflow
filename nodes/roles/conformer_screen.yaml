@@ -1,0 +1,165 @@
+# conformer_screen role contract (v1)
+#
+# Reduce a conformer ensemble to a smaller set of representatives or unique
+# conformers. The role is implementation-agnostic: prism-pruner and
+# navicat-marc both implement it, and a workflow that uses the role can
+# swap implementations without rewiring its graph.
+#
+# This file is the source of truth for the contract. Implementations
+# (`scripps_workflow.nodes.prism_screen`, `scripps_workflow.nodes.marc_screen`,
+# ...) MUST emit a manifest that satisfies it. The runtime validator is
+# `scripps_workflow.contracts.conformer_screen.validate(manifest)`.
+#
+# Versioning: bump `version` on any breaking change to required fields.
+# Adding a new optional field is non-breaking.
+
+role: conformer_screen
+version: 1
+description: |
+  Conformer ensemble reduction. Implementations may select representatives
+  by energy gating, geometric similarity (RMSD / moment-of-inertia /
+  rotation-corrected RMSD), or any combination thereof. The contract is
+  intentionally agnostic to the scoring metric — each implementation may
+  attach its own metric fields under the `metrics` block of each
+  conformer record.
+
+# ----------------------------------------------------------------------
+# Inputs
+# ----------------------------------------------------------------------
+inputs:
+  upstream:
+    required: true
+    description: |
+      The upstream manifest must contain a conformer ensemble. The role
+      reads from the first non-empty bucket in this priority order:
+      `accepted` -> `selected` -> `conformers` -> `xyz_ensemble` -> `xyz`.
+      Each member must have `path_abs` (absolute path to an `.xyz` file)
+      and SHOULD have `sha256`.
+
+  config_keys:
+    # Universal config keys every implementation must accept (and may
+    # ignore where not applicable). Implementation-specific keys are
+    # allowed in addition.
+    method:
+      type: string
+      enum: [auto, prism, marc]
+      default: auto
+      description: |
+        Implementation selector. `auto` uses whichever impl the wrapper
+        was instantiated with. Engine-rendered wrappers normally pin a
+        single impl, so this is mostly for in-Python use.
+    keep_rejected:
+      type: bool
+      default: true
+      description: |
+        Whether to materialize rejected conformers in `outputs/rejected/`
+        and record them in the `rejected` artifact bucket. False = drop
+        them silently (only counts survive in the inputs block).
+
+# ----------------------------------------------------------------------
+# Outputs
+# ----------------------------------------------------------------------
+outputs:
+  artifacts:
+    accepted:
+      required: true
+      type: list
+      element: conformer_record
+      description: |
+        Conformers that survived screening, sorted by `index` ascending.
+        May be empty (in which case the manifest's `ok` MUST be false
+        and a structured failure must be recorded).
+    rejected:
+      required: true
+      type: list
+      element: conformer_record
+      description: |
+        Conformers that were dropped. May be an empty list (e.g. all
+        survived, or `keep_rejected=false`). Must always be present —
+        downstream consumers may check `len(rejected) > 0` for triage.
+    xyz_ensemble:
+      required: when_accepted_nonempty
+      type: list
+      element: ensemble_record
+      description: |
+        Single record pointing to the merged accepted ensemble (one
+        multi-frame `.xyz` file). Required iff `accepted` is non-empty.
+    xyz:
+      required: when_accepted_nonempty
+      type: list
+      element: ensemble_record
+      description: |
+        Single record labeled `best`, pointing to the chosen
+        representative conformer (a single-frame `.xyz` file). Required
+        iff `accepted` is non-empty. Implementations choose `best`
+        however they want — by lowest energy, by cluster-center, etc.
+        — but MUST document the choice in `inputs.best_chosen_by`.
+
+  inputs_block:
+    # Required keys in the manifest's top-level `inputs` block. These
+    # carry the structured run summary so a downstream consumer doesn't
+    # have to re-derive counts from the artifact lists.
+    method:
+      required: true
+      type: string
+      description: |
+        Concrete implementation name (`prism`, `marc`, ...). NOT `auto`
+        — the wrapper resolved that to a real impl by the time this is
+        written.
+    method_version:
+      required: false
+      type: string
+      description: |
+        Version string of the underlying tool (e.g. prism-pruner pkg
+        version, marc git rev). Recorded for reproducibility; not
+        required because some tools don't expose a version.
+    n_input:
+      required: true
+      type: int
+      description: |
+        Total conformers received from upstream (before any filtering).
+    n_accepted:
+      required: true
+      type: int
+      description: |
+        Length of the `accepted` artifact bucket. Redundant with the
+        bucket length but explicit for fast triage.
+    n_rejected:
+      required: true
+      type: int
+      description: |
+        Length of the `rejected` artifact bucket. Note this can differ
+        from `n_input - n_accepted` if `keep_rejected=false` was used.
+    best_chosen_by:
+      required: when_accepted_nonempty
+      type: string
+      description: |
+        Free-form short string describing how `xyz/best` was selected
+        (e.g. `lowest_rel_energy_kcal`, `cluster_center`, `first_accepted`).
+
+# ----------------------------------------------------------------------
+# Schemas referenced above
+# ----------------------------------------------------------------------
+schemas:
+  conformer_record:
+    required:
+      index: { type: int, description: "1-based ordinal in the input ensemble" }
+      path_abs: { type: string, description: "Absolute path to the conformer .xyz" }
+      sha256: { type: string, description: "Hex sha256 of the file at path_abs" }
+    optional:
+      label: { type: string }
+      format: { type: string, default: xyz }
+      energy_kcal: { type: float, description: "Absolute electronic energy or proxy (impl-defined)" }
+      rel_energy_kcal: { type: float, description: "Relative to lowest accepted; only meaningful in `accepted`" }
+      cluster_id: { type: int, description: "marc-style cluster assignment" }
+      cluster_distance: { type: float, description: "marc-style distance to cluster center" }
+      rejected_reason: { type: string, description: "Required only inside `rejected`. Short tag like `energy_gate`, `rmsd_dup`, `rotcorr_rmsd_dup`, `cluster_dup`." }
+      metrics: { type: object, description: "Impl-specific catch-all for metrics not covered by the optional fields above. Free dict." }
+
+  ensemble_record:
+    required:
+      label: { type: string, description: "`accepted_ensemble` for the ensemble bucket; `best` for the xyz bucket." }
+      path_abs: { type: string }
+      sha256: { type: string }
+    optional:
+      format: { type: string, default: xyz }

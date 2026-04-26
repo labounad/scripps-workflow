@@ -1,0 +1,107 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scripps-workflow"
+version = "0.0.1"
+description = "HPC-aware quantum chemistry / cheminformatics / bioinformatics workflow framework. Engine-agnostic node + workflow definitions."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Lucas Abounader", email = "labounader@scripps.edu" },
+]
+keywords = [
+    "workflow",
+    "hpc",
+    "slurm",
+    "quantum-chemistry",
+    "nmr",
+    "conformer",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+# Runtime hot path is stdlib-only on purpose: nodes need to be importable from any
+# HPC env without pulling in a dependency tree. Optional deps are gated under
+# extras (see [project.optional-dependencies]).
+dependencies = []
+
+[project.optional-dependencies]
+# GUI export/import round-trip + schema validation tooling. NOT needed at node
+# runtime — only for `wf-export-gui` / `wf-import-gui` and tests.
+gui = [
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+# Cheminformatic / quantum chemistry node deps. Each pulled in only by the
+# matching node module's import statement, so missing extras = soft import
+# failure recorded in the manifest, not a hard crash.
+chem = [
+    "numpy>=1.26",
+    "rdkit>=2024.3",
+]
+# Prism-pruner node specifically needs Python >= 3.12 and the prism-pruner pkg.
+prism = [
+    "prism-pruner",
+]
+# Test suite.
+test = [
+    "pytest>=7.4",
+    "pyyaml>=6.0",
+]
+# Everything (for development).
+all = [
+    "scripps-workflow[gui,chem,prism,test]",
+]
+
+[project.scripts]
+# Node entrypoints. Each is a thin function that calls the node's `main()`.
+# The engine's per-node `script.sh` is a 5-line shim that exec's one of these.
+wf-embed             = "scripps_workflow.nodes.smiles_to_3d:main"
+wf-xtb               = "scripps_workflow.nodes.xtb_calc:main"
+wf-crest             = "scripps_workflow.nodes.crest:main"
+wf-orca-goat         = "scripps_workflow.nodes.orca_goat:main"
+wf-marc              = "scripps_workflow.nodes.marc_screen:main"
+wf-prism             = "scripps_workflow.nodes.prism_screen:main"
+wf-orca-dft-array    = "scripps_workflow.nodes.orca_dft_array:main"
+wf-orca-thermo-array = "scripps_workflow.nodes.orca_thermo_array:main"
+wf-thermo-aggregate  = "scripps_workflow.nodes.thermo_aggregate:main"
+wf-tag-input         = "scripps_workflow.nodes.tag_input:main"
+
+# GUI round-trip tooling.
+wf-export-gui = "scripps_workflow.gui.cli:export_main"
+wf-import-gui = "scripps_workflow.gui.cli:import_main"
+wf-validate   = "scripps_workflow.gui.cli:validate_main"
+
+[project.urls]
+Homepage = "https://github.com/labounad/scripps-workflow"
+Repository = "https://github.com/labounad/scripps-workflow"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scripps_workflow"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/scripps_workflow",
+    "nodes",
+    "workflows",
+    "tests",
+    "pyproject.toml",
+    ".gitignore",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:pydantic.*",
+]
