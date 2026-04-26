@@ -187,6 +187,95 @@ def make_orca_simple_input(
     return "\n".join(lines)
 
 
+def make_orca_compound_input(
+    *,
+    keywords: str,
+    singlepoint_keywords: Optional[str] = None,
+    nprocs: int,
+    maxcore: int,
+    charge: int,
+    multiplicity: int,
+    solvent: Optional[str],
+    smd_solvent_override: Optional[str] = None,
+    xyz_filename: str = "input.xyz",
+) -> str:
+    """Render a single- or two-job ORCA input.
+
+    When ``singlepoint_keywords`` is ``None`` (or empty after a strip)
+    the output is identical to :func:`make_orca_simple_input` — a
+    single ORCA job. When provided, two jobs are concatenated with a
+    ``$new_job`` separator::
+
+        ! r2scan-3c TightSCF Freq
+        ...
+        * xyzfile 0 1 input.xyz
+
+        $new_job
+
+        ! wB97M-V def2-TZVPP TightSCF
+        ...
+        * xyzfile 0 1 input.xyz
+
+    ORCA runs the jobs sequentially, sharing the same SCF guess strategy
+    but with fresh basis/functional setup for each. The geometry is
+    re-specified from the same xyz for both jobs (the freq job doesn't
+    optimize, so the coordinates are unchanged anyway — but explicit is
+    safer than relying on ORCA's inheritance behavior).
+
+    This is the standard "low-level thermo + high-level single point"
+    composite protocol used to compute Gibbs energies at a level the
+    Hessian itself isn't affordable at. Downstream tooling (the
+    ``thermo_aggregate`` node) reads ``G - E(el)`` from the *first*
+    job's freq block and ``FINAL SINGLE POINT ENERGY`` from the last
+    occurrence in the file — the SP — so the composite Gibbs is
+    naturally::
+
+        G_composite = E_SP_high + (G - E_el)_low
+
+    Note ``parse_orca_final_energy`` returns the LAST FINAL E match by
+    design, so callers parsing energies don't need to know whether the
+    file is single- or two-job.
+
+    Args:
+        keywords: First-job ``!`` line (e.g. the freq calc).
+        singlepoint_keywords: Second-job ``!`` line, or ``None`` to
+            render a single-job input. Empty/whitespace-only is
+            treated as ``None``.
+        nprocs / maxcore / charge / multiplicity / solvent /
+        smd_solvent_override / xyz_filename:
+            Forwarded to both jobs verbatim.
+    """
+    job1 = make_orca_simple_input(
+        keywords=keywords,
+        nprocs=nprocs,
+        maxcore=maxcore,
+        charge=charge,
+        multiplicity=multiplicity,
+        solvent=solvent,
+        smd_solvent_override=smd_solvent_override,
+        xyz_filename=xyz_filename,
+    )
+    sp = (singlepoint_keywords or "").strip()
+    if not sp:
+        return job1
+
+    job2 = make_orca_simple_input(
+        keywords=sp,
+        nprocs=nprocs,
+        maxcore=maxcore,
+        charge=charge,
+        multiplicity=multiplicity,
+        solvent=solvent,
+        smd_solvent_override=smd_solvent_override,
+        xyz_filename=xyz_filename,
+    )
+    # ``make_orca_simple_input`` ends with a trailing newline (the xyz
+    # line). Insert a blank line, then ``$new_job``, another blank, and
+    # the second job — keeps the file readable when an operator opens
+    # it.
+    return job1 + "\n$new_job\n\n" + job2
+
+
 # --------------------------------------------------------------------
 # Output parsing
 # --------------------------------------------------------------------
@@ -198,6 +287,15 @@ def make_orca_simple_input(
 #: copy is the converged value.
 FINAL_E_RE: re.Pattern[str] = re.compile(
     r"FINAL\s+SINGLE\s+POINT\s+ENERGY\s+(-?\d+\.\d+(?:[Ee][+-]?\d+)?)"
+)
+
+
+#: Pattern for ORCA's "ORCA TERMINATED NORMALLY" footer. ORCA prints
+#: this exact phrase only on a clean exit; SCF blowups, geometry
+#: failures, and SLURM-killed jobs all leave it absent. Case-insensitive
+#: because some legacy builds emit lowercase variants.
+ORCA_NORMAL_RE: re.Pattern[str] = re.compile(
+    r"ORCA\s+TERMINATED\s+NORMALLY", re.IGNORECASE
 )
 
 
@@ -220,6 +318,32 @@ def parse_orca_final_energy(out_path: Path) -> Optional[float]:
         return float(matches[-1])
     except (ValueError, TypeError):
         return None
+
+
+def orca_terminated_normally(
+    out_path: Path, *, tail_bytes: int = 16384
+) -> bool:
+    """Check whether an ``orca.out`` ends with the normal-termination footer.
+
+    Used by the thermo-array node to detect partial/killed runs that
+    nonetheless produced a FINAL E line earlier (SLURM walltime kills
+    after the SCF but before the Freq finishes are the typical culprit).
+
+    Reads only the file's tail (default 16 KiB) — ORCA's freq output
+    can be tens of MB so a full read isn't worth it for one regex.
+    Returns ``False`` for missing / unreadable files, just like
+    :func:`parse_orca_final_energy`.
+    """
+    try:
+        with Path(out_path).open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - int(tail_bytes)), 0)
+            data = f.read()
+    except Exception:
+        return False
+    text = data.decode("utf-8", errors="replace")
+    return ORCA_NORMAL_RE.search(text) is not None
 
 
 # --------------------------------------------------------------------
@@ -295,8 +419,11 @@ def write_energy_file(
 __all__ = [
     "FINAL_E_RE",
     "HARTREE_TO_KCAL",
+    "ORCA_NORMAL_RE",
     "concat_xyz_files",
+    "make_orca_compound_input",
     "make_orca_simple_input",
+    "orca_terminated_normally",
     "parse_orca_final_energy",
     "solvent_to_orca_smd",
     "write_energy_file",
