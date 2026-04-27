@@ -910,6 +910,23 @@ class OrcaThermoArray(Node):
                 progress=result.final_progress.to_dict(),
             )
 
+        # If the SLURM-side sentinel walker reported any failed tasks
+        # (``.wf_status/done_failed`` written by the per-task body),
+        # surface that at the manifest level immediately. Without this
+        # the downstream ``_aggregate`` step can declare the run "ok"
+        # whenever the freq+SP outputs parse successfully — even when
+        # one of the *separate* NMR ORCA invocations crashed and left
+        # a ``done_failed`` marker. Keeps ``ok``/``failures`` honest
+        # against ``progress_final``.
+        if result.final_progress.failed > 0:
+            ctx.fail(
+                "tasks_marked_failed",
+                jobid=jobid,
+                n_failed=result.final_progress.failed,
+                n_total=n_tasks,
+                progress=result.final_progress.to_dict(),
+            )
+
     def _aggregate(
         self,
         ctx: NodeContext,

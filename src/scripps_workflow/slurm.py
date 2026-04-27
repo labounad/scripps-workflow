@@ -517,23 +517,28 @@ def standard_orca_per_task_body(
     """Return the canonical "run ORCA + record sentinels" task body.
 
     Both DFT-array and thermo-array share the same shape; only the
-    filenames differ::
-
-        if "${ORCA_BIN}" "orca_opt.inp" > "orca_opt.out"; then
-          mark_success
-        else
-          ...
-        fi
+    filenames differ. Captures the ORCA exit code via the bare-call
+    pattern (``orca ...; rc=$?``) rather than ``if ! orca ...`` so
+    that ``$?`` inside an ``else`` branch reflects the real rc rather
+    than the inverted pipeline status. Also requires the ``.out`` file
+    to end in ``ORCA TERMINATED NORMALLY`` — catches the case where
+    ORCA exits 0 after a recoverable input warning but didn't actually
+    finish the requested calculation.
     """
     return (
-        f'if "${{ORCA_BIN}}" "{inp_filename}" > "{out_filename}"; then\n'
-        f"  mark_success\n"
-        f"else\n"
-        f"  rc=$?\n"
+        f'"${{ORCA_BIN}}" "{inp_filename}" > "{out_filename}"\n'
+        f"rc=$?\n"
+        f'if [[ "${{rc}}" -ne 0 ]]; then\n'
         f'  echo "[wf-array] task=${{TASK_ID}} ORCA failed rc=${{rc}}" >&2\n'
         f'  mark_failure "${{rc}}"\n'
         f'  exit "${{rc}}"\n'
         f"fi\n"
+        f'if ! grep -q "ORCA TERMINATED NORMALLY" "{out_filename}"; then\n'
+        f'  echo "[wf-array] task=${{TASK_ID}} ORCA did not terminate normally" >&2\n'
+        f'  mark_failure 1\n'
+        f'  exit 1\n'
+        f"fi\n"
+        f"mark_success\n"
     )
 
 
@@ -549,12 +554,19 @@ def multi_orca_per_task_body(
     by the thermo-array node to keep the freq+SP compound separate
     from the WP04 ¹H, wB97X-D3 ¹³C, and mPW1PW91 J-coupling NMR jobs.
 
-    Fail-fast: any non-zero ORCA exit aborts the chain, records the
+    Fail-fast: any non-zero ORCA exit, or any output that doesn't end
+    in ``ORCA TERMINATED NORMALLY``, aborts the chain, records the
     return code, and marks the task failed. The first job is the
     "primary" — its sentinel filename is what the manifest's
     ``ORCA_OUT_NAME`` points at — so when only one job is supplied
     this helper produces a body equivalent to
     :func:`standard_orca_per_task_body`.
+
+    Exit-code capture: the body uses a ``run_orca_job`` helper rather
+    than an ``if ! orca ...; then rc=$?`` shape, because the leading
+    ``!`` inverts the pipeline status to 0 inside the ``then`` block,
+    masking the real rc. Capturing rc immediately after the bare
+    invocation (``orca ...; rc=$?``) preserves it.
 
     :param jobs: Ordered list of ``(inp, out)`` filename pairs
         (relative to the task dir). Must contain at least one entry.
@@ -562,19 +574,29 @@ def multi_orca_per_task_body(
     if not jobs:
         raise ValueError("multi_orca_per_task_body: jobs must be non-empty")
 
-    parts: list[str] = []
+    helper = (
+        'run_orca_job() {\n'
+        '  local idx="$1"; local total="$2"; local inp="$3"; local out="$4"\n'
+        '  echo "[wf-array] task=${TASK_ID} job ${idx}/${total}: ${inp} -> ${out}"\n'
+        '  "${ORCA_BIN}" "${inp}" > "${out}"\n'
+        '  local rc=$?\n'
+        '  if [[ "${rc}" -ne 0 ]]; then\n'
+        '    echo "[wf-array] task=${TASK_ID} ORCA job ${idx}/${total} (${inp}) failed rc=${rc}" >&2\n'
+        '    mark_failure "${rc}"\n'
+        '    exit "${rc}"\n'
+        '  fi\n'
+        '  if ! grep -q "ORCA TERMINATED NORMALLY" "${out}"; then\n'
+        '    echo "[wf-array] task=${TASK_ID} ORCA job ${idx}/${total} (${inp}) did not terminate normally" >&2\n'
+        '    mark_failure 1\n'
+        '    exit 1\n'
+        '  fi\n'
+        '}\n'
+    )
+
+    parts: list[str] = [helper]
+    total = len(jobs)
     for i, (inp, out) in enumerate(jobs, start=1):
-        parts.append(
-            f'echo "[wf-array] task=${{TASK_ID}} job {i}/{len(jobs)}: '
-            f'{inp} -> {out}"\n'
-            f'if ! "${{ORCA_BIN}}" "{inp}" > "{out}"; then\n'
-            f"  rc=$?\n"
-            f'  echo "[wf-array] task=${{TASK_ID}} ORCA job {i}/{len(jobs)} '
-            f'({inp}) failed rc=${{rc}}" >&2\n'
-            f'  mark_failure "${{rc}}"\n'
-            f'  exit "${{rc}}"\n'
-            f"fi\n"
-        )
+        parts.append(f'run_orca_job {i} {total} "{inp}" "{out}"')
     parts.append("mark_success\n")
     return "\n".join(parts)
 

@@ -478,6 +478,14 @@ def resolve_functional_alias(method: str) -> tuple[str, list[str]]:
       changed; if you need exact-match accuracy, swap to ``wB97X-V``
       and refit the calibration.
 
+    * ``mPW1PW91`` → ``mPW1PW``. ORCA 6's keyword for the Adamo–
+      Barone 1998 one-parameter hybrid of mPW exchange + PW91
+      correlation is the bare ``mPW1PW`` (without the ``91`` suffix
+      most calibration tables use). The functional form is identical;
+      only the keyword spelling changed. Standard cheshire J-coupling
+      calibrations refer to it as "mPW1PW91" so we accept that name
+      and translate to what ORCA expects.
+
     Add new entries here as the lab adopts other custom functionals.
     """
     m = (method or "").strip()
@@ -486,6 +494,8 @@ def resolve_functional_alias(method: str) -> tuple[str, list[str]]:
         return ("B3LYP/G", [_WP04_METHOD_BLOCK])
     if low == "wb97x-d":
         return ("wB97X-D3", [])
+    if low == "mpw1pw91":
+        return ("mPW1PW", [])
     return (m, [])
 
 
