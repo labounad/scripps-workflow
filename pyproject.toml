@@ -74,6 +74,7 @@ wf-prism             = "scripps_workflow.nodes.prism_screen:main"
 wf-orca-dft-array    = "scripps_workflow.nodes.orca_dft_array:main"
 wf-orca-thermo-array = "scripps_workflow.nodes.orca_thermo_array:main"
 wf-thermo-aggregate  = "scripps_workflow.nodes.thermo_aggregate:main"
+wf-nmr-aggregate     = "scripps_workflow.nodes.nmr_aggregate:main"
 wf-tag-input         = "scripps_workflow.nodes.tag_input:main"
 
 # GUI round-trip tooling.

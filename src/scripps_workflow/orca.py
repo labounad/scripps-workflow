@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 #: 1 Eh in kcal/mol (CODATA 2018 / NIST). ORCA's internal
@@ -113,6 +113,7 @@ def make_orca_simple_input(
     solvent: Optional[str],
     smd_solvent_override: Optional[str] = None,
     xyz_filename: str = "input.xyz",
+    extra_blocks: Optional[list[str]] = None,
 ) -> str:
     """Render the ``orca_*.inp`` text used by the array nodes.
 
@@ -182,6 +183,18 @@ def make_orca_simple_input(
         lines.append("end")
         lines.append("")
 
+    # Caller-supplied raw blocks (``%method``, ``%eprnmr`` for NMR
+    # shieldings/couplings, custom ``%basis``, etc.). Each block is
+    # written verbatim with one trailing blank line so an operator
+    # opening the .inp can read it. Empty/None entries are skipped.
+    if extra_blocks:
+        for block in extra_blocks:
+            text = (block or "").strip()
+            if not text:
+                continue
+            lines.append(text)
+            lines.append("")
+
     lines.append(f"* xyzfile {int(charge)} {int(multiplicity)} {xyz_filename}")
     lines.append("")
     return "\n".join(lines)
@@ -191,6 +204,7 @@ def make_orca_compound_input(
     *,
     keywords: str,
     singlepoint_keywords: Optional[str] = None,
+    post_jobs: Optional[list[dict[str, Any]]] = None,
     nprocs: int,
     maxcore: int,
     charge: int,
@@ -199,52 +213,77 @@ def make_orca_compound_input(
     smd_solvent_override: Optional[str] = None,
     xyz_filename: str = "input.xyz",
 ) -> str:
-    """Render a single- or two-job ORCA input.
+    """Render a chain of ORCA jobs separated by ``$new_job``.
 
-    When ``singlepoint_keywords`` is ``None`` (or empty after a strip)
-    the output is identical to :func:`make_orca_simple_input` — a
-    single ORCA job. When provided, two jobs are concatenated with a
-    ``$new_job`` separator::
+    Three calling shapes, in increasing flexibility:
 
-        ! r2scan-3c TightSCF Freq
-        ...
-        * xyzfile 0 1 input.xyz
+    1. **Plain freq** — pass only ``keywords``. Output is identical to
+       :func:`make_orca_simple_input`.
 
-        $new_job
+    2. **Freq + one SP** — pass ``keywords`` (the freq line) and
+       ``singlepoint_keywords`` (the high-level SP line). The SP is
+       rendered as a single ``$new_job`` block. This is the classic
+       "low-level thermo + high-level single point" recipe that
+       :mod:`scripps_workflow.nodes.thermo_aggregate` consumes::
 
-        ! wB97M-V def2-TZVPP TightSCF
-        ...
-        * xyzfile 0 1 input.xyz
+            G_composite = E_SP_high + (G - E_el)_low
 
-    ORCA runs the jobs sequentially, sharing the same SCF guess strategy
-    but with fresh basis/functional setup for each. The geometry is
-    re-specified from the same xyz for both jobs (the freq job doesn't
-    optimize, so the coordinates are unchanged anyway — but explicit is
-    safer than relying on ORCA's inheritance behavior).
+    3. **Freq + arbitrary chain** — pass ``post_jobs`` instead of (or
+       in addition to) ``singlepoint_keywords``. Each entry is a dict
+       with at least a ``keywords`` field plus an optional
+       ``extra_blocks`` list and ``kind`` label. Each post-job becomes
+       its own ``$new_job`` segment. Used by the NMR pipeline to chain
+       freq + high-level SP + 1H shieldings + 13C shieldings + J
+       couplings inside ONE allocated SLURM job.
 
-    This is the standard "low-level thermo + high-level single point"
-    composite protocol used to compute Gibbs energies at a level the
-    Hessian itself isn't affordable at. Downstream tooling (the
-    ``thermo_aggregate`` node) reads ``G - E(el)`` from the *first*
-    job's freq block and ``FINAL SINGLE POINT ENERGY`` from the last
-    occurrence in the file — the SP — so the composite Gibbs is
-    naturally::
+    When both ``singlepoint_keywords`` and ``post_jobs`` are set, the
+    SP entry is prepended to ``post_jobs`` so the SP comes first
+    (matches the legacy thermo aggregator's last-FINAL-E convention).
 
-        G_composite = E_SP_high + (G - E_el)_low
-
-    Note ``parse_orca_final_energy`` returns the LAST FINAL E match by
-    design, so callers parsing energies don't need to know whether the
-    file is single- or two-job.
+    Each post-job inherits ``nprocs``/``maxcore``/``charge``/
+    ``multiplicity``/``solvent`` from the parent call — different
+    methods/basis sets/functionals are conveyed via the per-job
+    ``keywords`` and ``extra_blocks`` (e.g. ``%method`` or
+    ``%eprnmr`` blocks for custom functionals or NMR settings).
 
     Args:
-        keywords: First-job ``!`` line (e.g. the freq calc).
-        singlepoint_keywords: Second-job ``!`` line, or ``None`` to
-            render a single-job input. Empty/whitespace-only is
-            treated as ``None``.
+        keywords: First-job ``!`` line (typically the freq calc).
+        singlepoint_keywords: Optional shorthand for "one SP job after
+            the freq". Empty/whitespace/sentinel-string treated as
+            ``None``.
+        post_jobs: Optional list of post-freq job specs. Each entry:
+
+            * ``keywords`` (required): the ``!`` line for the job.
+            * ``extra_blocks`` (optional): list of raw block strings
+              appended after ``%cpcm`` and before ``* xyzfile`` (e.g.
+              ``"%eprnmr\\n  Nuclei = all H { shift }\\nend"``).
+            * ``kind`` (optional): label-only, ignored at render time
+              but useful for the manifest's ``inputs`` echo.
+
         nprocs / maxcore / charge / multiplicity / solvent /
         smd_solvent_override / xyz_filename:
-            Forwarded to both jobs verbatim.
+            Forwarded to every job verbatim.
     """
+    # Normalize the call shape into a single list of jobs.
+    jobs: list[dict[str, Any]] = []
+    sp = (singlepoint_keywords or "").strip()
+    if sp:
+        jobs.append({"keywords": sp, "extra_blocks": None, "kind": "energy"})
+    if post_jobs:
+        for j in post_jobs:
+            kw = str(j.get("keywords", "")).strip()
+            if not kw:
+                raise ValueError(
+                    f"post_jobs entry missing 'keywords': {j!r}"
+                )
+            jobs.append(
+                {
+                    "keywords": kw,
+                    "extra_blocks": j.get("extra_blocks") or None,
+                    "kind": j.get("kind"),
+                }
+            )
+
     job1 = make_orca_simple_input(
         keywords=keywords,
         nprocs=nprocs,
@@ -255,25 +294,101 @@ def make_orca_compound_input(
         smd_solvent_override=smd_solvent_override,
         xyz_filename=xyz_filename,
     )
-    sp = (singlepoint_keywords or "").strip()
-    if not sp:
+    if not jobs:
         return job1
 
-    job2 = make_orca_simple_input(
-        keywords=sp,
-        nprocs=nprocs,
-        maxcore=maxcore,
-        charge=charge,
-        multiplicity=multiplicity,
-        solvent=solvent,
-        smd_solvent_override=smd_solvent_override,
-        xyz_filename=xyz_filename,
+    chunks: list[str] = [job1]
+    for spec in jobs:
+        block = make_orca_simple_input(
+            keywords=spec["keywords"],
+            nprocs=nprocs,
+            maxcore=maxcore,
+            charge=charge,
+            multiplicity=multiplicity,
+            solvent=solvent,
+            smd_solvent_override=smd_solvent_override,
+            xyz_filename=xyz_filename,
+            extra_blocks=spec.get("extra_blocks"),
+        )
+        # ``make_orca_simple_input`` ends with a trailing newline (the
+        # xyz line). One blank line + ``$new_job`` + blank, then the
+        # next block — keeps the file readable.
+        chunks.append("\n$new_job\n\n" + block)
+    return "".join(chunks)
+
+
+# --------------------------------------------------------------------
+# NMR-specific %eprnmr block helpers
+# --------------------------------------------------------------------
+
+
+def nmr_shielding_block(nuclei: str) -> str:
+    """Render a ``%eprnmr`` block requesting GIAO chemical shieldings.
+
+    ``nuclei`` is an ORCA nucleus selector — ``"all H"``, ``"all C"``,
+    or a specific atom-index list like ``"1, 4, 7"``. ORCA's ``! NMR``
+    keyword automatically selects GIAO; this block just narrows which
+    atoms get shieldings printed.
+
+    Example::
+
+        %eprnmr
+          Nuclei = all H { shift }
+        end
+    """
+    sel = str(nuclei).strip()
+    if not sel:
+        raise ValueError("nmr_shielding_block: nuclei selector cannot be empty")
+    return (
+        "%eprnmr\n"
+        f"  Nuclei = {sel} {{ shift }}\n"
+        "end"
     )
-    # ``make_orca_simple_input`` ends with a trailing newline (the xyz
-    # line). Insert a blank line, then ``$new_job``, another blank, and
-    # the second job — keeps the file readable when an operator opens
-    # it.
-    return job1 + "\n$new_job\n\n" + job2
+
+
+def nmr_coupling_block(
+    nuclei_pairs: list[str],
+    *,
+    ssall: bool = True,
+    spinspin_thresh: Optional[float] = 8.0,
+) -> str:
+    """Render a ``%eprnmr`` block requesting indirect spin-spin couplings.
+
+    ``ssall=True`` enables the full Ramsey decomposition (FC + SD +
+    PSO + DSO) — required for accurate J's, especially 1H-1H couplings
+    where FC dominates but SD/PSO contribute meaningfully. The default
+    ORCA setup is FC-only, which is wrong for production use.
+
+    ``spinspin_thresh`` (in Å) caps the inter-nucleus distance for
+    which couplings are computed. 8 Å is a practical default that
+    catches all chemically-relevant couplings while skipping the
+    O(N²) work for distant pairs.
+
+    ``nuclei_pairs`` is a list of selectors (e.g.
+    ``["all H", "all C"]``). ORCA computes couplings between any pair
+    of selected nuclei.
+
+    Example output::
+
+        %eprnmr
+          Nuclei = all H { ssall }
+          Nuclei = all C { ssall }
+          SpinSpinRThresh 8.0
+        end
+    """
+    if not nuclei_pairs:
+        raise ValueError("nmr_coupling_block: nuclei_pairs must be non-empty")
+    term = "ssall" if ssall else "ssfc"
+    lines: list[str] = ["%eprnmr"]
+    for sel in nuclei_pairs:
+        s = str(sel).strip()
+        if not s:
+            continue
+        lines.append(f"  Nuclei = {s} {{ {term} }}")
+    if spinspin_thresh is not None:
+        lines.append(f"  SpinSpinRThresh {float(spinspin_thresh)}")
+    lines.append("end")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------
@@ -620,21 +735,383 @@ def write_energy_file(
     return rel_kcal, e_min
 
 
+# --------------------------------------------------------------------
+# NMR output parsing
+# --------------------------------------------------------------------
+
+
+#: Marker that opens an ORCA "CHEMICAL SHIELDING SUMMARY" table. Match
+#: case-insensitively because legacy ORCA versions print mixed case.
+SHIELDING_HDR_RE: re.Pattern[str] = re.compile(
+    r"CHEMICAL\s+SHIELDING\s+SUMMARY", re.IGNORECASE
+)
+
+
+#: Per-row pattern: ``  0  C   175.234   12.345`` — atom index, element
+#: symbol, isotropic shielding (ppm), anisotropy (ppm). The element is
+#: 1–2 letters; numbers may be negative or in scientific notation.
+SHIELDING_ROW_RE: re.Pattern[str] = re.compile(
+    r"^\s*(\d+)\s+([A-Z][a-z]?)\s+"
+    r"(-?\d+\.\d+(?:[Ee][+-]?\d+)?)\s+"
+    r"(-?\d+\.\d+(?:[Ee][+-]?\d+)?)\s*$"
+)
+
+
+#: Per-pair "Nucleus A:" header in modern ORCA 6 output. The detail
+#: blocks for spin-spin couplings emit ``Nucleus A:`` and ``Nucleus B:``
+#: on TWO consecutive lines, each carrying ``<atom_index> <element>``
+#: (one-based or zero-based depending on ORCA build — we capture the
+#: integer verbatim and the consumer is responsible for the offset).
+#:
+#: Example::
+#:
+#:      Nucleus A: 0 C
+#:      Nucleus B: 1 H
+#:
+#: We also accept the variant where element comes first
+#: (``Nucleus A: C 0``) — older builds and some print levels swap order.
+COUPLING_NUCLEUS_RE: re.Pattern[str] = re.compile(
+    r"\bNucleus\s+([AB])\s*[:=]\s*"
+    r"(?:(\d+)\s+([A-Z][a-z]?)|([A-Z][a-z]?)\s+(\d+))",
+    re.IGNORECASE,
+)
+
+
+#: Legacy single-line header retained for backward compatibility with
+#: pre-ORCA-6 outputs that emitted both nuclei on one comma-separated
+#: line. New parser will fall through to :data:`COUPLING_NUCLEUS_RE` when
+#: this doesn't match.
+COUPLING_PAIR_RE: re.Pattern[str] = re.compile(
+    r"NUCLEUS\s+A\s*=\s*(\d+)\s+([A-Z][a-z]?)\s*,\s*"
+    r"NUCLEUS\s+B\s*=\s*(\d+)\s+([A-Z][a-z]?)",
+    re.IGNORECASE,
+)
+
+
+def parse_orca_shieldings(out_path: Path) -> list[dict[str, Any]]:
+    """Parse the ``CHEMICAL SHIELDING SUMMARY`` table from an ORCA out.
+
+    Returns a list of dicts ordered by atom index (ORCA's intrinsic
+    order, which is the input-geometry order)::
+
+        [{"atom_index": 0, "element": "C", "sigma_iso_ppm": 175.234,
+          "sigma_aniso_ppm": 12.345}, ...]
+
+    If a compound (multi-job) output contains MULTIPLE shielding
+    summaries (e.g. one per ``$new_job`` block), the parser collects
+    rows from every block and de-duplicates by ``atom_index`` keeping
+    the LAST occurrence — so the final job's table wins. This matches
+    the convention used by the energy parsers.
+
+    Returns ``[]`` on read errors or when no summary marker is found.
+    """
+    try:
+        text = Path(out_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    # Find every "CHEMICAL SHIELDING SUMMARY" block; iterate through
+    # the lines that follow it until we hit a blank or a clearly
+    # non-row line (e.g. another header).
+    rows_by_idx: dict[int, dict[str, Any]] = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if SHIELDING_HDR_RE.search(lines[i]):
+            i += 1
+            # Walk forward, skipping ORCA's separator/sub-header lines
+            # (composed of dashes, blank, or non-numeric column titles).
+            saw_data = False
+            while i < len(lines):
+                m = SHIELDING_ROW_RE.match(lines[i])
+                if m:
+                    saw_data = True
+                    idx = int(m.group(1))
+                    rows_by_idx[idx] = {
+                        "atom_index": idx,
+                        "element": m.group(2),
+                        "sigma_iso_ppm": float(m.group(3)),
+                        "sigma_aniso_ppm": float(m.group(4)),
+                    }
+                    i += 1
+                    continue
+                # Stop the inner loop once we exit the data rows. Allow
+                # a few non-matching lines BEFORE the data starts (header
+                # separators); once we've started seeing data, the first
+                # non-match ends the block.
+                if saw_data:
+                    break
+                # Bail if we wandered into a completely unrelated section.
+                if "SUMMARY" in lines[i].upper() and not SHIELDING_HDR_RE.search(lines[i]):
+                    break
+                i += 1
+        else:
+            i += 1
+
+    return [rows_by_idx[k] for k in sorted(rows_by_idx)]
+
+
+#: Patterns for the per-term lines inside a single pair block.
+#:
+#: ORCA 6 prints spelled-out term names with a ``:`` separator and
+#: trailing ``Hz`` unit, e.g.::
+#:
+#:     Fermi contact contribution                 :  143.456 Hz
+#:     Spin-dipolar contribution                  :    0.123 Hz
+#:     Paramagnetic contribution                  :    1.234 Hz
+#:     Diamagnetic contribution                   :    0.310 Hz
+#:     Spin-dipolar/Fermi-contact cross term      :    0.001 Hz
+#:     Total                                      :  145.124 Hz
+#:
+#: Some older builds use bare abbreviations (``FC = ...``); each
+#: pattern below matches either spelling. The ``Total`` pattern
+#: deliberately requires word-boundary anchors so a "Total" appearing
+#: inside another label doesn't match.
+_COUPLING_TERM_PATTERNS: dict[str, re.Pattern[str]] = {
+    "J_total_hz": re.compile(
+        r"(?:^|\s)(?:Total(?:\s+(?:iso(?:tropic)?|J|coupling))?|TOTAL\s+JISO)\b"
+        r"[^=:]*[=:]\s*(-?\d+\.\d+(?:[Ee][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
+    "J_FC_hz": re.compile(
+        r"(?:Fermi[-\s]contact(?:\s+contribution)?|\bFC\b)"
+        r"[^=:]*[=:]\s*(-?\d+\.\d+(?:[Ee][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
+    "J_SD_hz": re.compile(
+        r"(?:Spin[-\s]dipolar(?:\s+contribution)?|\bSD\b)"
+        r"[^=:]*[=:]\s*(-?\d+\.\d+(?:[Ee][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
+    "J_PSO_hz": re.compile(
+        r"(?:Paramagnetic(?:\s+(?:spin[-\s]orbit|contribution))?"
+        r"|Para(?:magnetic)?\s+SO|\bPSO\b)"
+        r"[^=:]*[=:]\s*(-?\d+\.\d+(?:[Ee][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
+    "J_DSO_hz": re.compile(
+        r"(?:Diamagnetic(?:\s+(?:spin[-\s]orbit|contribution))?"
+        r"|Dia(?:magnetic)?\s+SO|\bDSO\b)"
+        r"[^=:]*[=:]\s*(-?\d+\.\d+(?:[Ee][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
+}
+
+#: The cross term (Spin-dipolar/Fermi-contact) is small in magnitude but
+#: ORCA reports it; we capture it so synthesized totals (FC+SD+PSO+DSO+
+#: cross) match the printed Total exactly. It isn't surfaced in the
+#: per-pair record by default — the consumer rarely needs it — but it
+#: participates in the synthesized-total fallback below.
+_COUPLING_CROSS_RE: re.Pattern[str] = re.compile(
+    r"(?:Spin[-\s]dipolar/Fermi[-\s]contact(?:\s+cross\s+term)?|\bSD/FC\b)"
+    r"[^=:]*[=:]\s*(-?\d+\.\d+(?:[Ee][+-]?\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_nucleus_line(
+    line: str,
+) -> Optional[tuple[str, int, str]]:
+    """Parse a ``Nucleus A: <idx> <El>`` style line.
+
+    Returns ``(side, atom_index, element)`` where ``side`` is ``"A"``
+    or ``"B"``, or ``None`` if the line isn't a nucleus header.
+    Accepts both ``<idx> <El>`` and ``<El> <idx>`` orderings.
+    """
+    m = COUPLING_NUCLEUS_RE.search(line)
+    if not m:
+        return None
+    side = m.group(1).upper()
+    if m.group(2) is not None:
+        idx = int(m.group(2))
+        el = m.group(3)
+    else:
+        idx = int(m.group(5))
+        el = m.group(4)
+    return side, idx, el
+
+
+def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
+    """Parse spin-spin coupling per-pair blocks from an ORCA out.
+
+    Returns a list of dicts, one per (i, j) nucleus pair::
+
+        [{"i": 0, "elem_i": "C", "j": 1, "elem_j": "H",
+          "J_total_hz": 145.123,
+          "J_FC_hz": 143.456, "J_SD_hz": 0.123,
+          "J_PSO_hz": 1.234, "J_DSO_hz": 0.310}, ...]
+
+    Pairs are de-duplicated on (min(i,j), max(i,j)). Multiple blocks
+    (compound output) merge with last-occurrence-wins. Missing Ramsey
+    terms are returned as ``None``.
+
+    Two header formats are supported:
+
+        * **Modern ORCA 6** — the per-pair block opens with two
+          consecutive lines::
+
+              Nucleus A: 0 C
+              Nucleus B: 1 H
+
+          (or with element/index swapped, or with ``=`` instead of
+          ``:``). The parser pairs an ``A`` with the next ``B`` it
+          finds within a small look-ahead window.
+
+        * **Legacy** — a single ``NUCLEUS A = idx el, NUCLEUS B = idx
+          el`` line. Retained so older runs still parse.
+
+    For each identified pair, the next ~30 lines are scanned for the
+    five term lines (Total, Fermi-contact, spin-dipolar,
+    paramagnetic, diamagnetic) and the cross term. Spelled-out names
+    take precedence; bare abbreviations are accepted as fallbacks.
+    If ``Total`` was not printed, it is synthesized as
+    ``FC + SD + PSO + DSO + (cross or 0)`` when all four Ramsey terms
+    are present.
+
+    Returns ``[]`` on read errors.
+    """
+    try:
+        text = Path(out_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    lines = text.splitlines()
+    n = len(lines)
+    pairs: dict[tuple[int, int], dict[str, Any]] = {}
+    # Look-ahead window for "Nucleus B" after "Nucleus A", and for term
+    # lines after a pair header. ORCA 6 puts the totals 8–15 lines below
+    # the header; 30 is a generous cap that still bails before drifting
+    # into the next pair.
+    NUCLEUS_LOOKAHEAD = 6
+    TERM_LOOKAHEAD = 30
+
+    def _record_pair(
+        a_idx: int, a_el: str, b_idx: int, b_el: str, scan_from: int
+    ) -> int:
+        """Scan terms starting from ``scan_from``, register the pair,
+        and return the line index immediately past the scanned region."""
+        key = (min(a_idx, b_idx), max(a_idx, b_idx))
+        rec: dict[str, Any] = {
+            "i": key[0],
+            "j": key[1],
+            "elem_i": a_el if a_idx == key[0] else b_el,
+            "elem_j": b_el if b_idx == key[1] else a_el,
+            "J_total_hz": None,
+            "J_FC_hz": None,
+            "J_SD_hz": None,
+            "J_PSO_hz": None,
+            "J_DSO_hz": None,
+        }
+        cross: Optional[float] = None
+
+        end = min(scan_from + TERM_LOOKAHEAD, n)
+        k = scan_from
+        while k < end:
+            ln = lines[k]
+            # Stop early if we've drifted into the next pair header.
+            if (
+                _parse_nucleus_line(ln) is not None
+                or COUPLING_PAIR_RE.search(ln) is not None
+            ):
+                break
+            for term, pat in _COUPLING_TERM_PATTERNS.items():
+                if rec[term] is None:
+                    mt = pat.search(ln)
+                    if mt:
+                        try:
+                            rec[term] = float(mt.group(1))
+                        except (ValueError, TypeError):
+                            pass
+            if cross is None:
+                mc = _COUPLING_CROSS_RE.search(ln)
+                if mc:
+                    try:
+                        cross = float(mc.group(1))
+                    except (ValueError, TypeError):
+                        cross = None
+            k += 1
+
+        # Synthesize Total when all four Ramsey terms are present but
+        # Total wasn't printed (some print levels suppress it).
+        if rec["J_total_hz"] is None:
+            terms = [
+                rec[t]
+                for t in ("J_FC_hz", "J_SD_hz", "J_PSO_hz", "J_DSO_hz")
+            ]
+            if all(t is not None for t in terms):
+                total = sum(terms)  # type: ignore[arg-type]
+                if cross is not None:
+                    total += cross
+                rec["J_total_hz"] = total
+
+        pairs[key] = rec
+        return k
+
+    i = 0
+    while i < n:
+        line = lines[i]
+
+        # Try the modern multi-line ``Nucleus A: ... / Nucleus B: ...``
+        # shape first.
+        nuc = _parse_nucleus_line(line)
+        if nuc is not None and nuc[0] == "A":
+            a_idx, a_el = nuc[1], nuc[2]
+            j = i + 1
+            j_end = min(j + NUCLEUS_LOOKAHEAD, n)
+            b_idx: Optional[int] = None
+            b_el: Optional[str] = None
+            while j < j_end:
+                nb = _parse_nucleus_line(lines[j])
+                if nb is not None and nb[0] == "B":
+                    b_idx, b_el = nb[1], nb[2]
+                    break
+                j += 1
+            if b_idx is not None and b_el is not None:
+                next_i = _record_pair(a_idx, a_el, b_idx, b_el, scan_from=j + 1)
+                i = next_i if next_i > i else i + 1
+                continue
+
+        # Legacy single-line header.
+        m = COUPLING_PAIR_RE.search(line)
+        if m is not None:
+            next_i = _record_pair(
+                int(m.group(1)),
+                m.group(2),
+                int(m.group(3)),
+                m.group(4),
+                scan_from=i + 1,
+            )
+            i = next_i if next_i > i else i + 1
+            continue
+
+        i += 1
+
+    return [pairs[k] for k in sorted(pairs)]
+
+
 __all__ = [
+    "COUPLING_NUCLEUS_RE",
+    "COUPLING_PAIR_RE",
     "FINAL_E_RE",
     "FINAL_G_RE",
     "G_MINUS_E_EL_RE",
     "HARTREE_TO_KCAL",
     "ORCA_NORMAL_RE",
     "S_CORR_RE",
+    "SHIELDING_HDR_RE",
+    "SHIELDING_ROW_RE",
     "THERMO_T_RE",
     "TOTAL_H_RE",
     "classify_orca_outfile",
     "concat_xyz_files",
     "make_orca_compound_input",
     "make_orca_simple_input",
+    "nmr_coupling_block",
+    "nmr_shielding_block",
     "orca_terminated_normally",
+    "parse_orca_couplings",
     "parse_orca_final_energy",
+    "parse_orca_shieldings",
     "parse_orca_thermochem",
     "pick_orca_outputs",
     "solvent_to_orca_smd",

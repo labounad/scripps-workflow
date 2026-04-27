@@ -84,13 +84,27 @@ The test suite avoids touching real external binaries (xtb, crest, orca) by monk
 
 ## Available nodes
 
-| Entry point             | Purpose                                          |
-|-------------------------|--------------------------------------------------|
-| `wf-embed`              | SMILES → 3D coordinates (RDKit)                  |
-| `wf-xtb`                | xTB single-point / optimize / gradient / hessian |
-| `wf-tag-input`          | Engine wiring shim — relay a single `key=value`  |
+| Entry point             | Purpose                                                  |
+|-------------------------|----------------------------------------------------------|
+| `wf-embed`              | SMILES → 3D coordinates (RDKit)                          |
+| `wf-xtb`                | xTB single-point / optimize / gradient / hessian         |
+| `wf-crest`              | CREST conformer search                                   |
+| `wf-orca-goat`          | ORCA 6.0+ GOAT global conformer search                   |
+| `wf-prism`              | RMSD/MoI conformer pruning via prism-pruner              |
+| `wf-marc`               | navicat-marc clustering (sibling of `wf-prism`)          |
+| `wf-orca-dft-array`     | SLURM-array DFT geometry optimization                    |
+| `wf-orca-thermo-array`  | Composite freq + high-level SP (+ optional NMR jobs)     |
+| `wf-thermo-aggregate`   | Boltzmann weights + composite Gibbs over an ensemble     |
+| `wf-nmr-aggregate`      | Boltzmann-averaged NMR shifts + couplings + calibration  |
+| `wf-tag-input`          | Engine wiring shim — relay a single `key=value`          |
 
-More nodes (`crest`, `orca-goat`, `marc`, `prism`, `orca-dft-array`, `orca-thermo-array`, `thermo-aggregate`) are planned and will land as their legacy counterparts get ported in.
+The `wf-orca-thermo-array` node optionally chains GIAO shielding and
+spin-spin coupling jobs (`run_shielding_h`, `run_shielding_c`,
+`run_couplings`) into the same per-conformer ORCA invocation, separated
+by `$new_job`. The downstream `wf-nmr-aggregate` then population-weights
+the parsed shieldings/J's across the ensemble and applies a
+linear-scaling calibration (cheshire for shifts, Bally/Rablen for
+couplings) to produce predicted experimental observables.
 
 ## License
 

@@ -61,6 +61,29 @@ Config keys (``key=value`` tokens or one JSON object) — same shape as
     monitor_timeout_min    wall-clock cap (0 = no cap)                  [0]
     silence_openib         set ``OMPI_MCA_btl=^openib`` in the array   [true]
 
+Optional NMR section (all default off — when every flag is False the
+node behaves exactly like the freq[+SP] runner described above):
+
+    run_shielding_h           append a 1H shielding job                [false]
+    run_shielding_c           append a 13C shielding job               [false]
+    run_couplings             append a 1H-1H coupling job              [false]
+    shielding_method_h        functional for the 1H job                ["WP04"]
+    shielding_basis_h         basis set for the 1H job                 ["6-311++G(2d,p)"]
+    shielding_method_c        functional for the 13C job               ["wB97X-D"]
+    shielding_basis_c         basis set for the 13C job                ["6-31G(d,p)"]
+    coupling_method           functional for the J job                 ["mPW1PW91"]
+    coupling_basis            basis set for the J job                  ["pcJ-2"]
+    coupling_pairs            list/csv of ORCA nuclei selectors        [["all H"]]
+    coupling_thresh_angstrom  ``SpinSpinRThresh`` cap                  [8.0]
+    nmr_aux_keywords          extra ``!`` tokens added to every NMR    ["TightSCF"]
+                              job line
+
+Each enabled NMR job is appended after the freq+SP via ``$new_job``,
+producing a single ``orca_thermo.out`` containing every block. The
+matching :mod:`scripps_workflow.nodes.nmr_aggregate` reads back the
+shielding / coupling tables, Boltzmann-averages over the conformer
+ensemble, and applies the cheshire / Bally-Rablen linear scaling.
+
 Ports the legacy ``orca_thermo_freq_array`` script onto the new
 framework, and extends it with the composite SP step. The on-disk
 artifact layout (``outputs/array/tasks/...``,
@@ -81,6 +104,8 @@ from ..node import Node, NodeContext
 from ..orca import (
     concat_xyz_files,
     make_orca_compound_input,
+    nmr_coupling_block,
+    nmr_shielding_block,
     orca_terminated_normally,
     parse_orca_final_energy,
     write_energy_file,
@@ -88,6 +113,7 @@ from ..orca import (
 from ..parsing import (
     normalize_optional_str,
     parse_bool,
+    parse_float,
     parse_int,
     parse_optional_int,
 )
@@ -144,6 +170,116 @@ DEFAULT_NPROCS: int = 8
 #: geometry rather than producing a new one.
 ORCA_INP_NAME: str = "orca_thermo.inp"
 ORCA_OUT_NAME: str = "orca_thermo.out"
+
+
+# --------------------------------------------------------------------
+# NMR defaults — kept in sync with
+# :mod:`scripps_workflow.nodes.nmr_aggregate` so an operator who
+# configures one node sees the same recipe in the other. Override at
+# config time when running a non-cheshire calibration.
+# --------------------------------------------------------------------
+
+#: Functional/basis defaults for the ¹H GIAO shielding job. Combined
+#: with the cheshire ¹H calibration table in
+#: ``scripps_workflow.nmr_calibration``.
+DEFAULT_SHIELDING_METHOD_H: str = "WP04"
+DEFAULT_SHIELDING_BASIS_H: str = "6-311++G(2d,p)"
+
+#: Functional/basis defaults for the ¹³C GIAO shielding job.
+DEFAULT_SHIELDING_METHOD_C: str = "wB97X-D"
+DEFAULT_SHIELDING_BASIS_C: str = "6-31G(d,p)"
+
+#: Functional/basis defaults for the ¹H–¹H J-coupling job (Bally/Rablen).
+DEFAULT_COUPLING_METHOD: str = "mPW1PW91"
+DEFAULT_COUPLING_BASIS: str = "pcJ-2"
+
+#: Per-job ``! NMR`` keyword fragment. The shielding/coupling jobs all
+#: need ``! NMR`` to trigger ORCA's GIAO + spin-spin machinery. The
+#: ``TightSCF`` ride-along matches the freq/SP defaults so the SCF
+#: thresholds are uniform across the chain.
+DEFAULT_NMR_AUX_KEYWORDS: str = "TightSCF"
+
+#: Default coupling-block configuration. ``["all H"]`` requests every
+#: ¹H–¹H pair; the ``SpinSpinRThresh`` cap keeps the O(N²) cost down
+#: by skipping pairs farther apart than the threshold.
+DEFAULT_COUPLING_PAIRS: tuple[str, ...] = ("all H",)
+DEFAULT_COUPLING_THRESH_ANGSTROM: float = 8.0
+
+
+def build_nmr_post_jobs(*, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate the NMR config knobs into a ``post_jobs`` chain.
+
+    Returns a list of post-job specs (in the shape consumed by
+    :func:`scripps_workflow.orca.make_orca_compound_input`) for every
+    NMR job the config requested. Empty list if no NMR is requested.
+
+    The job order is (when all three are enabled):
+
+        1. ¹H shielding   (``kind="shielding_h"``)
+        2. ¹³C shielding  (``kind="shielding_c"``)
+        3. ¹H–¹H couplings (``kind="couplings_hh"``)
+
+    Each job is rendered as a single ``$new_job`` segment by the
+    compound-input writer, sharing the same charge/multiplicity/
+    solvent as the freq+SP jobs above it. Method/basis come from the
+    matching ``shielding_method_*``/``shielding_basis_*`` /
+    ``coupling_method``/``coupling_basis`` config keys.
+
+    Pure function — no I/O — so it's easy to unit-test against
+    config dicts.
+    """
+    post_jobs: list[dict[str, Any]] = []
+
+    aux = str(cfg.get("nmr_aux_keywords", DEFAULT_NMR_AUX_KEYWORDS)).strip()
+    aux_suffix = f" {aux}" if aux else ""
+
+    if cfg.get("run_shielding_h"):
+        post_jobs.append(
+            {
+                "kind": "shielding_h",
+                "keywords": (
+                    f"NMR {cfg['shielding_method_h']} "
+                    f"{cfg['shielding_basis_h']}{aux_suffix}"
+                ),
+                "extra_blocks": [nmr_shielding_block("all H")],
+            }
+        )
+
+    if cfg.get("run_shielding_c"):
+        post_jobs.append(
+            {
+                "kind": "shielding_c",
+                "keywords": (
+                    f"NMR {cfg['shielding_method_c']} "
+                    f"{cfg['shielding_basis_c']}{aux_suffix}"
+                ),
+                "extra_blocks": [nmr_shielding_block("all C")],
+            }
+        )
+
+    if cfg.get("run_couplings"):
+        pairs = list(cfg.get("coupling_pairs") or DEFAULT_COUPLING_PAIRS)
+        thresh = cfg.get("coupling_thresh_angstrom")
+        post_jobs.append(
+            {
+                "kind": "couplings_hh",
+                "keywords": (
+                    f"NMR {cfg['coupling_method']} "
+                    f"{cfg['coupling_basis']}{aux_suffix}"
+                ),
+                "extra_blocks": [
+                    nmr_coupling_block(
+                        pairs,
+                        ssall=True,
+                        spinspin_thresh=(
+                            float(thresh) if thresh is not None else None
+                        ),
+                    )
+                ],
+            }
+        )
+
+    return post_jobs
 
 
 # --------------------------------------------------------------------
@@ -312,6 +448,72 @@ class OrcaThermoArray(Node):
         monitor_interval_s = max(5, parse_int(raw.get("monitor_interval_s"), 60))
         monitor_timeout_min = max(0, parse_int(raw.get("monitor_timeout_min"), 0))
 
+        # ---- NMR section ----
+        # Three booleans gate the optional shielding/coupling jobs
+        # appended after the freq+SP. When all three are False (the
+        # default) the node behaves exactly as before — pure
+        # freq+SP. Method/basis fall back to the cheshire defaults
+        # so an operator who only flips ``run_shielding_h=true`` gets
+        # the same recipe the matching ``nmr_aggregate`` calibration
+        # was fit for.
+        run_shielding_h = parse_bool(raw.get("run_shielding_h"), False)
+        run_shielding_c = parse_bool(raw.get("run_shielding_c"), False)
+        run_couplings = parse_bool(raw.get("run_couplings"), False)
+
+        shielding_method_h = (
+            normalize_optional_str(raw.get("shielding_method_h"))
+            or DEFAULT_SHIELDING_METHOD_H
+        )
+        shielding_basis_h = (
+            normalize_optional_str(raw.get("shielding_basis_h"))
+            or DEFAULT_SHIELDING_BASIS_H
+        )
+        shielding_method_c = (
+            normalize_optional_str(raw.get("shielding_method_c"))
+            or DEFAULT_SHIELDING_METHOD_C
+        )
+        shielding_basis_c = (
+            normalize_optional_str(raw.get("shielding_basis_c"))
+            or DEFAULT_SHIELDING_BASIS_C
+        )
+        coupling_method = (
+            normalize_optional_str(raw.get("coupling_method"))
+            or DEFAULT_COUPLING_METHOD
+        )
+        coupling_basis = (
+            normalize_optional_str(raw.get("coupling_basis"))
+            or DEFAULT_COUPLING_BASIS
+        )
+
+        # ``coupling_pairs`` accepts either a list (from JSON config)
+        # or a comma-separated string (from key=value config). Each
+        # entry is an ORCA nuclei selector (``"all H"``, ``"1, 4, 7"``,
+        # ``"all C"``, ...).
+        raw_cp = raw.get("coupling_pairs")
+        coupling_pairs: list[str]
+        if raw_cp is None:
+            coupling_pairs = list(DEFAULT_COUPLING_PAIRS)
+        elif isinstance(raw_cp, list):
+            coupling_pairs = [str(s).strip() for s in raw_cp if str(s).strip()]
+        else:
+            coupling_pairs = [
+                s.strip() for s in str(raw_cp).split(",") if s.strip()
+            ]
+        if run_couplings and not coupling_pairs:
+            raise ValueError(
+                "run_couplings=true but coupling_pairs is empty"
+            )
+
+        coupling_thresh_angstrom = parse_float(
+            raw.get("coupling_thresh_angstrom"),
+            DEFAULT_COUPLING_THRESH_ANGSTROM,
+        )
+
+        nmr_aux_keywords = (
+            normalize_optional_str(raw.get("nmr_aux_keywords"))
+            or DEFAULT_NMR_AUX_KEYWORDS
+        )
+
         return {
             "max_concurrency": max_concurrency,
             "charge": parse_int(raw.get("charge"), 0),
@@ -332,6 +534,19 @@ class OrcaThermoArray(Node):
             "monitor_interval_s": monitor_interval_s,
             "monitor_timeout_min": monitor_timeout_min,
             "silence_openib": parse_bool(raw.get("silence_openib"), True),
+            # NMR knobs (forwarded to build_nmr_post_jobs in run()):
+            "run_shielding_h": run_shielding_h,
+            "run_shielding_c": run_shielding_c,
+            "run_couplings": run_couplings,
+            "shielding_method_h": shielding_method_h,
+            "shielding_basis_h": shielding_basis_h,
+            "shielding_method_c": shielding_method_c,
+            "shielding_basis_c": shielding_basis_c,
+            "coupling_method": coupling_method,
+            "coupling_basis": coupling_basis,
+            "coupling_pairs": coupling_pairs,
+            "coupling_thresh_angstrom": coupling_thresh_angstrom,
+            "nmr_aux_keywords": nmr_aux_keywords,
         }
 
     def run(self, ctx: NodeContext) -> None:
@@ -360,6 +575,18 @@ class OrcaThermoArray(Node):
             monitor_interval_s=cfg["monitor_interval_s"],
             monitor_timeout_min=cfg["monitor_timeout_min"],
             silence_openib=cfg["silence_openib"],
+            run_shielding_h=cfg["run_shielding_h"],
+            run_shielding_c=cfg["run_shielding_c"],
+            run_couplings=cfg["run_couplings"],
+            shielding_method_h=cfg["shielding_method_h"],
+            shielding_basis_h=cfg["shielding_basis_h"],
+            shielding_method_c=cfg["shielding_method_c"],
+            shielding_basis_c=cfg["shielding_basis_c"],
+            coupling_method=cfg["coupling_method"],
+            coupling_basis=cfg["coupling_basis"],
+            coupling_pairs=list(cfg["coupling_pairs"]),
+            coupling_thresh_angstrom=cfg["coupling_thresh_angstrom"],
+            nmr_aux_keywords=cfg["nmr_aux_keywords"],
         )
 
         if ctx.upstream_manifest is None:
@@ -419,9 +646,16 @@ class OrcaThermoArray(Node):
         tasks_root.mkdir(parents=True, exist_ok=True)
         slurm_logs.mkdir(parents=True, exist_ok=True)
 
+        # Assemble any optional NMR jobs into a post_jobs chain that
+        # will be appended after the freq+SP via ``$new_job``. Empty
+        # list when no NMR knobs are flipped — the compound writer
+        # then degenerates to the classic freq[+SP] shape.
+        post_jobs = build_nmr_post_jobs(cfg=cfg)
+
         inp_text = make_orca_compound_input(
             keywords=cfg["keywords"],
             singlepoint_keywords=cfg["singlepoint_keywords"],
+            post_jobs=post_jobs or None,
             nprocs=cfg["nprocs"],
             maxcore=cfg["maxcore"],
             charge=cfg["charge"],
@@ -706,13 +940,23 @@ class OrcaThermoArray(Node):
 
 
 __all__ = [
+    "DEFAULT_COUPLING_BASIS",
+    "DEFAULT_COUPLING_METHOD",
+    "DEFAULT_COUPLING_PAIRS",
+    "DEFAULT_COUPLING_THRESH_ANGSTROM",
     "DEFAULT_KEYWORDS",
+    "DEFAULT_NMR_AUX_KEYWORDS",
     "DEFAULT_NPROCS",
     "DEFAULT_ORCA_MODULE",
+    "DEFAULT_SHIELDING_BASIS_C",
+    "DEFAULT_SHIELDING_BASIS_H",
+    "DEFAULT_SHIELDING_METHOD_C",
+    "DEFAULT_SHIELDING_METHOD_H",
     "DEFAULT_SINGLEPOINT_KEYWORDS",
     "ORCA_INP_NAME",
     "ORCA_OUT_NAME",
     "OrcaThermoArray",
+    "build_nmr_post_jobs",
     "build_thermo_task_dirs",
     "collect_thermo_outputs",
     "main",

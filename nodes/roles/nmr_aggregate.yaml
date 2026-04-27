@@ -1,0 +1,183 @@
+# nmr_aggregate role contract (v1)
+#
+# Boltzmann-average DFT NMR shieldings + J-couplings across a conformer
+# ensemble, then apply linear-scaling calibration (cheshire / Bally-Rablen)
+# to produce predicted experimental observables.
+#
+# This role is implemented by `scripps_workflow.nodes.nmr_aggregate`. Its
+# upstream is a thermo-aggregator manifest (typically from
+# `wf-thermo-aggregate`) carrying per-conformer Boltzmann weights AND
+# per-conformer task directories whose ORCA `.out` files contain the
+# shielding / coupling tables (produced by `wf-orca-thermo-array` with
+# the NMR knobs flipped on).
+#
+# Versioning: bump `version` on any breaking change to required fields.
+# Adding a new optional field is non-breaking.
+
+role: nmr_aggregate
+version: 1
+description: |
+  Population-weighted DFT NMR aggregation for a conformer ensemble.
+  Reads each conformer's ORCA output, parses the chemical shielding
+  table (and optionally the spin-spin coupling tables), Boltzmann-
+  averages using the weights the upstream thermo aggregator computed,
+  and applies a calibration-table-driven linear scaling to produce
+  predicted chemical shifts (in ppm) and J-couplings (in Hz). Linear
+  scaling is applied AFTER averaging — mathematically equivalent to
+  scaling each conformer first then averaging, since both operations
+  are linear.
+
+# ----------------------------------------------------------------------
+# Inputs
+# ----------------------------------------------------------------------
+inputs:
+  upstream:
+    required: true
+    description: |
+      A thermo-aggregator manifest. The role reads from
+      `artifacts.conformers[]`, expecting each record to carry both
+      `task_dir_abs` (the per-conformer ORCA run directory) and
+      `boltzmann_weight` (a float, or `null` for conformers that lacked
+      parseable thermochemistry). Records with `null` weights are
+      skipped; weights are renormalized over the contributing subset.
+
+  config_keys:
+    solvent:
+      type: string
+      default: CHCl3
+      description: |
+        SMD solvent token; used in the calibration-table lookup, NOT
+        in the ORCA input (the upstream array node owns that side).
+        Must match one of the keys in `nmr_calibration.NMR_CALIBRATION`
+        for the configured `(method, basis, solvent, nucleus)` tuples,
+        otherwise the role emits `calibration_not_found` for the
+        affected nucleus and writes the raw shielding to the CSV
+        without a predicted-shift column.
+    shielding_method_h:
+      type: string
+      default: WP04
+      description: Functional used for the ¹H GIAO shielding job.
+    shielding_basis_h:
+      type: string
+      default: 6-311++G(2d,p)
+      description: Basis set used for the ¹H GIAO shielding job.
+    shielding_method_c:
+      type: string
+      default: wB97X-D
+      description: Functional used for the ¹³C GIAO shielding job.
+    shielding_basis_c:
+      type: string
+      default: 6-31G(d,p)
+      description: Basis set used for the ¹³C GIAO shielding job.
+    coupling_method:
+      type: string
+      default: mPW1PW91
+      description: Functional used for the ¹H–¹H J-coupling job.
+    coupling_basis:
+      type: string
+      default: pcJ-2
+      description: Basis set used for the ¹H–¹H J-coupling job.
+    output_shifts_csv:
+      type: string
+      default: predicted_shifts.csv
+      description: |
+        Basename for the per-atom predicted-shifts CSV. Must NOT
+        contain `/` or start with `.` — it is written into the node's
+        `outputs/` directory.
+    output_couplings_csv:
+      type: string
+      default: predicted_couplings.csv
+      description: |
+        Basename for the per-pair predicted-couplings CSV. Same
+        path-restriction as `output_shifts_csv`. Skipped entirely
+        when `skip_couplings=true`.
+    skip_couplings:
+      type: bool
+      default: false
+      description: |
+        When true, no J-coupling parsing or CSV emission is performed.
+        Useful when the upstream array node was run without a
+        `run_couplings=true` job to save time.
+
+# ----------------------------------------------------------------------
+# Outputs
+# ----------------------------------------------------------------------
+outputs:
+  artifacts:
+    files:
+      required: true
+      type: list
+      element: file_record
+      description: |
+        Always contains the per-atom shifts CSV (`label`:
+        `predicted_shifts_csv`) and the summary JSON (`label`:
+        `nmr_summary_json`). Additionally contains the per-pair
+        couplings CSV (`label`: `predicted_couplings_csv`) iff
+        `skip_couplings=false`.
+
+  inputs_block:
+    solvent:
+      required: true
+      type: string
+      description: Solvent token used for calibration lookup.
+    shielding_method_h:
+      required: true
+      type: string
+    shielding_basis_h:
+      required: true
+      type: string
+    shielding_method_c:
+      required: true
+      type: string
+    shielding_basis_c:
+      required: true
+      type: string
+    coupling_method:
+      required: true
+      type: string
+    coupling_basis:
+      required: true
+      type: string
+    skip_couplings:
+      required: true
+      type: bool
+
+# ----------------------------------------------------------------------
+# Schemas referenced above
+# ----------------------------------------------------------------------
+schemas:
+  file_record:
+    required:
+      label: { type: string, description: "`predicted_shifts_csv`, `predicted_couplings_csv`, or `nmr_summary_json`." }
+      path_abs: { type: string }
+      sha256: { type: string }
+      format: { type: string, description: "`csv` or `json`." }
+
+  shifts_csv_columns:
+    # Documents the column shape of the predicted-shifts CSV. Columns
+    # are written in this exact order; consumers should treat any
+    # absent calibration column as an empty string.
+    required:
+      atom_index: { type: int, description: "Zero-based atom index from the input geometry (matches ORCA's intrinsic order)." }
+      element: { type: string, description: "Element symbol (e.g. `H`, `C`)." }
+      sigma_iso_avg_ppm: { type: float, description: "Boltzmann-averaged isotropic shielding." }
+      delta_predicted_ppm: { type: float, description: "Predicted chemical shift after linear scaling. Empty when no calibration entry was found for the (element, method, basis, solvent) tuple." }
+      calibration_source: { type: string, description: "Provenance string from the calibration table; empty when no calibration was applied." }
+      calibration_method: { type: string }
+      calibration_basis: { type: string }
+      calibration_solvent: { type: string }
+      n_conformers_used: { type: int, description: "Number of conformers that contributed at least one shielding row to the average." }
+
+  couplings_csv_columns:
+    required:
+      i: { type: int, description: "Atom index of the first nucleus in the canonicalized pair `(min(i,j), max(i,j))`." }
+      elem_i: { type: string }
+      j: { type: int, description: "Atom index of the second nucleus." }
+      elem_j: { type: string }
+      J_total_avg_hz: { type: float, description: "Boltzmann-averaged total isotropic coupling." }
+      J_predicted_hz: { type: float, description: "Predicted J after linear scaling. Currently only populated for ¹H-¹H pairs (the default cheshire/Bally-Rablen calibration covers H-H only); empty for heteronuclear pairs." }
+      calibration_source: { type: string }
+      calibration_method: { type: string }
+      calibration_basis: { type: string }
+      calibration_solvent: { type: string }
+      n_conformers_used: { type: int }
