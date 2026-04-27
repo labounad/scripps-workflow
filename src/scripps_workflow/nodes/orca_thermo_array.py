@@ -109,6 +109,7 @@ from ..orca import (
     nmr_shielding_block,
     orca_terminated_normally,
     parse_orca_final_energy,
+    resolve_functional_alias,
     write_energy_file,
 )
 from ..parsing import (
@@ -235,47 +236,51 @@ def build_nmr_post_jobs(*, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     aux_suffix = f" {aux}" if aux else ""
 
     if cfg.get("run_shielding_h"):
+        h_method, h_extras = resolve_functional_alias(cfg["shielding_method_h"])
         post_jobs.append(
             {
                 "kind": "shielding_h",
                 "keywords": (
-                    f"NMR {cfg['shielding_method_h']} "
+                    f"NMR {h_method} "
                     f"{cfg['shielding_basis_h']}{aux_suffix}"
                 ),
-                "extra_blocks": [nmr_shielding_block("all H")],
+                "extra_blocks": [*h_extras, nmr_shielding_block("all H")],
             }
         )
 
     if cfg.get("run_shielding_c"):
+        c_method, c_extras = resolve_functional_alias(cfg["shielding_method_c"])
         post_jobs.append(
             {
                 "kind": "shielding_c",
                 "keywords": (
-                    f"NMR {cfg['shielding_method_c']} "
+                    f"NMR {c_method} "
                     f"{cfg['shielding_basis_c']}{aux_suffix}"
                 ),
-                "extra_blocks": [nmr_shielding_block("all C")],
+                "extra_blocks": [*c_extras, nmr_shielding_block("all C")],
             }
         )
 
     if cfg.get("run_couplings"):
         pairs = list(cfg.get("coupling_pairs") or DEFAULT_COUPLING_PAIRS)
         thresh = cfg.get("coupling_thresh_angstrom")
+        j_method, j_extras = resolve_functional_alias(cfg["coupling_method"])
         post_jobs.append(
             {
                 "kind": "couplings_hh",
                 "keywords": (
-                    f"NMR {cfg['coupling_method']} "
+                    f"NMR {j_method} "
                     f"{cfg['coupling_basis']}{aux_suffix}"
                 ),
                 "extra_blocks": [
+                    *j_extras,
                     nmr_coupling_block(
                         pairs,
                         ssall=True,
                         spinspin_thresh=(
                             float(thresh) if thresh is not None else None
                         ),
-                    )
+                    ),
                 ],
             }
         )

@@ -357,7 +357,7 @@ def make_orca_compound_input(
     chunks: list[str] = [job1]
     for spec in jobs:
         spec_extra = list(spec.get("extra_blocks") or [])
-        if inject_reset and not _has_method_block(spec_extra):
+        if inject_reset and not _has_dispersion_directives(spec_extra):
             spec_extra.insert(0, _DISPERSION_RESET_BLOCK)
         block = make_orca_simple_input(
             keywords=spec["keywords"],
@@ -377,20 +377,79 @@ def make_orca_compound_input(
     return "".join(chunks)
 
 
-def _has_method_block(extra_blocks: list[str]) -> bool:
-    """True if any ``extra_blocks`` entry already opens a ``%method`` block.
+def _has_dispersion_directives(extra_blocks: list[str]) -> bool:
+    """True if any ``extra_blocks`` entry already sets DFTDOPT or DoGCP.
 
-    Used to make the 3c-dispersion-reset injection idempotent: a caller
-    who hand-rolls a ``%method`` block for some other reason (e.g.
-    custom functional definition) is assumed to know what they're
-    doing, and we leave their settings alone rather than stacking a
-    second ``%method`` block on top.
+    Used to make the 3c-dispersion-reset injection idempotent at the
+    *directive* level rather than the block level. Two ``%method``
+    blocks in a single ORCA input are legal (settings stack), so the
+    earlier "skip if any %method block exists" rule was too coarse —
+    it suppressed the reset whenever a caller added an unrelated
+    ``%method`` block (e.g. functional re-mixing for WP04). We now
+    only skip the auto-injection when the caller has already taken
+    explicit ownership of the two specific directives this helper
+    sets, which is the correct invariant.
     """
     for raw in extra_blocks:
-        text = (raw or "").strip().lower()
-        if text.startswith("%method"):
+        text = (raw or "").lower()
+        if not text.lstrip().startswith("%method"):
+            continue
+        if "dftdopt" in text or "dogcp" in text:
             return True
     return False
+
+
+# --------------------------------------------------------------------
+# Functional alias resolution
+# --------------------------------------------------------------------
+
+
+#: ``ScalHFX``/``ScalDFX``/``ScalLDAC``/``ScalGGAC`` mixing parameters
+#: for the WP04 functional (Wiitala, Cramer, Hoye, J. Chem. Theory
+#: Comput. 2006, 2, 1085). WP04 is the cheshire-recommended functional
+#: for ¹H GIAO shieldings; ORCA doesn't ship a built-in keyword for it,
+#: so we re-mix B3LYP/G via ``%method``. Numbers verified against the
+#: original publication (a₀=0.1161, ax=0.8839, ac(LYP)=0.82,
+#: ac(VWN)=0.18).
+_WP04_METHOD_BLOCK = (
+    "%method\n"
+    "  ScalHFX  0.1161\n"
+    "  ScalDFX  0.8839\n"
+    "  ScalLDAC 0.1800\n"
+    "  ScalGGAC 0.8200\n"
+    "end"
+)
+
+
+def resolve_functional_alias(method: str) -> tuple[str, list[str]]:
+    """Translate a non-native functional name into ``(orca_keyword, extra_blocks)``.
+
+    Some calibration-table functionals — most importantly **WP04** —
+    aren't ORCA simple-input keywords. They're parametric tweaks of
+    standard hybrids that need a ``%method`` block to define. ORCA
+    aborts with::
+
+        UNRECOGNIZED OR DUPLICATED KEYWORD(S) IN SIMPLE INPUT LINE
+          WP04
+
+    when fed the bare name. This helper takes the calibration-table
+    label (case-insensitive) and returns the actual ORCA keyword to
+    drop on the ``!`` line plus any ``%method``/``%basis``/etc. blocks
+    that need to accompany it. Returns ``(method, [])`` unchanged when
+    the input is already an ORCA-native keyword.
+
+    Currently handled aliases:
+
+    * ``WP04`` → ``B3LYP/G`` + ``%method ScalHFX/ScalDFX/ScalLDAC/
+      ScalGGAC ...``. Wiitala–Cramer–Hoye 2006 reparametrization of
+      B3LYP/G; standard cheshire ¹H NMR functional.
+
+    Add new entries here as the lab adopts other custom functionals.
+    """
+    m = (method or "").strip()
+    if m.lower() == "wp04":
+        return ("B3LYP/G", [_WP04_METHOD_BLOCK])
+    return (m, [])
 
 
 # --------------------------------------------------------------------
@@ -1183,6 +1242,7 @@ __all__ = [
     "make_orca_compound_input",
     "make_orca_simple_input",
     "_uses_3c_composite_method",
+    "resolve_functional_alias",
     "nmr_coupling_block",
     "nmr_shielding_block",
     "orca_terminated_normally",
