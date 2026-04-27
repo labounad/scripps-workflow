@@ -187,16 +187,41 @@ def make_orca_simple_input(
     # shieldings/couplings, custom ``%basis``, etc.). Each block is
     # written verbatim with one trailing blank line so an operator
     # opening the .inp can read it. Empty/None entries are skipped.
-    if extra_blocks:
-        for block in extra_blocks:
-            text = (block or "").strip()
-            if not text:
-                continue
-            lines.append(text)
-            lines.append("")
+    #
+    # ``%eprnmr`` blocks must appear AFTER the geometry input because
+    # their ``Nuclei = all H``-style selectors are resolved against the
+    # parsed atom list at read time — putting ``%eprnmr`` before the
+    # geometry trips ORCA with::
+    #
+    #     Error in [EPRNMR] block: nuclear properties are requested
+    #     but no coordinates have been read!
+    #
+    # Auto-partition extra_blocks: anything starting with ``%eprnmr``
+    # is deferred to post-xyz, everything else stays pre-xyz where the
+    # rest of ORCA's declarative blocks live. Idempotent and order-
+    # preserving within each partition.
+    pre_xyz: list[str] = []
+    post_xyz: list[str] = []
+    for block in extra_blocks or []:
+        text = (block or "").strip()
+        if not text:
+            continue
+        if text.lstrip().lower().startswith("%eprnmr"):
+            post_xyz.append(text)
+        else:
+            pre_xyz.append(text)
+
+    for text in pre_xyz:
+        lines.append(text)
+        lines.append("")
 
     lines.append(f"* xyzfile {int(charge)} {int(multiplicity)} {xyz_filename}")
     lines.append("")
+
+    for text in post_xyz:
+        lines.append(text)
+        lines.append("")
+
     return "\n".join(lines)
 
 
