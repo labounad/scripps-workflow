@@ -158,7 +158,7 @@ DEFAULT_KEYWORDS: str = "r2scan-3c TightSCF Freq"
 #: ``G_composite = E_SP_high + (G - E_el)_low``. Set
 #: ``singlepoint_keywords=none`` (or ``""``) at config time to disable
 #: the SP step entirely and run a plain single-job freq calculation.
-DEFAULT_SINGLEPOINT_KEYWORDS: str = "wB97M-V def2-TZVPP TightSCF"
+DEFAULT_SINGLEPOINT_KEYWORDS: str = "wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3"
 
 #: Default ORCA ``%pal nprocs`` (and SLURM ``--ntasks``). Matches the
 #: rest of the array nodes' default of 8 — Frequency calculations

@@ -539,6 +539,18 @@ class Workflow:
     def to_dict(self) -> dict:
         """Render the workflow to its JSON-shaped dict (without zipping)."""
         wf_id = int(hashlib.sha1(self.name.encode()).hexdigest()[:7], 16)
+        # Workflow-level metadata fields the GUI auto-creates on first save
+        # (Name / Debug / Number). Including them here keeps round-trip
+        # imports happy: the engine appears to expect their presence and
+        # surfaces them in the run-launcher panel.
+        metadata = [
+            {"workflow_metadata_id": 1, "workflow_id": wf_id,
+             "name": "Name",   "type": "text",   "required": 0},
+            {"workflow_metadata_id": 2, "workflow_id": wf_id,
+             "name": "Debug",  "type": "text",   "required": 0},
+            {"workflow_metadata_id": 3, "workflow_id": wf_id,
+             "name": "Number", "type": "number", "required": 0},
+        ]
         return {
             "workflow_id": wf_id,
             "name": self.name,
@@ -550,7 +562,7 @@ class Workflow:
             "workflow_favorite_status": 0,
             "connections": [self._render_connection(c, wf_id) for c in self._connections],
             "content": [self._render_placement(p, wf_id) for p in self._all_placements()],
-            "metadata": [],
+            "metadata": metadata,
             "version": self.version,
             "host": self.host,
         }

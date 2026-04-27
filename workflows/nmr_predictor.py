@@ -83,12 +83,13 @@ def build() -> Workflow:
 
     temperature = wf.widget("number", alias="Temperature (K)", default="298.15", at=(x(0), y(13)))
 
-    # NMR-side knobs (kept narrow — defaults already match nmr_aggregate's table).
-    nmr_solvent = wf.widget(
-        "combo", alias="NMR calibration solvent",
-        default="CHCl3", at=(x(0), y(15)),
-        help_text="Must match a key in nmr_calibration.NMR_CALIBRATION.",
-    )
+    # NMR side: the single ``Solvent`` widget above also feeds
+    # nmr-aggregate's calibration-table lookup. Both consumers use a
+    # config key named ``solvent`` and (by convention) want the same
+    # value. If a workflow ever needs to decouple QC solvent from the
+    # NMR calibration solvent, bind()'s tag dedupe key has to grow from
+    # ``key`` to ``(widget, key)`` first; otherwise both widgets feed a
+    # single tag's ``value`` port.
 
     # ------------------------------------------------------------------
     # Process pipeline (top row).
@@ -123,11 +124,9 @@ def build() -> Workflow:
     wf.bind(charge,   to=[xtb, crest, dftopt, thermo],                key="charge")
     wf.bind(unpaired, to=[xtb, crest, dftopt, thermo],                key="unpaired_electrons")
 
-    # Solvent: the QC nodes use it for SMD/ALPB; nmr-aggregate uses it
-    # for the calibration-table lookup. nmr_solvent is a separate widget
-    # so the user can decouple if needed.
-    wf.bind(solvent,     to=[xtb, crest, dftopt, thermo],             key="solvent")
-    wf.bind(nmr_solvent, to=aggNmr,                                   key="solvent")
+    # Solvent fans out to QC SMD/ALPB consumers AND nmr-aggregate's
+    # calibration-table lookup — same key, same value.
+    wf.bind(solvent, to=[xtb, crest, dftopt, thermo, aggNmr], key="solvent")
 
     # xTB / CREST knobs.
     wf.bind(xtb_theory, to=[xtb, crest], key="theory")
