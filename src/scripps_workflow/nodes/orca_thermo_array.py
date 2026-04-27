@@ -61,12 +61,13 @@ Config keys (``key=value`` tokens or one JSON object) — same shape as
     monitor_timeout_min    wall-clock cap (0 = no cap)                  [0]
     silence_openib         set ``OMPI_MCA_btl=^openib`` in the array   [true]
 
-Optional NMR section (all default off — when every flag is False the
-node behaves exactly like the freq[+SP] runner described above):
+Optional NMR section (all default ON because this node is the
+shielding/coupling generator for the NMR Predictor pipeline — set all
+three flags to ``false`` to degrade back to a pure freq[+SP] run):
 
-    run_shielding_h           append a 1H shielding job                [false]
-    run_shielding_c           append a 13C shielding job               [false]
-    run_couplings             append a 1H-1H coupling job              [false]
+    run_shielding_h           append a 1H shielding job                [true]
+    run_shielding_c           append a 13C shielding job               [true]
+    run_couplings             append a 1H-1H coupling job              [true]
     shielding_method_h        functional for the 1H job                ["WP04"]
     shielding_basis_h         basis set for the 1H job                 ["6-311++G(2d,p)"]
     shielding_method_c        functional for the 13C job               ["wB97X-D"]
@@ -450,15 +451,19 @@ class OrcaThermoArray(Node):
 
         # ---- NMR section ----
         # Three booleans gate the optional shielding/coupling jobs
-        # appended after the freq+SP. When all three are False (the
-        # default) the node behaves exactly as before — pure
-        # freq+SP. Method/basis fall back to the cheshire defaults
-        # so an operator who only flips ``run_shielding_h=true`` gets
-        # the same recipe the matching ``nmr_aggregate`` calibration
-        # was fit for.
-        run_shielding_h = parse_bool(raw.get("run_shielding_h"), False)
-        run_shielding_c = parse_bool(raw.get("run_shielding_c"), False)
-        run_couplings = parse_bool(raw.get("run_couplings"), False)
+        # appended after the freq+SP. Defaults are ``True`` because
+        # this node is the heart of the ``NMR Predictor`` workflow —
+        # the downstream ``nmr_aggregate`` aborts with
+        # ``no_shielding_data_in_any_conformer`` whenever none of the
+        # three are run. Method/basis fall back to the cheshire
+        # defaults so an operator who flips one off (e.g.
+        # ``run_couplings=false`` to skip J-couplings on a big system)
+        # gets the same recipe the matching ``nmr_aggregate``
+        # calibration was fit for. Set all three to ``false`` to
+        # degrade gracefully back to a pure freq+SP run.
+        run_shielding_h = parse_bool(raw.get("run_shielding_h"), True)
+        run_shielding_c = parse_bool(raw.get("run_shielding_c"), True)
+        run_couplings = parse_bool(raw.get("run_couplings"), True)
 
         shielding_method_h = (
             normalize_optional_str(raw.get("shielding_method_h"))
