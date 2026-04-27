@@ -105,6 +105,7 @@ from ..node import Node, NodeContext
 from ..orca import (
     concat_xyz_files,
     make_orca_compound_input,
+    make_orca_simple_input,
     nmr_coupling_block,
     nmr_shielding_block,
     orca_terminated_normally,
@@ -173,6 +174,19 @@ DEFAULT_NPROCS: int = 8
 ORCA_INP_NAME: str = "orca_thermo.inp"
 ORCA_OUT_NAME: str = "orca_thermo.out"
 
+#: Per-task NMR input/output filenames. Each NMR job runs as a SEPARATE
+#: ORCA invocation (not via ``$new_job``) so that method-state flags
+#: like VV10/NL, D3/D4, gCP, etc. cannot leak from the freq+SP compound
+#: into the chemically-unrelated NMR calculations. The cost is one
+#: extra ORCA boot per job (~5–10 s of overhead); the benefit is
+#: bulletproof state isolation for any future functional combination.
+ORCA_NMR_H_INP_NAME: str = "orca_nmr_h.inp"
+ORCA_NMR_H_OUT_NAME: str = "orca_nmr_h.out"
+ORCA_NMR_C_INP_NAME: str = "orca_nmr_c.inp"
+ORCA_NMR_C_OUT_NAME: str = "orca_nmr_c.out"
+ORCA_NMR_J_INP_NAME: str = "orca_nmr_j.inp"
+ORCA_NMR_J_OUT_NAME: str = "orca_nmr_j.out"
+
 
 # --------------------------------------------------------------------
 # NMR defaults — kept in sync with
@@ -208,84 +222,92 @@ DEFAULT_COUPLING_PAIRS: tuple[str, ...] = ("all H",)
 DEFAULT_COUPLING_THRESH_ANGSTROM: float = 8.0
 
 
-def build_nmr_post_jobs(*, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Translate the NMR config knobs into a ``post_jobs`` chain.
+def build_nmr_input_files(
+    *,
+    cfg: dict[str, Any],
+    multiplicity: int,
+    xyz_filename: str = "input.xyz",
+) -> dict[str, str]:
+    """Translate the NMR config knobs into standalone ORCA ``.inp`` files.
 
-    Returns a list of post-job specs (in the shape consumed by
-    :func:`scripps_workflow.orca.make_orca_compound_input`) for every
-    NMR job the config requested. Empty list if no NMR is requested.
+    Returns a mapping ``{filename: input_text}`` with one entry per
+    enabled NMR job. Empty dict when none are enabled.
 
-    The job order is (when all three are enabled):
+    Each file is a complete, standalone ORCA simple input — *not* a
+    ``$new_job`` chain. Running them as separate ORCA invocations
+    eliminates method-state leakage (DFT-NL/VV10, D3/D4, gCP, …) from
+    the freq+SP compound that ran upstream. The trade-off is one
+    extra ORCA boot per job (~5–10 s of basis-set / functional-table
+    init); the win is bulletproof isolation for any future
+    functional combination, including the WP04 ¹H + wB97X-D3 ¹³C +
+    mPW1PW91 J-coupling chain whose cross-functional state mismatch
+    used to abort the run.
 
-        1. ¹H shielding   (``kind="shielding_h"``)
-        2. ¹³C shielding  (``kind="shielding_c"``)
-        3. ¹H–¹H couplings (``kind="couplings_hh"``)
+    Filenames returned (only those whose ``run_*`` flag is True):
 
-    Each job is rendered as a single ``$new_job`` segment by the
-    compound-input writer, sharing the same charge/multiplicity/
-    solvent as the freq+SP jobs above it. Method/basis come from the
-    matching ``shielding_method_*``/``shielding_basis_*`` /
-    ``coupling_method``/``coupling_basis`` config keys.
+        * :data:`ORCA_NMR_H_INP_NAME` — ¹H GIAO shielding
+        * :data:`ORCA_NMR_C_INP_NAME` — ¹³C GIAO shielding
+        * :data:`ORCA_NMR_J_INP_NAME` — ¹H–¹H J-couplings
+
+    Method/basis come from the matching ``shielding_method_*`` /
+    ``shielding_basis_*`` / ``coupling_method`` / ``coupling_basis``
+    config keys; functional aliases (e.g. ``WP04``, ``wB97X-D``) are
+    resolved via :func:`scripps_workflow.orca.resolve_functional_alias`.
 
     Pure function — no I/O — so it's easy to unit-test against
     config dicts.
     """
-    post_jobs: list[dict[str, Any]] = []
+    files: dict[str, str] = {}
 
     aux = str(cfg.get("nmr_aux_keywords", DEFAULT_NMR_AUX_KEYWORDS)).strip()
     aux_suffix = f" {aux}" if aux else ""
 
+    common = {
+        "nprocs": cfg["nprocs"],
+        "maxcore": cfg["maxcore"],
+        "charge": cfg["charge"],
+        "multiplicity": multiplicity,
+        "solvent": cfg["solvent"],
+        "smd_solvent_override": cfg["smd_solvent"],
+        "xyz_filename": xyz_filename,
+    }
+
     if cfg.get("run_shielding_h"):
         h_method, h_extras = resolve_functional_alias(cfg["shielding_method_h"])
-        post_jobs.append(
-            {
-                "kind": "shielding_h",
-                "keywords": (
-                    f"NMR {h_method} "
-                    f"{cfg['shielding_basis_h']}{aux_suffix}"
-                ),
-                "extra_blocks": [*h_extras, nmr_shielding_block("all H")],
-            }
+        files[ORCA_NMR_H_INP_NAME] = make_orca_simple_input(
+            keywords=f"NMR {h_method} {cfg['shielding_basis_h']}{aux_suffix}",
+            extra_blocks=[*h_extras, nmr_shielding_block("all H")],
+            **common,
         )
 
     if cfg.get("run_shielding_c"):
         c_method, c_extras = resolve_functional_alias(cfg["shielding_method_c"])
-        post_jobs.append(
-            {
-                "kind": "shielding_c",
-                "keywords": (
-                    f"NMR {c_method} "
-                    f"{cfg['shielding_basis_c']}{aux_suffix}"
-                ),
-                "extra_blocks": [*c_extras, nmr_shielding_block("all C")],
-            }
+        files[ORCA_NMR_C_INP_NAME] = make_orca_simple_input(
+            keywords=f"NMR {c_method} {cfg['shielding_basis_c']}{aux_suffix}",
+            extra_blocks=[*c_extras, nmr_shielding_block("all C")],
+            **common,
         )
 
     if cfg.get("run_couplings"):
         pairs = list(cfg.get("coupling_pairs") or DEFAULT_COUPLING_PAIRS)
         thresh = cfg.get("coupling_thresh_angstrom")
         j_method, j_extras = resolve_functional_alias(cfg["coupling_method"])
-        post_jobs.append(
-            {
-                "kind": "couplings_hh",
-                "keywords": (
-                    f"NMR {j_method} "
-                    f"{cfg['coupling_basis']}{aux_suffix}"
-                ),
-                "extra_blocks": [
-                    *j_extras,
-                    nmr_coupling_block(
-                        pairs,
-                        ssall=True,
-                        spinspin_thresh=(
-                            float(thresh) if thresh is not None else None
-                        ),
+        files[ORCA_NMR_J_INP_NAME] = make_orca_simple_input(
+            keywords=f"NMR {j_method} {cfg['coupling_basis']}{aux_suffix}",
+            extra_blocks=[
+                *j_extras,
+                nmr_coupling_block(
+                    pairs,
+                    ssall=True,
+                    spinspin_thresh=(
+                        float(thresh) if thresh is not None else None
                     ),
-                ],
-            }
+                ),
+            ],
+            **common,
         )
 
-    return post_jobs
+    return files
 
 
 # --------------------------------------------------------------------
@@ -299,15 +321,20 @@ def build_thermo_task_dirs(
     tasks_root: Path,
     inp_text: str,
     inp_name: str = ORCA_INP_NAME,
+    extra_inputs: dict[str, str] | None = None,
 ) -> None:
     """Per-conformer task dir, each with ``input.xyz`` + ``<inp_name>``.
 
     Same shape as :func:`orca_dft_array.build_task_dirs` modulo the
     default ``inp_name``. Kept as a thin wrapper for clarity at the
-    call site (``build_thermo_task_dirs`` reads better than
-    ``build_task_dirs(..., inp_name="orca_thermo.inp")`` in this node's
-    ``run`` method, and it lets the test file lock the thermo-specific
-    filename without piggy-backing on the DFT helper's tests).
+    call site.
+
+    :param extra_inputs: Optional ``{filename: text}`` map of extra
+        ORCA inputs to materialize in each task dir. Used by the NMR
+        pipeline to drop standalone ``orca_nmr_h.inp`` /
+        ``orca_nmr_c.inp`` / ``orca_nmr_j.inp`` next to the freq+SP
+        compound; the SLURM per-task body runs each as its own
+        invocation so method-state flags can't leak between them.
     """
     tasks_root.mkdir(parents=True, exist_ok=True)
     for i, src_xyz in enumerate(staged_paths, start=1):
@@ -315,6 +342,8 @@ def build_thermo_task_dirs(
         task_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_xyz, task_dir / "input.xyz")
         (task_dir / inp_name).write_text(inp_text, encoding="utf-8")
+        for name, text in (extra_inputs or {}).items():
+            (task_dir / name).write_text(text, encoding="utf-8")
 
 
 def collect_thermo_outputs(
@@ -544,7 +573,7 @@ class OrcaThermoArray(Node):
             "monitor_interval_s": monitor_interval_s,
             "monitor_timeout_min": monitor_timeout_min,
             "silence_openib": parse_bool(raw.get("silence_openib"), True),
-            # NMR knobs (forwarded to build_nmr_post_jobs in run()):
+            # NMR knobs (forwarded to build_nmr_input_files in run()):
             "run_shielding_h": run_shielding_h,
             "run_shielding_c": run_shielding_c,
             "run_couplings": run_couplings,
@@ -656,16 +685,19 @@ class OrcaThermoArray(Node):
         tasks_root.mkdir(parents=True, exist_ok=True)
         slurm_logs.mkdir(parents=True, exist_ok=True)
 
-        # Assemble any optional NMR jobs into a post_jobs chain that
-        # will be appended after the freq+SP via ``$new_job``. Empty
-        # list when no NMR knobs are flipped — the compound writer
-        # then degenerates to the classic freq[+SP] shape.
-        post_jobs = build_nmr_post_jobs(cfg=cfg)
-
+        # The freq+SP compound stays as ONE ORCA invocation (the
+        # r2scan-3c → wB97M-V transition is well-covered by the
+        # auto-injected DFTDOPT/DoGCP reset block). The NMR jobs,
+        # however, are emitted as SEPARATE standalone ORCA inputs —
+        # one ``orca_nmr_*.inp`` each — so method-state flags like
+        # VV10/NL can't leak from the wB97M-V SP into the chemically
+        # unrelated WP04/wB97X-D3/mPW1PW91 NMR functionals. Each NMR
+        # job runs as a fresh ORCA process, paying ~5–10 s of init
+        # overhead for bulletproof state isolation.
         inp_text = make_orca_compound_input(
             keywords=cfg["keywords"],
             singlepoint_keywords=cfg["singlepoint_keywords"],
-            post_jobs=post_jobs or None,
+            post_jobs=None,
             nprocs=cfg["nprocs"],
             maxcore=cfg["maxcore"],
             charge=cfg["charge"],
@@ -674,19 +706,39 @@ class OrcaThermoArray(Node):
             smd_solvent_override=cfg["smd_solvent"],
             xyz_filename="input.xyz",
         )
+        nmr_inputs = build_nmr_input_files(
+            cfg=cfg, multiplicity=multiplicity, xyz_filename="input.xyz",
+        )
         build_thermo_task_dirs(
             staged_paths=staged_paths,
             tasks_root=tasks_root,
             inp_text=inp_text,
             inp_name=ORCA_INP_NAME,
+            extra_inputs=nmr_inputs,
         )
 
         # ----- 3) Render SLURM array script -----
         job_name = cfg["job_name"] or f"orca_thermo_array_{n_tasks}"
-        per_task_body = standard_orca_per_task_body(
-            inp_filename=ORCA_INP_NAME,
-            out_filename=ORCA_OUT_NAME,
-        )
+        # Build the (inp, out) sequence: freq+SP first, then each
+        # enabled NMR job as its own ORCA call. mapping is locked to
+        # ORCA_NMR_*_INP_NAME / ORCA_NMR_*_OUT_NAME constants so
+        # nmr_aggregate can find them by name without rummaging.
+        nmr_out_map = {
+            ORCA_NMR_H_INP_NAME: ORCA_NMR_H_OUT_NAME,
+            ORCA_NMR_C_INP_NAME: ORCA_NMR_C_OUT_NAME,
+            ORCA_NMR_J_INP_NAME: ORCA_NMR_J_OUT_NAME,
+        }
+        orca_jobs: list[tuple[str, str]] = [(ORCA_INP_NAME, ORCA_OUT_NAME)]
+        for inp_name in nmr_inputs:
+            orca_jobs.append((inp_name, nmr_out_map[inp_name]))
+        if len(orca_jobs) == 1:
+            per_task_body = standard_orca_per_task_body(
+                inp_filename=ORCA_INP_NAME,
+                out_filename=ORCA_OUT_NAME,
+            )
+        else:
+            from ..slurm import multi_orca_per_task_body
+            per_task_body = multi_orca_per_task_body(jobs=orca_jobs)
         slurm_text = make_array_slurm_text(
             job_name=job_name,
             n_tasks=n_tasks,
@@ -966,7 +1018,13 @@ __all__ = [
     "ORCA_INP_NAME",
     "ORCA_OUT_NAME",
     "OrcaThermoArray",
-    "build_nmr_post_jobs",
+    "build_nmr_input_files",
+    "ORCA_NMR_H_INP_NAME",
+    "ORCA_NMR_H_OUT_NAME",
+    "ORCA_NMR_C_INP_NAME",
+    "ORCA_NMR_C_OUT_NAME",
+    "ORCA_NMR_J_INP_NAME",
+    "ORCA_NMR_J_OUT_NAME",
     "build_thermo_task_dirs",
     "collect_thermo_outputs",
     "main",

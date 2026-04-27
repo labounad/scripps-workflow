@@ -537,6 +537,48 @@ def standard_orca_per_task_body(
     )
 
 
+def multi_orca_per_task_body(
+    *,
+    jobs: list[tuple[str, str]],
+) -> str:
+    """Run multiple ORCA invocations sequentially in one SLURM task.
+
+    Each ``(inp_filename, out_filename)`` pair becomes a fresh ORCA
+    process — completely isolated from its neighbors — so method-state
+    flags (DFT-NL/VV10, D3/D4, gCP, …) cannot leak between them. Used
+    by the thermo-array node to keep the freq+SP compound separate
+    from the WP04 ¹H, wB97X-D3 ¹³C, and mPW1PW91 J-coupling NMR jobs.
+
+    Fail-fast: any non-zero ORCA exit aborts the chain, records the
+    return code, and marks the task failed. The first job is the
+    "primary" — its sentinel filename is what the manifest's
+    ``ORCA_OUT_NAME`` points at — so when only one job is supplied
+    this helper produces a body equivalent to
+    :func:`standard_orca_per_task_body`.
+
+    :param jobs: Ordered list of ``(inp, out)`` filename pairs
+        (relative to the task dir). Must contain at least one entry.
+    """
+    if not jobs:
+        raise ValueError("multi_orca_per_task_body: jobs must be non-empty")
+
+    parts: list[str] = []
+    for i, (inp, out) in enumerate(jobs, start=1):
+        parts.append(
+            f'echo "[wf-array] task=${{TASK_ID}} job {i}/{len(jobs)}: '
+            f'{inp} -> {out}"\n'
+            f'if ! "${{ORCA_BIN}}" "{inp}" > "{out}"; then\n'
+            f"  rc=$?\n"
+            f'  echo "[wf-array] task=${{TASK_ID}} ORCA job {i}/{len(jobs)} '
+            f'({inp}) failed rc=${{rc}}" >&2\n'
+            f'  mark_failure "${{rc}}"\n'
+            f'  exit "${{rc}}"\n'
+            f"fi\n"
+        )
+    parts.append("mark_success\n")
+    return "\n".join(parts)
+
+
 # --------------------------------------------------------------------
 # sacct → per-task failure aggregation
 # --------------------------------------------------------------------
@@ -594,4 +636,5 @@ __all__ = [
     "sbatch_submit",
     "squeue_has_any",
     "standard_orca_per_task_body",
+    "multi_orca_per_task_body",
 ]

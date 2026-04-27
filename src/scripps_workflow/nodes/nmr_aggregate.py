@@ -513,18 +513,44 @@ class NmrAggregate(Node):
                 per_conformer_couplings.append(None)
                 continue
             task_dir = Path(task_dir_str)
-            thermo_out, _sp_out = pick_orca_outputs(task_dir)
-            if thermo_out is None:
-                per_conformer_shieldings.append(None)
-                per_conformer_couplings.append(None)
-                continue
 
-            sh = parse_orca_shieldings(thermo_out)
+            # Shieldings live in the dedicated standalone NMR ``.out``
+            # files (``orca_nmr_h.out`` for ¹H, ``orca_nmr_c.out`` for
+            # ¹³C). Couplings live in ``orca_nmr_j.out``. These are
+            # produced by orca_thermo_array as separate ORCA invocations
+            # so the GIAO functionals (WP04, wB97X-D3, mPW1PW91) don't
+            # inherit method-state flags from the wB97M-V SP that ran
+            # earlier in the task. For backward compat with older runs
+            # that used a single compound ``orca_thermo.out`` we fall
+            # back to that file when the dedicated NMR outputs aren't
+            # present, picking up shieldings/couplings from any
+            # ``$new_job`` blocks the parser finds inside.
+            sh: list[dict[str, Any]] = []
+            for out_name in ("orca_nmr_h.out", "orca_nmr_c.out"):
+                p = task_dir / out_name
+                if p.exists():
+                    sh.extend(parse_orca_shieldings(p))
+            cp: list[dict[str, Any]] = []
+            j_out = task_dir / "orca_nmr_j.out"
+            if j_out.exists() and not cfg["skip_couplings"]:
+                cp.extend(parse_orca_couplings(j_out))
+
+            # Backward-compat: if no dedicated NMR outputs were found,
+            # try the legacy single-compound ``orca_thermo.out`` shape.
+            if not sh and not cp:
+                thermo_out, _sp_out = pick_orca_outputs(task_dir)
+                if thermo_out is None:
+                    per_conformer_shieldings.append(None)
+                    per_conformer_couplings.append(None)
+                    continue
+                sh = parse_orca_shieldings(thermo_out)
+                if not cfg["skip_couplings"]:
+                    cp = parse_orca_couplings(thermo_out)
+
             per_conformer_shieldings.append(sh or None)
             if cfg["skip_couplings"]:
                 per_conformer_couplings.append(None)
             else:
-                cp = parse_orca_couplings(thermo_out)
                 per_conformer_couplings.append(cp or None)
 
         if not any(isinstance(w, (int, float)) for w in weights):

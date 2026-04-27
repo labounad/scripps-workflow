@@ -469,11 +469,23 @@ def resolve_functional_alias(method: str) -> tuple[str, list[str]]:
       ScalGGAC ...``. Wiitala–Cramer–Hoye 2006 reparametrization of
       B3LYP/G; standard cheshire ¹H NMR functional.
 
+    * ``wB97X-D`` → ``wB97X-D3``. ORCA 6 dropped the bare ``wB97X-D``
+      simple-input keyword (a stand-in for Chai–Head-Gordon 2008,
+      which used D2-style dispersion). The closest in-tree analog is
+      ``wB97X-D3`` (zero-damping D3). Calibrations fit against the
+      original "wB97X-D" are typically transferable since the
+      functional form is identical and only the dispersion kernel
+      changed; if you need exact-match accuracy, swap to ``wB97X-V``
+      and refit the calibration.
+
     Add new entries here as the lab adopts other custom functionals.
     """
     m = (method or "").strip()
-    if m.lower() == "wp04":
+    low = m.lower()
+    if low == "wp04":
         return ("B3LYP/G", [_WP04_METHOD_BLOCK])
+    if low == "wb97x-d":
+        return ("wB97X-D3", [])
     return (m, [])
 
 
