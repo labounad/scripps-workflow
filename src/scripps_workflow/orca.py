@@ -200,6 +200,43 @@ def make_orca_simple_input(
     return "\n".join(lines)
 
 
+#: Composite "3c" methods (r2SCAN-3c, B97-3c, HF-3c, PBEh-3c, B3LYP-3c,
+#: ωB97X-3c). These bake D3/D4 dispersion + gCP geometric counterpoise
+#: into the SCF, and ORCA propagates those ``%method`` settings into
+#: every subsequent ``$new_job`` block. If the next job uses a
+#: nonlocal-VV10 functional (``wB97M-V``, ``wB97X-V``, ``B97M-V``, ...)
+#: ORCA hard-aborts with::
+#:
+#:     DFT-NL dispersion correction can not be applied together with D3/D4!
+#:
+#: To break the leak we inject ``%method DFTDOPT 0; DoGCP false; end``
+#: at the top of every post-job when the *first* job is a 3c composite.
+#: See :func:`_uses_3c_composite_method` and the
+#: ``reset_3c_dispersion_in_post_jobs`` knob below.
+_3C_COMPOSITE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:r2scan|b97|hf|pbeh|b3lyp|wb97x|ωb97x)-3c(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+_DISPERSION_RESET_BLOCK = (
+    "%method\n"
+    "  DFTDOPT 0\n"
+    "  DoGCP false\n"
+    "end"
+)
+
+
+def _uses_3c_composite_method(keywords: str) -> bool:
+    """True if ``keywords`` names a composite ``*-3c`` ORCA method.
+
+    Used to decide whether to prepend a dispersion/gCP reset block to
+    each post-job in :func:`make_orca_compound_input` so a leaking
+    ``%method DFTDOPT/DoGCP`` doesn't collide with VV10-type
+    nonlocal-dispersion functionals downstream.
+    """
+    return bool(_3C_COMPOSITE_PATTERN.search(keywords or ""))
+
+
 def make_orca_compound_input(
     *,
     keywords: str,
@@ -212,6 +249,7 @@ def make_orca_compound_input(
     solvent: Optional[str],
     smd_solvent_override: Optional[str] = None,
     xyz_filename: str = "input.xyz",
+    reset_3c_dispersion_in_post_jobs: bool = True,
 ) -> str:
     """Render a chain of ORCA jobs separated by ``$new_job``.
 
@@ -263,6 +301,17 @@ def make_orca_compound_input(
         nprocs / maxcore / charge / multiplicity / solvent /
         smd_solvent_override / xyz_filename:
             Forwarded to every job verbatim.
+        reset_3c_dispersion_in_post_jobs: When the first job uses a
+            composite ``*-3c`` method (which silently enables D3/D4 +
+            gCP via ``%method``), prepend a ``%method DFTDOPT 0; DoGCP
+            false; end`` block to every post-job's ``extra_blocks``.
+            Without this, ORCA aborts the second job with "DFT-NL
+            dispersion correction can not be applied together with
+            D3/D4" whenever that job uses a nonlocal-VV10 functional
+            (``wB97M-V``, ``wB97X-V``, ``B97M-V``, ...). Defaults to
+            ``True`` and is a no-op when the first job isn't a 3c
+            composite. Set to ``False`` to suppress the injection if
+            you're hand-tuning the chain.
     """
     # Normalize the call shape into a single list of jobs.
     jobs: list[dict[str, Any]] = []
@@ -297,8 +346,19 @@ def make_orca_compound_input(
     if not jobs:
         return job1
 
+    # Decide once: does the first job leak D3/D4 + gCP via %method?
+    # If so, every post-job needs the reset block prepended (idempotent —
+    # skipped if a caller already supplied an explicit %method override).
+    inject_reset = (
+        reset_3c_dispersion_in_post_jobs
+        and _uses_3c_composite_method(keywords)
+    )
+
     chunks: list[str] = [job1]
     for spec in jobs:
+        spec_extra = list(spec.get("extra_blocks") or [])
+        if inject_reset and not _has_method_block(spec_extra):
+            spec_extra.insert(0, _DISPERSION_RESET_BLOCK)
         block = make_orca_simple_input(
             keywords=spec["keywords"],
             nprocs=nprocs,
@@ -308,13 +368,29 @@ def make_orca_compound_input(
             solvent=solvent,
             smd_solvent_override=smd_solvent_override,
             xyz_filename=xyz_filename,
-            extra_blocks=spec.get("extra_blocks"),
+            extra_blocks=spec_extra or None,
         )
         # ``make_orca_simple_input`` ends with a trailing newline (the
         # xyz line). One blank line + ``$new_job`` + blank, then the
         # next block — keeps the file readable.
         chunks.append("\n$new_job\n\n" + block)
     return "".join(chunks)
+
+
+def _has_method_block(extra_blocks: list[str]) -> bool:
+    """True if any ``extra_blocks`` entry already opens a ``%method`` block.
+
+    Used to make the 3c-dispersion-reset injection idempotent: a caller
+    who hand-rolls a ``%method`` block for some other reason (e.g.
+    custom functional definition) is assumed to know what they're
+    doing, and we leave their settings alone rather than stacking a
+    second ``%method`` block on top.
+    """
+    for raw in extra_blocks:
+        text = (raw or "").strip().lower()
+        if text.startswith("%method"):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------
@@ -1106,6 +1182,7 @@ __all__ = [
     "concat_xyz_files",
     "make_orca_compound_input",
     "make_orca_simple_input",
+    "_uses_3c_composite_method",
     "nmr_coupling_block",
     "nmr_shielding_block",
     "orca_terminated_normally",
