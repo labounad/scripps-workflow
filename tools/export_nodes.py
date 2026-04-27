@@ -65,7 +65,13 @@ DEFAULT_ENV_PY = "/gpfs/group/shenvi/envs/workflow/bin/python"
 DEFAULT_HOST = "workflow.scripps.edu"
 DEFAULT_VERSION = "1.1.0"
 DEFAULT_CATEGORY = "Script"
-DEFAULT_OUTPUT_NAME = "pointer JSON"
+# Engine convention: every Process node's stdout socket is named "stdout"
+# in both the per-node bundle and the workflow connections. The actual
+# *content* type flowing on that socket is communicated via the `tags`
+# string — typically "pointer JSON" for nodes that emit a wf.pointer.v1
+# manifest pointer, and "" for tag nodes that emit a "key=value" token.
+DEFAULT_OUTPUT_NAME = "stdout"
+DEFAULT_OUTPUT_TAGS = "pointer JSON"
 
 
 @dataclass
@@ -76,6 +82,7 @@ class NodeSpec:
     is_source: bool = False
     inputs: list[str] = field(default_factory=list)  # excludes "pointer JSON"
     outputs: list[str] = field(default_factory=lambda: [DEFAULT_OUTPUT_NAME])
+    output_tags: str = DEFAULT_OUTPUT_TAGS
     category: str = DEFAULT_CATEGORY
 
 
@@ -97,9 +104,15 @@ NODES: dict[str, NodeSpec] = {
         NodeSpec(
             name="wf-tag-input",
             module="tag_input",
-            description="Engine wiring shim: relay a single key=value pair downstream as a pointer.",
+            description=(
+                "Engine wiring shim: emit a literal 'key=value' string on stdout. "
+                "Unlike every other node here, tag nodes intentionally break the "
+                "wf.pointer.v1 contract — downstream consumers parse the token "
+                "as a config argv token, not a manifest pointer."
+            ),
             is_source=True,
             inputs=["key", "value"],
+            output_tags="",
         ),
         # --- conformer / QC pipeline ---
         NodeSpec(
@@ -261,13 +274,15 @@ def _make_input_record(name: str, iid: int, node_id: int, *, type_: str = "text"
     }
 
 
-def _make_output_record(name: str, oid: int, node_id: int, *, type_: str = "text") -> dict:
+def _make_output_record(
+    name: str, oid: int, node_id: int, *, type_: str = "text", tags: str = "",
+) -> dict:
     return {
         "node_output_id": oid,
         "node_id": node_id,
         "name": name,
         "type": type_,
-        "tags": "",
+        "tags": tags,
         "new_id": oid,
     }
 
@@ -322,8 +337,14 @@ def build_metadata(
     host: str,
     version: str,
     node_id: int | None = None,
+    input_types: dict[str, str] | None = None,
 ) -> dict:
-    """Produce the top-level ``<name>.json`` GUI descriptor for one node."""
+    """Produce the top-level ``<name>.json`` GUI descriptor for one node.
+
+    :param input_types: Optional override for the GUI ``type`` field of
+        named inputs (default ``"text"``). Used by tag-instance bundles
+        so a numeric upstream widget surfaces as ``value: number``.
+    """
     # node_id derived from the name keeps it stable across exports so a
     # workflow bundle's content/connection records can reference the
     # same value the per-node bundle declares.
@@ -333,6 +354,8 @@ def build_metadata(
     inputs = list(spec.inputs)
     if not spec.is_source:
         inputs = ["pointer JSON", *inputs]
+
+    input_types = input_types or {}
 
     return {
         "node_id": node_id,
@@ -351,11 +374,17 @@ def build_metadata(
         "limit": "",
         "files_info": _make_files_info(node_id),
         "inputs": [
-            _make_input_record(n, derive_input_id(spec.name, n), node_id)
+            _make_input_record(
+                n, derive_input_id(spec.name, n), node_id,
+                type_=input_types.get(n, "text"),
+            )
             for n in inputs
         ],
         "outputs": [
-            _make_output_record(n, derive_output_id(spec.name, n), node_id)
+            _make_output_record(
+                n, derive_output_id(spec.name, n), node_id,
+                tags=spec.output_tags,
+            )
             for n in spec.outputs
         ],
         "params": [],

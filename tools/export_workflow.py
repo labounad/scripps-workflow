@@ -178,6 +178,10 @@ class _Process:
     # by string key without re-scanning lists.
     input_ids: dict[str, int] = field(default_factory=dict)
     output_ids: dict[str, int] = field(default_factory=dict)
+    # Per-instance overrides for the GUI ``type`` field of named inputs.
+    # Empty for stock process nodes; populated for tag instances so the
+    # ``value`` socket carries the upstream widget's kind (e.g. number).
+    input_types: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -321,6 +325,7 @@ class Workflow:
         self, spec: NodeSpec, *, at: tuple[int, int],
         alias: str | None = None, is_tag: bool = False,
         tag_key: str | None = None,
+        input_types: dict[str, str] | None = None,
     ) -> _Process:
         node_name = spec.name
         node_id = derive_node_id(node_name)
@@ -330,12 +335,13 @@ class Workflow:
         if not spec.is_source:
             inputs_named = ["pointer JSON", *inputs_named]
 
+        input_types = input_types or {}
         input_records = [
             {
                 "node_input_id": derive_input_id(node_name, n),
                 "node_id": node_id,
                 "name": n,
-                "type": "text",
+                "type": input_types.get(n, "text"),
                 "tags": "",
                 "required": 1 if (n == "pointer JSON" and not spec.is_source) else 0,
             }
@@ -347,7 +353,7 @@ class Workflow:
                 "node_id": node_id,
                 "name": n,
                 "type": "text",
-                "tags": "",
+                "tags": spec.output_tags,
             }
             for n in spec.outputs
         ]
@@ -372,6 +378,7 @@ class Workflow:
             tag_key=tag_key,
             input_ids={r["name"]: r["node_input_id"] for r in input_records},
             output_ids={r["name"]: r["node_output_id"] for r in output_records},
+            input_types=dict(input_types),
         )
         self._processes.append(proc)
         return proc
@@ -443,7 +450,10 @@ class Workflow:
         if not targets:
             raise ValueError("bind() needs at least one target process")
 
-        tag = self._get_or_make_tag(key, at=tag_at, near=widget.placement)
+        tag = self._get_or_make_tag(
+            key, at=tag_at, near=widget.placement,
+            value_type=widget.output_type,
+        )
 
         # Widget -> tag (one connection regardless of fan-out)
         if not any(c.src is widget.placement and c.dst is tag.placement
@@ -458,8 +468,12 @@ class Workflow:
                 input_name="value",
             ))
 
-        # Tag -> each consumer
-        tag_out_id = tag.output_ids["pointer JSON"]
+        # Tag -> each consumer. Tag nodes emit on the canonical "stdout"
+        # output socket (engine convention); the *content* is a key=value
+        # token, communicated downstream as the input_name on the
+        # consumer side.
+        tag_out_name = tag.spec.outputs[0] if tag.spec else "stdout"
+        tag_out_id = tag.output_ids[tag_out_name]
         for proc in targets:
             if key not in proc.input_ids:
                 raise KeyError(
@@ -472,7 +486,7 @@ class Workflow:
                 dst=proc.placement,
                 from_output=tag_out_id,
                 to_input=proc.input_ids[key],
-                output_name="pointer JSON",
+                output_name=tag_out_name,
                 input_name=key,
             ))
         return tag
@@ -480,19 +494,24 @@ class Workflow:
     def _get_or_make_tag(
         self, key: str, *, at: tuple[int, int] | None,
         near: _Placement | None,
+        value_type: str = "text",
     ) -> _Process:
         tag_name = f"tag_{key}"
         for p in self._processes:
             if p.is_tag and p.tag_key == key:
                 return p
-        # Synthesize a NodeSpec for the tag instance.
+        # Synthesize a NodeSpec for the tag instance. Tag nodes emit on
+        # the engine's canonical "stdout" socket with empty tags — the
+        # downstream consumer's input_name carries the semantic ("the
+        # token I'm receiving is for config key X").
         spec = NodeSpec(
             name=tag_name,
             module="tag_input",
             description=f'Tag value with "{key}=".',
             is_source=True,           # tag nodes don't take a pointer
             inputs=["value"],
-            outputs=["pointer JSON"],
+            outputs=["stdout"],
+            output_tags="",
             category="Script",
         )
         if at is None:
@@ -500,7 +519,10 @@ class Workflow:
                 at = (near.x + 150, near.y)
             else:
                 at = (0, 0)
-        return self._add_process_from_spec(spec, at=at, is_tag=True, tag_key=key)
+        return self._add_process_from_spec(
+            spec, at=at, is_tag=True, tag_key=key,
+            input_types={"value": value_type},
+        )
 
     # ---- id pools -------------------------------------------------------
 
@@ -550,6 +572,7 @@ class Workflow:
             "category": p.category,
             "name": p.name,
             "domain": "private",
+            "author": None,
             "inputs": p.inputs,
             "outputs": p.outputs,
             "node_params_data": [],
@@ -635,6 +658,7 @@ class Workflow:
             metadata = build_metadata(
                 spec, env_py=self.env_py, host=self.host,
                 version=self.node_version, node_id=node_id,
+                input_types=proc.input_types or None,
             )
             # Override name + description for tag instances so the GUI
             # shows ``tag_<key>`` instead of the bare ``tag_input`` name.
