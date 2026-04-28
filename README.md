@@ -98,13 +98,20 @@ The test suite avoids touching real external binaries (xtb, crest, orca) by monk
 | `wf-nmr-aggregate`      | Boltzmann-averaged NMR shifts + couplings + calibration  |
 | `wf-tag-input`          | Engine wiring shim — relay a single `key=value`          |
 
-The `wf-orca-thermo-array` node optionally chains GIAO shielding and
-spin-spin coupling jobs (`run_shielding_h`, `run_shielding_c`,
-`run_couplings`) into the same per-conformer ORCA invocation, separated
-by `$new_job`. The downstream `wf-nmr-aggregate` then population-weights
-the parsed shieldings/J's across the ensemble and applies a
-linear-scaling calibration (cheshire for shifts, Bally/Rablen for
-couplings) to produce predicted experimental observables.
+The `wf-orca-thermo-array` node runs a per-conformer compound protocol
+inside one SLURM array task. Each task may invoke ORCA multiple times
+sequentially: `orca_thermo.inp` (freq + high-level SP, internally
+chained via `$new_job`) and — when the corresponding `run_shielding_h`
+/ `run_shielding_c` / `run_couplings` flag is set — the standalone
+inputs `orca_nmr_h.inp`, `orca_nmr_c.inp`, and `orca_nmr_j.inp`. Each
+NMR file runs as its own ORCA process so method-state flags
+(DFT-NL/VV10, D3/D4, gCP, …) cannot leak between the
+chemically-unrelated functionals. The node emits raw ORCA output and
+does not apply any NMR referencing or scaling. The downstream
+`wf-nmr-aggregate` population-weights the parsed shieldings/J's across
+the ensemble and applies a linear-scaling calibration (cheshire for
+shifts, Bally/Rablen for couplings) to produce predicted experimental
+observables.
 
 ## License
 

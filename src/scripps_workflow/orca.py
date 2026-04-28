@@ -969,6 +969,41 @@ COUPLING_PAIR_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+#: ORCA 6 prints the per-pair header on a SINGLE line with
+#: element-then-index ordering and no comma separator::
+#:
+#:     NUCLEUS A = H    8 NUCLEUS B = H    9
+#:
+#: Captures (a_el, a_idx, b_el, b_idx). Tolerant of the index/element
+#: ordering being swapped on either side and of any whitespace between
+#: tokens.
+COUPLING_PAIR_SAME_LINE_RE: re.Pattern[str] = re.compile(
+    r"\bNUCLEUS\s+A\s*=\s*"
+    r"(?:([A-Z][a-z]?)\s+(\d+)|(\d+)\s+([A-Z][a-z]?))"
+    r"\s+NUCLEUS\s+B\s*=\s*"
+    r"(?:([A-Z][a-z]?)\s+(\d+)|(\d+)\s+([A-Z][a-z]?))",
+    re.IGNORECASE,
+)
+
+#: ORCA 6 emits per-term J values on lines like::
+#:
+#:     J[8,9](Total)              iso=    -14.978
+#:     J[8,9](FC)                 iso=    -15.001
+#:     J[8,9](SD)                 iso=      0.012
+#:     J[8,9](SD/FC)              iso=      0.001
+#:     J[8,9](PSO)                iso=      0.034
+#:     J[8,9](DSO)                iso=     -0.022
+#:
+#: Captures (i, j, term_label, iso_value). The term label
+#: distinguishes ``Total`` / ``FC`` / ``SD`` / ``SD/FC`` / ``PSO`` /
+#: ``DSO`` so the parser can route each value to the right slot.
+COUPLING_ISO_RE: re.Pattern[str] = re.compile(
+    r"J\[\s*(\d+)\s*,\s*(\d+)\s*\]"
+    r"\s*\((Total|FC|SD/FC|SD|PSO|DSO)\)"
+    r".*?\biso\s*=\s*(-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)",
+    re.IGNORECASE,
+)
+
 
 def parse_orca_shieldings(out_path: Path) -> list[dict[str, Any]]:
     """Parse the ``CHEMICAL SHIELDING SUMMARY`` table from an ORCA out.
@@ -1127,25 +1162,36 @@ def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
     (compound output) merge with last-occurrence-wins. Missing Ramsey
     terms are returned as ``None``.
 
-    Two header formats are supported:
+    Three header formats are supported:
 
-        * **Modern ORCA 6** — the per-pair block opens with two
-          consecutive lines::
+        * **ORCA 6 same-line** — the per-pair header is one line with
+          element-then-index ordering and no comma::
+
+              NUCLEUS A = H    8 NUCLEUS B = H    9
+
+          (this is what current ORCA 6 builds emit). Per-term values
+          appear several lines below as ``J[i,j](TERM)  iso= value``.
+
+        * **Modern multi-line** — two consecutive lines::
 
               Nucleus A: 0 C
               Nucleus B: 1 H
 
-          (or with element/index swapped, or with ``=`` instead of
-          ``:``). The parser pairs an ``A`` with the next ``B`` it
-          finds within a small look-ahead window.
+          (or with ``=`` instead of ``:``). Spelled-out term lines
+          (``Fermi contact contribution: ...``) follow.
 
-        * **Legacy** — a single ``NUCLEUS A = idx el, NUCLEUS B = idx
-          el`` line. Retained so older runs still parse.
+        * **Legacy single-line** — a ``NUCLEUS A = idx el, NUCLEUS B =
+          idx el`` line with comma separator. Retained so older runs
+          still parse.
 
-    For each identified pair, the next ~30 lines are scanned for the
-    five term lines (Total, Fermi-contact, spin-dipolar,
-    paramagnetic, diamagnetic) and the cross term. Spelled-out names
-    take precedence; bare abbreviations are accepted as fallbacks.
+    Block-bounded scanning: each pair header opens a block that runs
+    until the NEXT pair header (or EOF). Within the block we collect
+    every J-value the parser recognizes — ``J[i,j](TERM)  iso=`` lines
+    take precedence over spelled-out term lines because the index
+    annotation guarantees the value belongs to *this* pair. This
+    avoids the old "fixed-30-line lookahead" failure where ORCA's
+    actual output puts the Total line ~38 lines below the header.
+
     If ``Total`` was not printed, it is synthesized as
     ``FC + SD + PSO + DSO + (cross or 0)`` when all four Ramsey terms
     are present.
@@ -1160,18 +1206,55 @@ def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
     lines = text.splitlines()
     n = len(lines)
     pairs: dict[tuple[int, int], dict[str, Any]] = {}
-    # Look-ahead window for "Nucleus B" after "Nucleus A", and for term
-    # lines after a pair header. ORCA 6 puts the totals 8–15 lines below
-    # the header; 30 is a generous cap that still bails before drifting
-    # into the next pair.
+    # Look-ahead window for finding "Nucleus B" after "Nucleus A" in
+    # the multi-line header form. The block-end is found by walking
+    # forward to the next pair header (no fixed term-line cap).
     NUCLEUS_LOOKAHEAD = 6
-    TERM_LOOKAHEAD = 30
+
+    def _is_pair_header_line(idx: int) -> bool:
+        """True if ``lines[idx]`` opens a new pair header (any form)."""
+        if idx >= n:
+            return False
+        ln = lines[idx]
+        if COUPLING_PAIR_SAME_LINE_RE.search(ln) is not None:
+            return True
+        if COUPLING_PAIR_RE.search(ln) is not None:
+            return True
+        nuc = _parse_nucleus_line(ln)
+        return nuc is not None and nuc[0] == "A"
+
+    def _block_end(start: int) -> int:
+        """Return the line index where the block starting at ``start``
+        ends — i.e. the next pair-header line or EOF."""
+        j = start
+        while j < n:
+            if _is_pair_header_line(j):
+                return j
+            j += 1
+        return n
+
+    # Term-label -> record-key mapping for the J[i,j](TERM) iso= form.
+    _ISO_TERM_TO_KEY: dict[str, str] = {
+        "TOTAL": "J_total_hz",
+        "FC": "J_FC_hz",
+        "SD": "J_SD_hz",
+        "PSO": "J_PSO_hz",
+        "DSO": "J_DSO_hz",
+        # Cross term — kept locally for synthesized-Total fallback only,
+        # not surfaced in the per-pair record.
+        "SD/FC": "_cross",
+    }
 
     def _record_pair(
         a_idx: int, a_el: str, b_idx: int, b_el: str, scan_from: int
     ) -> int:
-        """Scan terms starting from ``scan_from``, register the pair,
-        and return the line index immediately past the scanned region."""
+        """Scan the per-pair block starting at ``scan_from``, register
+        the pair, and return the index of the next pair header (or
+        EOF). Block boundary is set by :func:`_block_end` — we scan
+        every line from ``scan_from`` up to (but not including) the
+        next pair header, so ORCA 6's wide spacing between header and
+        ``J[i,j](Total) iso=...`` line (often 30+ lines) is handled.
+        """
         key = (min(a_idx, b_idx), max(a_idx, b_idx))
         rec: dict[str, Any] = {
             "i": key[0],
@@ -1186,16 +1269,39 @@ def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
         }
         cross: Optional[float] = None
 
-        end = min(scan_from + TERM_LOOKAHEAD, n)
-        k = scan_from
-        while k < end:
+        end = _block_end(scan_from)
+        for k in range(scan_from, end):
             ln = lines[k]
-            # Stop early if we've drifted into the next pair header.
-            if (
-                _parse_nucleus_line(ln) is not None
-                or COUPLING_PAIR_RE.search(ln) is not None
-            ):
-                break
+            # Highest-priority form: ``J[i,j](TERM)  iso= value``. This
+            # is index-annotated so we can be SURE the value belongs
+            # to the (a_idx, b_idx) pair rather than a stray term line
+            # that drifted in from somewhere else.
+            for m_iso in COUPLING_ISO_RE.finditer(ln):
+                try:
+                    iso_i = int(m_iso.group(1))
+                    iso_j = int(m_iso.group(2))
+                except (ValueError, TypeError):
+                    continue
+                iso_key = (min(iso_i, iso_j), max(iso_i, iso_j))
+                if iso_key != key:
+                    continue
+                term_label = m_iso.group(3).upper()
+                slot = _ISO_TERM_TO_KEY.get(term_label)
+                if slot is None:
+                    continue
+                try:
+                    val = float(m_iso.group(4))
+                except (ValueError, TypeError):
+                    continue
+                if slot == "_cross":
+                    if cross is None:
+                        cross = val
+                elif rec[slot] is None:
+                    rec[slot] = val
+
+            # Fallback: spelled-out term names (older ORCA builds /
+            # different print levels). Only fills slots the
+            # higher-priority ``J[i,j]`` form didn't already capture.
             for term, pat in _COUPLING_TERM_PATTERNS.items():
                 if rec[term] is None:
                     mt = pat.search(ln)
@@ -1211,7 +1317,6 @@ def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
                         cross = float(mc.group(1))
                     except (ValueError, TypeError):
                         cross = None
-            k += 1
 
         # Synthesize Total when all four Ramsey terms are present but
         # Total wasn't printed (some print levels suppress it).
@@ -1227,33 +1332,54 @@ def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
                 rec["J_total_hz"] = total
 
         pairs[key] = rec
-        return k
+        return end
 
     i = 0
     while i < n:
         line = lines[i]
 
-        # Try the modern multi-line ``Nucleus A: ... / Nucleus B: ...``
-        # shape first.
+        # ORCA 6 same-line header MUST be checked first because
+        # COUPLING_NUCLEUS_RE will match its left half ("NUCLEUS A = H
+        # 8") on its own and the multi-line dispatch then fails to
+        # find a separate "Nucleus B" line — losing the pair.
+        m_same = COUPLING_PAIR_SAME_LINE_RE.search(line)
+        if m_same is not None:
+            # Each side is captured by one of two alternation branches:
+            # element-then-index OR index-then-element. Coalesce.
+            a_el = m_same.group(1) or m_same.group(4)
+            a_idx_s = m_same.group(2) or m_same.group(3)
+            b_el = m_same.group(5) or m_same.group(8)
+            b_idx_s = m_same.group(6) or m_same.group(7)
+            try:
+                a_idx = int(a_idx_s)
+                b_idx = int(b_idx_s)
+            except (TypeError, ValueError):
+                i += 1
+                continue
+            next_i = _record_pair(a_idx, a_el, b_idx, b_el, scan_from=i + 1)
+            i = next_i if next_i > i else i + 1
+            continue
+
+        # Modern multi-line ``Nucleus A: ... / Nucleus B: ...`` shape.
         nuc = _parse_nucleus_line(line)
         if nuc is not None and nuc[0] == "A":
             a_idx, a_el = nuc[1], nuc[2]
             j = i + 1
             j_end = min(j + NUCLEUS_LOOKAHEAD, n)
-            b_idx: Optional[int] = None
-            b_el: Optional[str] = None
+            b_idx_o: Optional[int] = None
+            b_el_o: Optional[str] = None
             while j < j_end:
                 nb = _parse_nucleus_line(lines[j])
                 if nb is not None and nb[0] == "B":
-                    b_idx, b_el = nb[1], nb[2]
+                    b_idx_o, b_el_o = nb[1], nb[2]
                     break
                 j += 1
-            if b_idx is not None and b_el is not None:
-                next_i = _record_pair(a_idx, a_el, b_idx, b_el, scan_from=j + 1)
+            if b_idx_o is not None and b_el_o is not None:
+                next_i = _record_pair(a_idx, a_el, b_idx_o, b_el_o, scan_from=j + 1)
                 i = next_i if next_i > i else i + 1
                 continue
 
-        # Legacy single-line header.
+        # Legacy single-line header (pre-ORCA-6, comma separator).
         m = COUPLING_PAIR_RE.search(line)
         if m is not None:
             next_i = _record_pair(
@@ -1274,6 +1400,8 @@ def parse_orca_couplings(out_path: Path) -> list[dict[str, Any]]:
 __all__ = [
     "COUPLING_NUCLEUS_RE",
     "COUPLING_PAIR_RE",
+    "COUPLING_PAIR_SAME_LINE_RE",
+    "COUPLING_ISO_RE",
     "FINAL_E_RE",
     "FINAL_G_RE",
     "G_MINUS_E_EL_RE",

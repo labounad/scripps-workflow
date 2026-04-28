@@ -626,6 +626,24 @@ class OrcaThermoArray(Node):
             coupling_pairs=list(cfg["coupling_pairs"]),
             coupling_thresh_angstrom=cfg["coupling_thresh_angstrom"],
             nmr_aux_keywords=cfg["nmr_aux_keywords"],
+            # Provenance: the operator-supplied / calibration-table
+            # functional name (``shielding_method_*`` / ``coupling_method``)
+            # may not be the literal ORCA 6 keyword we end up putting on
+            # the ``!`` line. ``resolve_functional_alias`` translates
+            # things like WP04 -> B3LYP/G + %method block, wB97X-D ->
+            # wB97X-D3, and mPW1PW91 -> mPW1PW. Record both forms so the
+            # manifest is unambiguous about which functional definition
+            # ORCA actually saw vs. which calibration label
+            # ``nmr-aggregate`` will key against downstream.
+            shielding_method_h_orca_keyword=resolve_functional_alias(
+                cfg["shielding_method_h"]
+            )[0],
+            shielding_method_c_orca_keyword=resolve_functional_alias(
+                cfg["shielding_method_c"]
+            )[0],
+            coupling_method_orca_keyword=resolve_functional_alias(
+                cfg["coupling_method"]
+            )[0],
         )
 
         if ctx.upstream_manifest is None:

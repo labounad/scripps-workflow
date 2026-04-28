@@ -530,10 +530,31 @@ class NmrAggregate(Node):
                 p = task_dir / out_name
                 if p.exists():
                     sh.extend(parse_orca_shieldings(p))
+
+            # Couplings: parse the dedicated ``orca_nmr_j.out`` if
+            # present. Distinguish three failure modes for diagnostics:
+            #   1. file missing       -> upstream workflow problem
+            #   2. file present but parser returned []  -> parser problem
+            #   3. file present but empty contents      -> ORCA crash
+            # Case (2) is the one this run hit before the parser
+            # rewrite; surface it as a structured failure so the next
+            # regression doesn't slip past silently.
             cp: list[dict[str, Any]] = []
             j_out = task_dir / "orca_nmr_j.out"
-            if j_out.exists() and not cfg["skip_couplings"]:
+            j_out_exists = j_out.exists()
+            if j_out_exists and not cfg["skip_couplings"]:
                 cp.extend(parse_orca_couplings(j_out))
+                if not cp:
+                    ctx.fail(
+                        "coupling_parse_empty",
+                        task_dir=str(task_dir),
+                        file=str(j_out),
+                        reason=(
+                            "orca_nmr_j.out exists but parse_orca_couplings "
+                            "returned zero rows — likely a parser/format "
+                            "mismatch"
+                        ),
+                    )
 
             # Backward-compat: if no dedicated NMR outputs were found,
             # try the legacy single-compound ``orca_thermo.out`` shape.
@@ -667,6 +688,23 @@ class NmrAggregate(Node):
             cal_c=cal_c,
             cfg=cfg,
         )
+        # Per-element scaled counts — distinguish "calibration table
+        # entry exists" from "calibration was actually applied to a
+        # row". The old ``calibration_*_used = bool(cal_*)`` shape
+        # produced misleading summaries when cal_jhh existed but zero
+        # coupling rows were parsed.
+        n_h_shifts_scaled = sum(
+            1 for entry in by_atom.values()
+            if entry["element"] == "H" and cal_h is not None
+        )
+        n_c_shifts_scaled = sum(
+            1 for entry in by_atom.values()
+            if entry["element"] == "C" and cal_c is not None
+        )
+        n_h_atoms = sum(
+            1 for entry in by_atom.values() if entry["element"] == "H"
+        )
+
         ctx.add_artifact(
             "files",
             {
@@ -674,15 +712,30 @@ class NmrAggregate(Node):
                 "path_abs": str(shifts_path.resolve()),
                 "sha256": sha256_file(shifts_path),
                 "format": "csv",
+                "row_count": len(by_atom),
+                "h_row_count": n_h_atoms,
+                "c_row_count": sum(
+                    1 for e in by_atom.values() if e["element"] == "C"
+                ),
             },
         )
 
         n_used_cp = 0
+        n_hh_pairs = 0
+        n_hh_pairs_scaled = 0
+        by_pair: dict[tuple[int, int], dict[str, Any]] = {}
         if not cfg["skip_couplings"]:
             by_pair, n_used_cp = boltzmann_average_couplings(
                 per_conformer=per_conformer_couplings,
                 weights=norm_weights,
             )
+            hh_pairs = {
+                k: v for k, v in by_pair.items()
+                if v["elem_i"] == "H" and v["elem_j"] == "H"
+            }
+            n_hh_pairs = len(hh_pairs)
+            n_hh_pairs_scaled = n_hh_pairs if cal_jhh is not None else 0
+
             couplings_path = outputs_dir / cfg["output_couplings_csv"]
             write_couplings_csv(
                 out_path=couplings_path,
@@ -698,17 +751,65 @@ class NmrAggregate(Node):
                     "path_abs": str(couplings_path.resolve()),
                     "sha256": sha256_file(couplings_path),
                     "format": "csv",
+                    "row_count": len(by_pair),
+                    "hh_row_count": n_hh_pairs,
                 },
             )
+
+            # Failure contract: when the user asked for couplings AND
+            # the molecule has at least 2 H atoms, an empty H-H table
+            # is a real failure — either the parser missed the format
+            # or the ORCA jobs didn't actually compute couplings.
+            # Don't paper over it with ``ok: true``.
+            if n_h_atoms >= 2 and n_hh_pairs == 0:
+                ctx.fail(
+                    "no_hh_couplings_parsed",
+                    n_h_atoms=n_h_atoms,
+                    n_conformers_with_couplings=n_used_cp,
+                    expected_reason=(
+                        "skip_couplings=false and >=2 H atoms present"
+                    ),
+                )
+            else:
+                # Stricter completeness check: every H-H pair within
+                # the coupling threshold should have a row. If the
+                # table is short, surface it (without failing the
+                # whole run — partial data is still useful) so an
+                # operator can investigate the gap.
+                expected_hh_pairs = n_h_atoms * (n_h_atoms - 1) // 2
+                if 0 < n_hh_pairs < expected_hh_pairs:
+                    ctx.fail(
+                        "incomplete_hh_coupling_table",
+                        n_h_atoms=n_h_atoms,
+                        expected_hh_pairs=expected_hh_pairs,
+                        actual_hh_pairs=n_hh_pairs,
+                        note=(
+                            "may be intentional if coupling_thresh_angstrom "
+                            "excludes long-range pairs"
+                        ),
+                    )
 
         summary = {
             "n_conformers_total": len(confs),
             "n_conformers_with_shielding": n_used_sh,
             "n_conformers_with_couplings": n_used_cp,
             "n_atoms": len(by_atom),
-            "calibration_h_used": bool(cal_h),
-            "calibration_c_used": bool(cal_c),
-            "calibration_jhh_used": bool(cal_jhh),
+            "n_h_atoms": n_h_atoms,
+            "n_hh_pairs": n_hh_pairs,
+            "n_h_shifts_scaled": n_h_shifts_scaled,
+            "n_c_shifts_scaled": n_c_shifts_scaled,
+            "n_hh_pairs_scaled": n_hh_pairs_scaled,
+            # ``_found``: a calibration entry exists in the table.
+            # ``_used``: that entry was actually applied to at least
+            # one output row. The two diverge whenever an upstream
+            # parser / data-availability problem leaves the input
+            # table empty for a nucleus class.
+            "calibration_h_found": cal_h is not None,
+            "calibration_h_used": n_h_shifts_scaled > 0,
+            "calibration_c_found": cal_c is not None,
+            "calibration_c_used": n_c_shifts_scaled > 0,
+            "calibration_jhh_found": cal_jhh is not None,
+            "calibration_jhh_used": n_hh_pairs_scaled > 0,
             "solvent": cfg["solvent"],
         }
         summary_path = outputs_dir / "nmr_summary.json"
