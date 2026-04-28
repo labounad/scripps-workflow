@@ -77,6 +77,7 @@ from tools.export_nodes import (  # noqa: E402
     derive_output_id,
     render_script_py,
     render_script_sh,
+    resolve_env_py,
 )
 
 
@@ -667,8 +668,12 @@ class Workflow:
             sub_dir = tmp_path / str(node_id)
             sub_dir.mkdir()
 
+            # Per-node interpreter override: spec.env_py wins over the
+            # workflow-level default. Lets wf-prism pin the 3.12 env
+            # without forcing every other node onto it.
+            node_env_py = resolve_env_py(spec, self.env_py)
             metadata = build_metadata(
-                spec, env_py=self.env_py, host=self.host,
+                spec, env_py=node_env_py, host=self.host,
                 version=self.node_version, node_id=node_id,
                 input_types=proc.input_types or None,
             )
@@ -697,10 +702,10 @@ class Workflow:
             else:
                 # script.sh + script.py shim (same as tools/export_nodes.py).
                 sh_path = sub_dir / "script.sh"
-                sh_path.write_text(render_script_sh(self.env_py), encoding="utf-8")
+                sh_path.write_text(render_script_sh(node_env_py), encoding="utf-8")
                 sh_path.chmod(0o755)
                 py_path = sub_dir / "script.py"
-                py_path.write_text(render_script_py(spec, self.env_py), encoding="utf-8")
+                py_path.write_text(render_script_py(spec, node_env_py), encoding="utf-8")
                 py_path.chmod(0o755)
                 # files_info already correct for script.sh / script.py.
 

@@ -62,6 +62,14 @@ from typing import Iterable
 # ``module`` is the dotted path under ``scripps_workflow.nodes``.
 
 DEFAULT_ENV_PY = "/gpfs/group/shenvi/envs/workflow/bin/python"
+
+#: Sibling Python 3.12 env on the same gpfs share. Some nodes need
+#: dependencies that don't currently install cleanly under the lab's
+#: 3.11 env (notably ``prism_pruner``, which requires 3.12+ on this
+#: cluster). NodeSpec entries that need this env should set
+#: ``env_py=ENV_PY_312`` so the rendered ``script.sh`` exec's the
+#: right interpreter for that node and that node only.
+ENV_PY_312 = "/gpfs/group/shenvi/envs/workflow312/bin/python"
 DEFAULT_HOST = "workflow.scripps.edu"
 DEFAULT_VERSION = "1.1.0"
 DEFAULT_CATEGORY = "Script"
@@ -84,6 +92,15 @@ class NodeSpec:
     outputs: list[str] = field(default_factory=lambda: [DEFAULT_OUTPUT_NAME])
     output_tags: str = DEFAULT_OUTPUT_TAGS
     category: str = DEFAULT_CATEGORY
+    #: Per-node override for the Python interpreter the GUI's
+    #: ``script.sh`` shim should ``exec``. ``None`` means inherit the
+    #: exporter-level default (``DEFAULT_ENV_PY``, currently the lab
+    #: 3.11 env). Set on ``NodeSpec`` entries whose deps need a
+    #: sibling env — e.g. ``wf-prism`` requires ``prism_pruner``,
+    #: which only installs cleanly under :data:`ENV_PY_312`. The
+    #: writers (``script.sh`` shim and the in-bundle ``script.py``
+    #: shebang) both honor this override transparently.
+    env_py: str | None = None
 
 
 NODES: dict[str, NodeSpec] = {
@@ -153,6 +170,13 @@ NODES: dict[str, NodeSpec] = {
                 "use_energies", "ewin_kcal", "max_dE_kcal",
                 "min_conformers", "keep_rejected", "timeout_s",
             ],
+            # ``prism_pruner`` only installs cleanly under the lab's
+            # Python 3.12 env (workflow312). Running this node under
+            # the default 3.11 env produces an ``import_prism_pruner_
+            # failed`` soft-fail and the node degrades to its accept-
+            # all fallback. Pinning the interpreter here makes the
+            # actual pruning run.
+            env_py=ENV_PY_312,
         ),
         NodeSpec(
             name="wf-marc",
@@ -407,6 +431,17 @@ def render_script_py(spec: NodeSpec, env_py: str) -> str:
 # I/O
 # ---------------------------------------------------------------------------
 
+def resolve_env_py(spec: NodeSpec, default_env_py: str) -> str:
+    """Pick the Python interpreter for ``spec``'s GUI shim.
+
+    Per-node ``NodeSpec.env_py`` overrides ``default_env_py`` when set;
+    otherwise the exporter-level default applies. Centralized here so
+    both ``tools/export_nodes.py`` and ``tools/export_workflow.py``
+    resolve the same way for the same registry entry.
+    """
+    return spec.env_py or default_env_py
+
+
 def write_node_bundle(
     spec: NodeSpec,
     *,
@@ -420,6 +455,7 @@ def write_node_bundle(
     sub_dir = bundle_dir / "0"  # node_id placeholder; matches files_info paths
     sub_dir.mkdir(parents=True, exist_ok=True)
 
+    env_py = resolve_env_py(spec, env_py)
     metadata = build_metadata(spec, env_py=env_py, host=host, version=version)
     json_path = bundle_dir / f"{spec.module}.json"
     json_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
