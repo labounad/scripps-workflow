@@ -349,8 +349,17 @@ class TestRdkitImportPath:
         monkeypatch.setattr(s23, "_Chem", None)
         monkeypatch.setattr(s23, "_AllChem", None)
 
-        # The sandbox doesn't have RDKit; this should soft-fail with a
-        # diagnostic mentioning RDKit.
+        # Simulate "no rdkit" regardless of whether it's actually installed
+        # in the test env. Setting sys.modules[<name>] to None makes
+        # ``import <name>`` raise ImportError on the next attempt,
+        # bypassing any cached real module. (Previously this test relied
+        # on the sandbox not having rdkit, which broke once the chem
+        # extras were installed locally.)
+        import sys
+        monkeypatch.setitem(sys.modules, "rdkit", None)
+        monkeypatch.setitem(sys.modules, "rdkit.Chem", None)
+        monkeypatch.setitem(sys.modules, "rdkit.Chem.AllChem", None)
+
         m = _run_node(tmp_path, "smiles=CCO")
         assert m["ok"] is False
         errors = " ".join(f.get("error", "") for f in m["failures"])
