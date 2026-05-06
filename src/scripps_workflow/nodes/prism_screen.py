@@ -34,11 +34,17 @@ Config keys (``key=value`` tokens or one JSON object):
     max_dE_kcal             float. prism-pruner's *internal* energy gate
                             for the energy-aware geometric comparison.
                             (default 0.5)
-    ewin_kcal               float >= 0. *Pre-pruning* energy cutoff:
+    ewin_kcal               float >= 0. *Post-pruning* energy cutoff:
                             drop conformers more than this many kcal/mol
-                            above the lowest-energy input before the
-                            pruner sees them. Mirrors the navicat-marc
-                            / crest ``ewin_kcal`` convention. Silently
+                            above the lowest-energy *pruner survivor*.
+                            The pruner sees the full input ensemble so
+                            structural diversity is preserved; the
+                            energy gate then trims unphysically high
+                            survivors. Reverses the navicat-marc /
+                            crest convention deliberately — pre-
+                            filtering risks discarding distinct
+                            geometries before the pruner's MoI / RMSD
+                            stages get a chance to see them. Silently
                             skipped when ``use_energies`` resolves to
                             false (no energy reference). (default 5.0)
     timeout_s               int >= 5. Per-stage timeout. (default 120)
@@ -76,11 +82,13 @@ METHOD_NAME = "prism_pruner"
 #: honestly representing the lack of granularity.
 REJECTED_REASON = "pruned_by_prism_pruner"
 
-#: ``rejected_reason`` value for conformers dropped by the pre-pruning
-#: ``ewin_kcal`` filter (above the energy window vs the lowest-energy
-#: input). Distinct from :data:`REJECTED_REASON` so downstream consumers
-#: can tell duplicate-by-geometry rejections apart from energy-window
-#: rejections.
+#: ``rejected_reason`` value for conformers dropped by the post-pruning
+#: ``ewin_kcal`` filter (more than ``ewin_kcal`` above the lowest-energy
+#: pruner survivor). Distinct from :data:`REJECTED_REASON` so downstream
+#: consumers can tell duplicate-by-geometry rejections apart from energy-
+#: window rejections; a conformer the pruner already rejected as a
+#: duplicate keeps :data:`REJECTED_REASON` even if it would also have
+#: failed the ewin gate, since the pruner saw it first.
 REJECTED_REASON_EWIN = "above_energy_window"
 
 
@@ -252,10 +260,17 @@ def apply_ewin_filter(
     energies_kcal: list[float | None],
     ewin_kcal: float,
 ) -> list[bool]:
-    """Pre-pruning energy cutoff. Returns a length-N mask where ``True``
+    """Energy-window cutoff. Returns a length-N mask where ``True``
     means "conformer i is within ``ewin_kcal`` of the lowest-energy
     member of ``energies_kcal``" (closed interval, so a value exactly at
     the threshold is kept).
+
+    Used by :class:`PrismScreen` as a *post-pruning* gate: the caller
+    masks pruner-rejected slots to ``None`` so the reference minimum is
+    computed over pruner survivors only, then ANDs the returned mask
+    with the pruner mask to produce the final accept set. The function
+    itself is stage-agnostic — it just answers "which entries are within
+    ``ewin_kcal`` of the minimum present value".
 
     Conformers with missing energies (``None``) are kept (mask ``True``)
     on the principle that absent energies are not grounds for *energy*-
@@ -461,44 +476,18 @@ class PrismScreen(Node):
             )
             return
 
-        # ---------- 3. ewin filter (pre-pruning energy cutoff) ----------
-        # Drop conformers more than ewin_kcal above the lowest-energy
-        # input BEFORE feeding them to prism-pruner. Mirrors the
-        # navicat-marc / crest convention. Only applied when energies
-        # are actually flowing through this run -- if use_energies
-        # resolved to False there's no energy reference to compare
-        # against, and the filter is silently skipped (consistent with
-        # the user's stated intent).
-        ewin_applied = bool(use_energies and have_energies)
-        if ewin_applied:
-            ewin_keep_mask = apply_ewin_filter(
-                [e if isinstance(e, float) else None for e in energies_kcal],
-                cfg["ewin_kcal"],
-            )
-        else:
-            ewin_keep_mask = [True] * n_input
-        n_above_ewin = sum(1 for k in ewin_keep_mask if not k)
-        if ewin_applied and n_above_ewin:
-            logging_utils.log_info(
-                f"prism_screen: ewin_kcal={cfg['ewin_kcal']:.3f} dropped "
-                f"{n_above_ewin}/{n_input} conformers above the energy window"
-            )
-
-        # The pruner only sees conformers that survived the ewin filter.
-        # We keep the original 1..n_input index space so per-conformer
-        # artifact records (and the rejection-reason split) stay stable.
-        within_paths = [p for p, k in zip(staged_paths, ewin_keep_mask) if k]
-        within_energies = [
-            e for e, k in zip(energies_kcal, ewin_keep_mask) if k
-        ]
-        n_within = len(within_paths)
-
-        # ---------- 4. concat ensemble (within-window only) ----------
+        # ---------- 3. concat full input ensemble ----------
+        # The pruner sees the FULL input ensemble; the energy gate is
+        # deferred to step 5. This preserves structural diversity through
+        # the MoI / RMSD / rotation-corrected RMSD passes — pre-filtering
+        # by energy risks discarding distinct geometries before the
+        # pruner has a chance to consider them. Reverses the navicat-marc
+        # / crest convention deliberately.
         run_dir = outputs_dir / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
         ensemble_path = run_dir / "input_ensemble.xyz"
-        if n_within > 0:
-            concat_xyz_files(within_paths, ensemble_path)
+        if n_input > 0:
+            concat_xyz_files(staged_paths, ensemble_path)
             ctx.add_artifact(
                 "files",
                 {
@@ -509,24 +498,20 @@ class PrismScreen(Node):
                 },
             )
 
-        # ---------- 5. prune (or skip if too few survived ewin) ----------
-        if n_within == 0:
-            # Everyone was filtered out. Pruner has nothing to do; we'll
-            # rely on the empty-accepted check below to mark ok=false.
-            prune_mask: list[bool] = []
-        elif n_within < cfg["min_conformers"]:
+        # ---------- 4. prune (full ensemble) ----------
+        if n_input < cfg["min_conformers"]:
             logging_utils.log_info(
-                f"prism_screen: n_within={n_within} < min_conformers="
-                f"{cfg['min_conformers']}; skipping pruning, accepting all "
-                f"survivors of the ewin filter."
+                f"prism_screen: n_input={n_input} < min_conformers="
+                f"{cfg['min_conformers']}; skipping pruning, accepting "
+                f"all inputs (the post-pruning ewin filter still applies)."
             )
-            prune_mask = [True] * n_within
+            prune_mask: list[bool] = [True] * n_input
         else:
             try:
                 prune_mask = run_prism_pruner(
                     ensemble_path=ensemble_path,
                     energies_kcal=(
-                        [float(e) for e in within_energies]
+                        [float(e) for e in energies_kcal]
                         if use_energies and have_energies
                         else None
                     ),
@@ -539,60 +524,89 @@ class PrismScreen(Node):
                 )
             except ImportError as e:
                 ctx.fail(f"import_prism_pruner_failed: {e}")
-                prune_mask = [True] * n_within
+                prune_mask = [True] * n_input
             except Exception as e:
                 ctx.fail(f"pruning_failed_fallback_accept_all: {e}")
-                prune_mask = [True] * n_within
+                prune_mask = [True] * n_input
 
-            if len(prune_mask) != n_within:
+            if len(prune_mask) != n_input:
                 ctx.fail(
                     f"pruning_returned_unexpected_mask_length: "
-                    f"expected {n_within}, got {len(prune_mask)}"
+                    f"expected {n_input}, got {len(prune_mask)}"
                 )
-                prune_mask = [True] * n_within
+                prune_mask = [True] * n_input
+
+        n_pruner_dropped = sum(1 for k in prune_mask if not k)
+        if n_pruner_dropped:
+            logging_utils.log_info(
+                f"prism_screen: pruner dropped {n_pruner_dropped}/{n_input} "
+                f"conformers as duplicates"
+            )
+
+        # ---------- 5. ewin filter (post-pruning energy cutoff) ----------
+        # Apply the energy window to pruner SURVIVORS only. The window
+        # minimum is taken over the survivor subset (pruner-rejected
+        # slots are masked out as None so they don't shift the reference
+        # energy). Pruner-rejected conformers stay rejected with
+        # REJECTED_REASON in step 6 below; pruner survivors above the
+        # window get REJECTED_REASON_EWIN.
+        ewin_applied = bool(use_energies and have_energies)
+        if ewin_applied:
+            survivor_energies: list[float | None] = [
+                e if (kept and isinstance(e, float)) else None
+                for e, kept in zip(energies_kcal, prune_mask)
+            ]
+            ewin_within_mask = apply_ewin_filter(
+                survivor_energies, cfg["ewin_kcal"]
+            )
+        else:
+            ewin_within_mask = [True] * n_input
+        n_above_ewin = sum(
+            1
+            for kept, within in zip(prune_mask, ewin_within_mask)
+            if kept and not within
+        )
+        if ewin_applied and n_above_ewin:
+            logging_utils.log_info(
+                f"prism_screen: ewin_kcal={cfg['ewin_kcal']:.3f} dropped "
+                f"{n_above_ewin}/{sum(prune_mask)} pruner survivors above "
+                f"the energy window"
+            )
+
+        # Combined accept mask spanning the original 1..n_input space.
+        accept_mask: list[bool] = [
+            bool(p and w) for p, w in zip(prune_mask, ewin_within_mask)
+        ]
 
         # ---------- 6. materialize accepted / rejected ----------
-        # Combine masks: a conformer is accepted iff it survived BOTH
-        # the ewin filter AND the pruner. Rejection reason is recorded
-        # so downstream consumers can tell ewin-rejects from pruner-rejects.
+        # Rejection-reason attribution: pruner rejections come first
+        # (REJECTED_REASON), ewin rejections only apply to pruner
+        # survivors (REJECTED_REASON_EWIN).
         accepted_dir = outputs_dir / "accepted"
         accepted_dir.mkdir(parents=True, exist_ok=True)
         rejected_dir = outputs_dir / "rejected"
         if cfg["keep_rejected"]:
             rejected_dir.mkdir(parents=True, exist_ok=True)
 
-        prune_iter = iter(prune_mask)
         accepted_paths: list[Path] = []
         rejected_records: list[tuple[Path, str]] = []
-        for i, (src, ewin_ok) in enumerate(
-            zip(staged_paths, ewin_keep_mask), start=1
+        for i, (src, prune_keep, ewin_keep) in enumerate(
+            zip(staged_paths, prune_mask, ewin_within_mask), start=1
         ):
-            if not ewin_ok:
+            if prune_keep and ewin_keep:
+                dst = accepted_dir / f"conf_{i:04d}.xyz"
+                shutil.copy2(src, dst)
+                accepted_paths.append(dst)
+            elif not prune_keep:
+                if cfg["keep_rejected"]:
+                    dst = rejected_dir / f"conf_{i:04d}.xyz"
+                    shutil.copy2(src, dst)
+                    rejected_records.append((dst, REJECTED_REASON))
+            else:  # prune_keep and not ewin_keep
                 if cfg["keep_rejected"]:
                     dst = rejected_dir / f"conf_{i:04d}.xyz"
                     shutil.copy2(src, dst)
                     rejected_records.append((dst, REJECTED_REASON_EWIN))
-                continue
-            keep = next(prune_iter)
-            if keep:
-                dst = accepted_dir / f"conf_{i:04d}.xyz"
-                shutil.copy2(src, dst)
-                accepted_paths.append(dst)
-            elif cfg["keep_rejected"]:
-                dst = rejected_dir / f"conf_{i:04d}.xyz"
-                shutil.copy2(src, dst)
-                rejected_records.append((dst, REJECTED_REASON))
-
-        # Synthesize an accept_mask for the downstream blocks that still
-        # use it (energy harvest + index lookup). This is the COMBINED
-        # mask spanning the original 1..n_input space.
-        accept_mask: list[bool] = []
-        prune_iter2 = iter(prune_mask)
-        for ewin_ok in ewin_keep_mask:
-            if not ewin_ok:
-                accept_mask.append(False)
-            else:
-                accept_mask.append(next(prune_iter2))
 
         # Compute accepted-only relative energies.
         accepted_indices = [

@@ -1014,7 +1014,7 @@ class TestFailures:
 
 
 # --------------------------------------------------------------------
-# Pre-pruning energy cutoff (ewin_kcal) — end to end
+# Post-pruning energy cutoff (ewin_kcal) — end to end
 # --------------------------------------------------------------------
 
 
@@ -1053,11 +1053,13 @@ def _upstream_with_explicit_energies(
 
 class TestEwinFilter:
     def test_default_5kcal_drops_above_window(self, tmp_path, monkeypatch):
-        """Default ewin_kcal=5.0; energies 0/2/8 -> conf 3 dropped.
+        """Default ewin_kcal=5.0; energies 0/2/8 -> conf 3 dropped post-pruning.
 
-        ``min_conformers=1`` so the pruner runs at n_within=2 (otherwise
-        the framework would short-circuit and the stub would never fire,
-        leaving us unable to inspect what energies reached the pruner).
+        ``min_conformers=1`` so the pruner runs (otherwise the framework
+        would short-circuit and the stub would never fire, leaving us
+        unable to inspect what reached the pruner). The pruner now sees
+        the full input ensemble — the ewin filter is applied AFTER, on
+        survivors only.
         """
         captured: dict = {}
 
@@ -1071,8 +1073,8 @@ class TestEwinFilter:
         monkeypatch.setattr(ps, "run_prism_pruner", _capture)
         up = _upstream_with_explicit_energies(tmp_path, [0.0, 2.0, 8.0])
         m = _run_node(tmp_path, up, "min_conformers=1")
-        # Only the within-window energies reach the pruner.
-        assert captured["energies_kcal"] == [0.0, 2.0]
+        # The pruner sees the FULL input ensemble (post-pruning ewin).
+        assert captured["energies_kcal"] == [0.0, 2.0, 8.0]
         # Conf 3 in rejected with the ewin reason.
         rejected = m["artifacts"]["rejected"]
         assert [r["index"] for r in rejected] == [3]
@@ -1093,7 +1095,8 @@ class TestEwinFilter:
             _stub_run_prism_factory(lambda n: [True] * n),
         )
         up = _upstream_with_explicit_energies(tmp_path, [0.0, 2.0, 8.0])
-        # min_conformers=1 so the pruner still runs at n_within=1.
+        # min_conformers=1 forces the pruner to run on the full ensemble
+        # (post-pruning ewin then drops conf 2 and conf 3).
         m = _run_node(tmp_path, up, "ewin_kcal=1.0", "min_conformers=1")
         rejected = m["artifacts"]["rejected"]
         assert [r["index"] for r in rejected] == [2, 3]
@@ -1143,28 +1146,31 @@ class TestEwinFilter:
         # Conf 3 NOT rejected — filter skipped.
         assert [a["index"] for a in m["artifacts"]["accepted"]] == [1, 2, 3]
 
-    def test_ewin_runs_before_pruner_distinct_reasons(
+    def test_ewin_runs_after_pruner_distinct_reasons(
         self, tmp_path, monkeypatch
     ):
-        """End-to-end: ewin drops conf 3, pruner then drops conf 2 from
-        the survivors. Final state has both reasons recorded distinctly.
+        """End-to-end: pruner drops conf 2 from the FULL ensemble, then
+        ewin drops conf 3 from the survivors. Final state has both
+        reasons recorded distinctly.
 
-        ``min_conformers=1`` so the pruner actually runs at n_within=2;
-        otherwise the framework's "skip pruner if too few" guard would
-        accept everything that survived ewin and we couldn't observe the
-        pruner-rejection branch.
+        ``min_conformers=1`` so the pruner actually runs (otherwise the
+        framework's "skip pruner if too few" guard would accept
+        everything and we couldn't observe the pruner-rejection branch).
         """
         captured: dict = {}
 
         def _stub(**kwargs):
             captured.update(kwargs)
-            return [True, False]  # pruner rejects conf 2
+            # Pruner sees the full input ensemble; rejects conf 2 as a
+            # duplicate. Conf 3 survives the pruner but the ewin filter
+            # will drop it for being above the energy window.
+            return [True, False, True]
 
         monkeypatch.setattr(ps, "run_prism_pruner", _stub)
         up = _upstream_with_explicit_energies(tmp_path, [0.0, 2.0, 8.0])
         m = _run_node(tmp_path, up, "min_conformers=1")
-        # Pruner only saw the within-window pair.
-        assert captured["energies_kcal"] == [0.0, 2.0]
+        # Pruner saw the full ensemble (no pre-pruning ewin filter).
+        assert captured["energies_kcal"] == [0.0, 2.0, 8.0]
 
         accepted = m["artifacts"]["accepted"]
         rejected = m["artifacts"]["rejected"]

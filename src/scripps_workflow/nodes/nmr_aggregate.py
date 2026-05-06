@@ -33,6 +33,15 @@ Failure modes:
       upstream had no parseable Gibbs).
     * ``no_shielding_data_in_any_conformer`` — every conformer's .out
       file failed to produce shielding rows.
+    * ``no_hh_couplings_parsed`` — ``skip_couplings=false`` and the
+      molecule has ≥2 H atoms but zero H–H pairs came back. Normally
+      means the parser missed the format or the ORCA J-coupling jobs
+      crashed. A *sparse* H–H table is expected and is NOT a failure —
+      ORCA's ``SpinSpinRThresh`` (default 8 Å) deliberately excludes
+      long-range pairs because their J's are negligible.
+    * ``coupling_parse_empty`` — per-conformer, ``orca_nmr_j.out``
+      exists but ``parse_orca_couplings`` returned no rows. Distinct
+      from a missing file; surfaces parser/format mismatches.
     * ``calibration_not_found`` — surfaced as a structured failure
       (NOT an exception) when a configured (functional, basis, solvent,
       nucleus) tuple isn't in the calibration table. Raw σ values are
@@ -759,8 +768,17 @@ class NmrAggregate(Node):
             # Failure contract: when the user asked for couplings AND
             # the molecule has at least 2 H atoms, an empty H-H table
             # is a real failure — either the parser missed the format
-            # or the ORCA jobs didn't actually compute couplings.
-            # Don't paper over it with ``ok: true``.
+            # or the ORCA jobs didn't actually compute couplings. At
+            # least one short-range H-H pair will always exist in any
+            # molecule small enough to do NMR on, so n_hh_pairs == 0
+            # under those conditions reliably indicates breakage.
+            #
+            # A *sparse* H-H table (some pairs present, but fewer than
+            # the complete-graph count of n_h*(n_h-1)/2) is normal:
+            # ORCA's SpinSpinRThresh caps the inter-nucleus distance
+            # for which couplings are computed, and J's outside that
+            # cutoff are negligible enough to not need a row. We do
+            # NOT fail in that case — the sparse table is the design.
             if n_h_atoms >= 2 and n_hh_pairs == 0:
                 ctx.fail(
                     "no_hh_couplings_parsed",
@@ -771,23 +789,16 @@ class NmrAggregate(Node):
                     ),
                 )
             else:
-                # Stricter completeness check: every H-H pair within
-                # the coupling threshold should have a row. If the
-                # table is short, surface it (without failing the
-                # whole run — partial data is still useful) so an
-                # operator can investigate the gap.
+                # Informational only — surface what fraction of the
+                # complete H-H graph actually came back so the operator
+                # has a sanity-check signal in the logs without it
+                # turning into a manifest-level failure.
                 expected_hh_pairs = n_h_atoms * (n_h_atoms - 1) // 2
-                if 0 < n_hh_pairs < expected_hh_pairs:
-                    ctx.fail(
-                        "incomplete_hh_coupling_table",
-                        n_h_atoms=n_h_atoms,
-                        expected_hh_pairs=expected_hh_pairs,
-                        actual_hh_pairs=n_hh_pairs,
-                        note=(
-                            "may be intentional if coupling_thresh_angstrom "
-                            "excludes long-range pairs"
-                        ),
-                    )
+                logging_utils.log_info(
+                    f"nmr-aggregate: {n_hh_pairs} H-H pair(s) parsed "
+                    f"out of {expected_hh_pairs} possible "
+                    f"(SpinSpinRThresh excludes long-range pairs by design)"
+                )
 
         summary = {
             "n_conformers_total": len(confs),
