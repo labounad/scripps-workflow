@@ -137,6 +137,7 @@ from ..hashing import sha256_file
 from ..mnova_xml import SpectrumConfig, SpinSystem, render_mnova_xml
 from ..molecule_diagram import render_shift_html, render_shift_svg
 from ..nmr_calibration import (
+    canonical_j_nucleus_label,
     lookup_calibration,
     predict_chemical_shift,
     predict_coupling_constant,
@@ -614,64 +615,388 @@ def _shifts_by_atom_from_per_conformer(
     return out
 
 
-def _calibrated_jhh_matrix_from_by_pair(
+def _calibrated_j_matrix_from_by_pair(
     by_pair: dict[tuple[int, int], dict[str, Any]],
-    cal_jhh: Optional[dict[str, Any]],
+    *,
+    allowed_element_pairs: Optional[set[tuple[str, str]]] = None,
+    cals_by_label: dict[str, Optional[dict[str, Any]]],
 ) -> dict[tuple[int, int], float]:
     """Convert aggregator's averaged ``by_pair`` map to the
-    canonical-pair-keyed J matrix the equivalence detector wants.
+    canonical-pair-keyed J matrix the equivalence detector wants,
+    with per-element-pair calibration dispatch.
 
-    Filters to ¹H–¹H pairs (the only ones our default coupling
-    pipeline computes) and applies the Bally/Rablen scaling
-    ``J_pred = slope · J_calc + intercept`` when available. When
-    no calibration is loaded, raw J's are passed through.
+    ``allowed_element_pairs`` is a set of frozen element pairs (each
+    a 2-tuple of element symbols, in either order) — pairs whose
+    elements aren't in any permitted pair are filtered out.
+    ``None`` (the default) means "include every pair regardless of
+    element".
+
+    ``cals_by_label`` maps canonical-isotope-pair labels (the output
+    of :func:`canonical_j_nucleus_label`, e.g., ``"1H-1H_J"``,
+    ``"1H-19F_J"``) to calibration entries (slope/intercept dicts) or
+    ``None`` for "no calibration loaded → pass raw J through".
+
+    Implementation note: ``allowed_element_pairs`` is checked using
+    canonical (sorted-by-mass) pair labels so the caller can pass
+    ``{("H", "F")}`` and we'll match both orientations of the
+    underlying coupling row.
     """
     out: dict[tuple[int, int], float] = {}
+    allowed_labels: Optional[set[str]] = None
+    if allowed_element_pairs is not None:
+        allowed_labels = {
+            canonical_j_nucleus_label(a, b) for (a, b) in allowed_element_pairs
+        }
+
     for key, entry in by_pair.items():
-        if not (
-            entry.get("elem_i") == "H" and entry.get("elem_j") == "H"
-        ):
+        ei = entry.get("elem_i")
+        ej = entry.get("elem_j")
+        if ei is None or ej is None:
+            continue
+        label = canonical_j_nucleus_label(ei, ej)
+        if allowed_labels is not None and label not in allowed_labels:
             continue
         j_avg = entry.get("J_total_avg_hz")
         if not isinstance(j_avg, (int, float)):
             continue
-        if cal_jhh is not None:
+        cal = cals_by_label.get(label)
+        if cal is not None:
             out[key] = predict_coupling_constant(
                 float(j_avg),
-                slope=cal_jhh["slope"],
-                intercept=cal_jhh["intercept"],
+                slope=cal["slope"],
+                intercept=cal["intercept"],
             )
         else:
             out[key] = float(j_avg)
     return out
 
 
-def _calibrated_jhh_matrix_from_per_conformer(
+def _calibrated_j_matrix_from_per_conformer(
     couplings: list[dict[str, Any]],
-    cal_jhh: Optional[dict[str, Any]],
+    *,
+    allowed_element_pairs: Optional[set[tuple[str, str]]] = None,
+    cals_by_label: dict[str, Optional[dict[str, Any]]],
 ) -> dict[tuple[int, int], float]:
-    """Per-conformer version of :func:`_calibrated_jhh_matrix_from_by_pair`.
-
-    Operates on parsed coupling rows from one ORCA J-coupling output.
-    """
+    """Per-conformer version of :func:`_calibrated_j_matrix_from_by_pair`."""
     out: dict[tuple[int, int], float] = {}
+    allowed_labels: Optional[set[str]] = None
+    if allowed_element_pairs is not None:
+        allowed_labels = {
+            canonical_j_nucleus_label(a, b) for (a, b) in allowed_element_pairs
+        }
+
     for row in couplings:
-        if not (row.get("elem_i") == "H" and row.get("elem_j") == "H"):
+        ei = row.get("elem_i")
+        ej = row.get("elem_j")
+        if ei is None or ej is None:
+            continue
+        label = canonical_j_nucleus_label(ei, ej)
+        if allowed_labels is not None and label not in allowed_labels:
             continue
         j_total = row.get("J_total_hz")
         if not isinstance(j_total, (int, float)):
             continue
         i, j = int(row["i"]), int(row["j"])
         key = (min(i, j), max(i, j))
-        if cal_jhh is not None:
+        cal = cals_by_label.get(label)
+        if cal is not None:
             out[key] = predict_coupling_constant(
                 float(j_total),
-                slope=cal_jhh["slope"],
-                intercept=cal_jhh["intercept"],
+                slope=cal["slope"],
+                intercept=cal["intercept"],
             )
         else:
             out[key] = float(j_total)
     return out
+
+
+def _parse_partner_list(raw: Any) -> list[str]:
+    """Parse the ``mnova_heteronuclear_partners`` config value.
+
+    Accepts a list (from JSON config) or a comma-separated string
+    (from key=value tokens). Strips whitespace, drops empty tokens,
+    and validates that each entry is a known element symbol the rest
+    of the pipeline can canonicalize. Unknown elements raise so a
+    typo (e.g., ``"Fl"`` for fluorine) surfaces as ``argv_parse_failed``
+    rather than silently producing wrong-element groups.
+    """
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw]
+    else:
+        items = [s.strip() for s in str(raw).split(",")]
+    out: list[str] = []
+    valid = {"H", "C", "N", "O", "F", "P", "Si"}
+    for item in items:
+        if not item:
+            continue
+        if item not in valid:
+            raise ValueError(
+                f"mnova_heteronuclear_partners: unknown element {item!r}; "
+                f"expected one of {sorted(valid)}"
+            )
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _build_pair_set_and_cals(
+    *,
+    primary_element: str,
+    partner_elements: list[str],
+    cfg: dict[str, Any],
+) -> tuple[set[tuple[str, str]], dict[str, Optional[dict[str, Any]]]]:
+    """Compute the J-coupling pair filter and per-pair calibration map.
+
+    For a spin-system that includes ``primary_element`` plus zero or
+    more ``partner_elements``, generate every distinct unordered
+    element-pair (including homonuclear within partners, e.g. F-F)
+    and look up the matching calibration entry in NMR_CALIBRATION.
+
+    Pairs without a calibration entry land in the dict as ``None``,
+    which the J-matrix builders interpret as "pass raw J through".
+    Calibration lookups use the aggregator's ``coupling_method`` /
+    ``coupling_basis`` / ``solvent`` config triple — heteronuclear
+    pairs assume the same DFT method/basis as the homonuclear pair,
+    which is what ORCA actually computes in a single J-coupling job.
+    """
+    elements_in_xml = [primary_element] + list(partner_elements)
+    pair_set: set[tuple[str, str]] = set()
+    cals_by_label: dict[str, Optional[dict[str, Any]]] = {}
+    for ea in elements_in_xml:
+        for eb in elements_in_xml:
+            # Canonical (sorted-by-mass) tuple so we don't double-add
+            # (H,F) and (F,H).
+            from ..nmr_calibration import _MASS_BY_ELEMENT
+            ma = _MASS_BY_ELEMENT.get(ea, 999)
+            mb = _MASS_BY_ELEMENT.get(eb, 999)
+            canonical_pair = (ea, eb) if ma <= mb else (eb, ea)
+            if canonical_pair in pair_set:
+                continue
+            pair_set.add(canonical_pair)
+            label = canonical_j_nucleus_label(*canonical_pair)
+            cal = lookup_calibration(
+                functional=cfg["coupling_method"],
+                basis=cfg["coupling_basis"],
+                solvent=cfg["solvent"],
+                nucleus=label,
+            )
+            cals_by_label[label] = cal
+    return pair_set, cals_by_label
+
+
+def _partner_shifts_by_atom(
+    *,
+    mol: Any,
+    partner_elements: list[str],
+    by_atom: Optional[dict[int, dict[str, Any]]],
+    stub_ppm: float,
+) -> dict[int, float]:
+    """Fetch placeholder chemical shifts for partner-element atoms.
+
+    For each atom of a partner element in ``mol``:
+
+    * If ``by_atom`` has a parsed σ for that atom (i.e., the upstream
+      ORCA job ran shielding on that nucleus), use the raw σ as a
+      placeholder δ. This is wrong as published-ppm chemistry but
+      lands the atom far outside the primary nucleus's window in
+      mnova's simulated spectrum (e.g., a typical ¹⁹F σ of 200-400
+      ppm sits well outside the 0-12 ppm ¹H window).
+    * Otherwise, use ``stub_ppm`` (default 100 ppm — also outside
+      typical ¹H or ¹³C windows). Each partner element gets a
+      slightly different stub via element-index offset so atoms
+      within a partner-element class still register as equivalent
+      while different partner elements are visually distinguishable.
+
+    Iteration 1 limitation: this is intentionally NOT a real shift
+    prediction. To get correct ¹⁹F δ values, add a 19F shielding
+    calibration entry and a ``shielding_method_f`` / ``shielding_basis_f``
+    config path (similar to the existing H/C plumbing). For now the
+    placeholder is enough to make the J-coupling-driven splitting
+    appear in the primary nucleus's spectrum.
+    """
+    shifts: dict[int, float] = {}
+    for elem_idx, elem in enumerate(partner_elements):
+        # Element-specific offset so multiple partner elements don't
+        # all stack at the same stub value (visually distinguishable
+        # in the rendered spectrum even though both are out-of-window).
+        elem_stub = stub_ppm + 50.0 * elem_idx
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() != elem:
+                continue
+            atom_idx = atom.GetIdx()
+            entry = by_atom.get(atom_idx) if by_atom else None
+            if entry and isinstance(entry.get("sigma_iso_avg_ppm"), (int, float)):
+                shifts[atom_idx] = float(entry["sigma_iso_avg_ppm"])
+            else:
+                shifts[atom_idx] = elem_stub
+    return shifts
+
+
+def _partner_shifts_per_conformer(
+    *,
+    mol: Any,
+    partner_elements: list[str],
+    shieldings: list[dict[str, Any]],
+    stub_ppm: float,
+) -> dict[int, float]:
+    """Per-conformer version of :func:`_partner_shifts_by_atom`.
+
+    Builds an atom_idx → σ map from a single conformer's parsed
+    shielding rows for the requested partner elements; falls back to
+    ``stub_ppm`` for partner atoms whose σ wasn't parsed.
+    """
+    by_idx_sigma: dict[int, float] = {}
+    for row in shieldings:
+        sym = row.get("element")
+        if sym not in partner_elements:
+            continue
+        sigma = row.get("sigma_iso_ppm")
+        if isinstance(sigma, (int, float)):
+            by_idx_sigma[int(row["atom_index"])] = float(sigma)
+
+    shifts: dict[int, float] = {}
+    for elem_idx, elem in enumerate(partner_elements):
+        elem_stub = stub_ppm + 50.0 * elem_idx
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() != elem:
+                continue
+            atom_idx = atom.GetIdx()
+            shifts[atom_idx] = by_idx_sigma.get(atom_idx, elem_stub)
+    return shifts
+
+
+def _build_multinucleus_groups(
+    *,
+    mol: Any,
+    primary_element: str,
+    partner_elements: list[str],
+    primary_shifts: dict[int, float],
+    partner_shifts: dict[int, float],
+    j_matrix: dict[tuple[int, int], float],
+    tol_jcoupling_hz: float,
+    tol_shift_ppm: float,
+) -> list[EquivalenceGroup]:
+    """Build one merged spin-system covering primary + partner elements.
+
+    Calls :func:`compute_equivalence_groups` once per element (so each
+    element's equivalence dispatch is independent — primary nucleus's
+    AA'BB' tier classification doesn't get confused by cross-element
+    coupling, and vice versa). Then merges the per-element group
+    lists, sorts by minimum atom index, re-assigns Excel-style names
+    A-Z over the combined list, and re-derives every inter-group J
+    coupling from the supplied ``j_matrix``.
+
+    The j_matrix passed here SHOULD include all relevant pair types
+    (primary-primary, primary-partner, partner-partner) — typically
+    built via :func:`_calibrated_j_matrix_from_by_pair` with an
+    ``allowed_element_pairs`` set that covers every pair from
+    :func:`_build_pair_set_and_cals`.
+
+    When ``partner_elements`` is empty this is equivalent to a single
+    :func:`compute_equivalence_groups` call (no merge step needed).
+
+    Iteration-1 caveat: per-element compute_equivalence_groups calls
+    pass the FULL j_matrix, but the magnetic-equivalence test inside
+    only uses J's to atoms of the same element (since ``other_atoms``
+    is restricted to same-nucleus atoms by the orchestrator). So an
+    AA'XX' pattern where the X's are partner atoms (e.g., two H's
+    coupled differently to two F's) will be wrongly classified as
+    HARD. Fix in iteration 2 by adding a ``cross_element_other_atoms``
+    parameter to compute_equivalence_groups.
+    """
+    primary_groups = compute_equivalence_groups(
+        mol=mol,
+        element=primary_element,
+        shifts_by_atom=primary_shifts,
+        j_matrix=j_matrix,
+        tol_jcoupling_hz=tol_jcoupling_hz,
+        tol_shift_ppm=tol_shift_ppm,
+    )
+    if not partner_elements:
+        return primary_groups
+
+    partner_groups: list[EquivalenceGroup] = []
+    for elem in partner_elements:
+        # Filter partner_shifts to just this element's atoms.
+        elem_shifts = {
+            idx: val
+            for idx, val in partner_shifts.items()
+            if mol.GetAtomWithIdx(idx).GetSymbol() == elem
+        }
+        if not elem_shifts:
+            continue
+        partner_groups.extend(
+            compute_equivalence_groups(
+                mol=mol,
+                element=elem,
+                shifts_by_atom=elem_shifts,
+                j_matrix=j_matrix,
+                tol_jcoupling_hz=tol_jcoupling_hz,
+                tol_shift_ppm=tol_shift_ppm,
+            )
+        )
+
+    if not partner_groups:
+        return primary_groups
+
+    # Merge + sort by min atom index for stable A-Z labeling.
+    combined: list[EquivalenceGroup] = list(primary_groups) + partner_groups
+    combined.sort(key=lambda g: min(g.atom_indices))
+    new_names = _assign_group_labels_local(len(combined))
+
+    # Re-derive J couplings between all groups using the new names.
+    relabeled: list[EquivalenceGroup] = []
+    for new_name, g in zip(new_names, combined):
+        new_j: dict[str, float] = {}
+        for other_new_name, other_g in zip(new_names, combined):
+            if new_name == other_new_name:
+                continue
+            j_avg = _avg_pairwise_j_local(
+                g.atom_indices, other_g.atom_indices, j_matrix
+            )
+            if j_avg is not None:
+                new_j[other_new_name] = j_avg
+        relabeled.append(
+            EquivalenceGroup(
+                name=new_name,
+                element=g.element,
+                atom_indices=g.atom_indices,
+                shift_avg_ppm=g.shift_avg_ppm,
+                tier=g.tier,
+                j_couplings=new_j,
+            )
+        )
+    return relabeled
+
+
+def _assign_group_labels_local(n: int) -> list[str]:
+    """Local re-import of equivalence.assign_group_labels to avoid an
+    aggregator-side name collision and keep the dependency explicit."""
+    from ..equivalence import assign_group_labels
+    return assign_group_labels(n)
+
+
+def _avg_pairwise_j_local(
+    atoms_a: tuple[int, ...],
+    atoms_b: tuple[int, ...],
+    j_matrix: dict[tuple[int, int], float],
+) -> Optional[float]:
+    """Average J(a, b) over a ∈ atoms_a, b ∈ atoms_b; ``None`` if no
+    pair has a parseable J. Mirrors equivalence._avg_pairwise_j but
+    kept local since that helper is module-private."""
+    vals: list[float] = []
+    for a in atoms_a:
+        for b in atoms_b:
+            if a == b:
+                continue
+            v = j_matrix.get((min(a, b), max(a, b)))
+            if v is not None:
+                vals.append(float(v))
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
 
 
 def _spectrum_config_for(
@@ -838,6 +1163,21 @@ class NmrAggregate(Node):
             ),
             "diagrams_height": parse_int(
                 raw.get("diagrams_height"), DEFAULT_DIAGRAM_HEIGHT
+            ),
+            # Heteronuclear partners — comma-separated element symbols
+            # (e.g., "F,P") to include in EVERY primary nucleus's
+            # spin-system XML so cross-element J's (¹H-¹⁹F, ¹³C-¹⁹F,
+            # etc.) are captured. The partner atoms appear as
+            # additional <group>s in the same <spin-system>; their
+            # shifts are taken from parsed shielding data when
+            # available, else fall back to a stub placeholder so they
+            # land far outside the primary nucleus's spectrum window.
+            # Empty (default) → homonuclear-only.
+            "mnova_heteronuclear_partners": _parse_partner_list(
+                raw.get("mnova_heteronuclear_partners")
+            ),
+            "mnova_partner_shift_stub_ppm": parse_float(
+                raw.get("mnova_partner_shift_stub_ppm"), 100.0
             ),
         }
 
@@ -1309,15 +1649,45 @@ class NmrAggregate(Node):
                     f"(no {element} atoms with parseable shielding)"
                 )
                 continue
-            j_matrix_avg = (
-                _calibrated_jhh_matrix_from_by_pair(by_pair, cal_jhh)
-                if nuc == "1H"
-                else {}
-            )
-            avg_groups = compute_equivalence_groups(
+            # Build the J-matrix with all element pairs we want in
+            # the spin-system. Default behavior preserved: ¹H XML has
+            # H-H J's; ¹³C XML has none. Configuring heteronuclear
+            # partners adds cross-element pairs to BOTH nuclei's XMLs
+            # (so a fluorinated molecule run with partners=["F"]
+            # gets H-H + H-F in the ¹H XML and C-F in the ¹³C XML).
+            partners = list(cfg["mnova_heteronuclear_partners"])
+            include_primary_primary = (nuc == "1H")
+            if include_primary_primary or partners:
+                pair_set, cals_by_label = _build_pair_set_and_cals(
+                    primary_element=element,
+                    partner_elements=partners,
+                    cfg=cfg,
+                )
+                if not include_primary_primary:
+                    # Drop the primary-primary entry to preserve the
+                    # "no ¹³C-¹³C J's" default; cross + partner-
+                    # partner entries stay so partner couplings show.
+                    pair_set.discard((element, element))
+                j_matrix_avg = _calibrated_j_matrix_from_by_pair(
+                    by_pair,
+                    allowed_element_pairs=pair_set,
+                    cals_by_label=cals_by_label,
+                )
+            else:
+                j_matrix_avg = {}
+
+            partner_shifts = _partner_shifts_by_atom(
                 mol=mol,
-                element=element,
-                shifts_by_atom=avg_shifts,
+                partner_elements=partners,
+                by_atom=by_atom,
+                stub_ppm=float(cfg["mnova_partner_shift_stub_ppm"]),
+            )
+            avg_groups = _build_multinucleus_groups(
+                mol=mol,
+                primary_element=element,
+                partner_elements=partners,
+                primary_shifts=avg_shifts,
+                partner_shifts=partner_shifts,
                 j_matrix=j_matrix_avg,
                 tol_jcoupling_hz=cfg["mnova_tol_jcoupling_hz"],
                 tol_shift_ppm=cfg["mnova_tol_shift_ppm"],
@@ -1628,17 +1998,35 @@ class NmrAggregate(Node):
             )
             if not shifts:
                 continue
-            j_matrix = (
-                _calibrated_jhh_matrix_from_per_conformer(
-                    couplings or [], cal_jhh
+            partners = list(cfg["mnova_heteronuclear_partners"])
+            include_primary_primary = (nucleus == "1H")
+            if include_primary_primary or partners:
+                pair_set, cals_by_label = _build_pair_set_and_cals(
+                    primary_element=element,
+                    partner_elements=partners,
+                    cfg=cfg,
                 )
-                if nucleus == "1H"
-                else {}
-            )
-            groups = compute_equivalence_groups(
+                if not include_primary_primary:
+                    pair_set.discard((element, element))
+                j_matrix = _calibrated_j_matrix_from_per_conformer(
+                    couplings or [],
+                    allowed_element_pairs=pair_set,
+                    cals_by_label=cals_by_label,
+                )
+            else:
+                j_matrix = {}
+            partner_shifts = _partner_shifts_per_conformer(
                 mol=mol,
-                element=element,
-                shifts_by_atom=shifts,
+                partner_elements=partners,
+                shieldings=shieldings,
+                stub_ppm=float(cfg["mnova_partner_shift_stub_ppm"]),
+            )
+            groups = _build_multinucleus_groups(
+                mol=mol,
+                primary_element=element,
+                partner_elements=partners,
+                primary_shifts=shifts,
+                partner_shifts=partner_shifts,
                 j_matrix=j_matrix,
                 tol_jcoupling_hz=cfg["mnova_tol_jcoupling_hz"],
                 tol_shift_ppm=cfg["mnova_tol_shift_ppm"],

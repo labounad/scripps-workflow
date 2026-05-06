@@ -931,3 +931,244 @@ class TestNmrAggregateDiagrams:
         # But diagrams DO emit.
         diagrams = _files_by_label(m, "predicted_structure_")
         assert len(diagrams) == 4  # 2 nuclei × (svg + html)
+
+
+# --------------------------------------------------------------------
+# Heteronuclear coupling support
+# --------------------------------------------------------------------
+
+
+class TestCanonicalJLabel:
+    """Pure-function tests for canonical_j_nucleus_label.
+
+    Verifies the mass-ordered isotope pair labels used as keys in
+    NMR_CALIBRATION (e.g., (H, F) and (F, H) both map to "1H-19F_J").
+    """
+
+    @pytest.mark.parametrize(
+        "a,b,expected",
+        [
+            ("H", "H", "1H-1H_J"),
+            ("H", "F", "1H-19F_J"),
+            ("F", "H", "1H-19F_J"),    # canonical: lighter first
+            ("C", "F", "13C-19F_J"),
+            ("F", "C", "13C-19F_J"),
+            ("F", "F", "19F-19F_J"),
+            ("H", "C", "1H-13C_J"),
+            ("Si", "P", "29Si-31P_J"),
+        ],
+    )
+    def test_canonical_label(self, a, b, expected):
+        from scripps_workflow.nmr_calibration import canonical_j_nucleus_label
+        assert canonical_j_nucleus_label(a, b) == expected
+
+    def test_unknown_element_marked_with_question(self):
+        # Robustness: unknown element symbols don't silently match a
+        # known pair; they get a "?" marker so the lookup miss is
+        # visible in the manifest rather than wrong-calibration silent
+        # behavior.
+        from scripps_workflow.nmr_calibration import canonical_j_nucleus_label
+        label = canonical_j_nucleus_label("Xe", "H")
+        assert "?Xe" in label
+
+
+class TestHeteronuclearCalibrationLookup:
+    """Verify the new identity-scaled heteronuclear J entries land via
+    lookup_calibration."""
+
+    @pytest.mark.parametrize(
+        "nucleus", ["1H-19F_J", "19F-19F_J", "1H-13C_J"],
+    )
+    def test_identity_entry_loaded(self, nucleus):
+        from scripps_workflow.nmr_calibration import lookup_calibration
+        cal = lookup_calibration(
+            functional="mPW1PW91", basis="pcJ-2", solvent="CHCl3",
+            nucleus=nucleus,
+        )
+        assert cal is not None
+        assert cal["slope"] == pytest.approx(1.0)
+        assert cal["intercept"] == pytest.approx(0.0)
+        assert "identity" in cal["source"].lower()
+
+
+class TestCalibratedJMatrix:
+    """Pure-function tests for the generalized j_matrix builders that
+    dispatch per element pair.
+    """
+
+    def test_dispatches_per_pair_type(self):
+        from scripps_workflow.nodes.nmr_aggregate import (
+            _calibrated_j_matrix_from_by_pair,
+        )
+        # H-H: scaled. H-F: identity. F-F: no calibration → raw passthrough.
+        by_pair = {
+            (0, 1): {"elem_i": "H", "elem_j": "H", "J_total_avg_hz": 10.0},
+            (0, 2): {"elem_i": "H", "elem_j": "F", "J_total_avg_hz": 20.0},
+            (1, 2): {"elem_i": "F", "elem_j": "F", "J_total_avg_hz": 100.0},
+        }
+        cals_by_label = {
+            "1H-1H_J": {"slope": 0.9, "intercept": 0.1},
+            "1H-19F_J": {"slope": 1.0, "intercept": 0.0},
+            "19F-19F_J": None,
+        }
+        out = _calibrated_j_matrix_from_by_pair(
+            by_pair,
+            allowed_element_pairs={("H", "H"), ("H", "F"), ("F", "F")},
+            cals_by_label=cals_by_label,
+        )
+        assert out[(0, 1)] == pytest.approx(10.0 * 0.9 + 0.1)
+        assert out[(0, 2)] == pytest.approx(20.0)
+        assert out[(1, 2)] == pytest.approx(100.0)
+
+    def test_filters_disallowed_pairs(self):
+        # When allowed_element_pairs only includes H-H, the H-F and
+        # F-F entries are dropped from the output.
+        from scripps_workflow.nodes.nmr_aggregate import (
+            _calibrated_j_matrix_from_by_pair,
+        )
+        by_pair = {
+            (0, 1): {"elem_i": "H", "elem_j": "H", "J_total_avg_hz": 7.0},
+            (0, 2): {"elem_i": "H", "elem_j": "F", "J_total_avg_hz": 50.0},
+        }
+        out = _calibrated_j_matrix_from_by_pair(
+            by_pair,
+            allowed_element_pairs={("H", "H")},
+            cals_by_label={"1H-1H_J": None},
+        )
+        assert (0, 1) in out
+        assert (0, 2) not in out
+
+    def test_pair_order_doesnt_matter(self):
+        # canonical_j_nucleus_label sorts by mass, so allowed_element_pairs
+        # accepts (F, H) and (H, F) interchangeably.
+        from scripps_workflow.nodes.nmr_aggregate import (
+            _calibrated_j_matrix_from_by_pair,
+        )
+        by_pair = {
+            (0, 1): {"elem_i": "F", "elem_j": "H", "J_total_avg_hz": 50.0},
+        }
+        out = _calibrated_j_matrix_from_by_pair(
+            by_pair,
+            allowed_element_pairs={("H", "F")},
+            cals_by_label={"1H-19F_J": None},
+        )
+        assert (0, 1) in out
+
+
+class TestNmrAggregateHeteronuclear:
+    """End-to-end aggregator runs with heteronuclear partners.
+
+    Uses methyl fluoride (CH₃F) as the test fixture: 1 C + 3 H + 1 F.
+    Atom indices after AddHs: 0=C, 1=F, 2=3=4=H. The H-F coupling
+    appears as a doublet split (H atoms coupled to single F). Our
+    synthetic data uses J(H,F) ≈ 50 Hz (typical for ²J(H-F) in
+    methyl fluoride is ≈ 46 Hz).
+    """
+
+    @pytest.fixture
+    def rdkit(self):
+        return pytest.importorskip("rdkit")
+
+    def _build_methyl_fluoride_upstream(
+        self, tmp_path: Path, *, n_conformers: int = 1,
+    ) -> Path:
+        # CH3F: heavy atoms 0=C, 1=F; H atoms 2, 3, 4.
+        h_shieldings = [
+            (2, "H", 28.0, 5.0),
+            (3, "H", 28.0, 5.0),
+            (4, "H", 28.0, 5.0),
+        ]
+        c_shieldings = [(0, "C", 80.0, 0.0)]
+        # H-H geminal couplings (3 pairs), H-F couplings (3 pairs).
+        couplings = [
+            # Geminal H-H within methyl (small, ~-12 Hz typical)
+            (2, 3, "H", "H", -12.0),
+            (2, 4, "H", "H", -12.0),
+            (3, 4, "H", "H", -12.0),
+            # H-F (²J, ~46 Hz typical for CH3F)
+            (1, 2, "F", "H", 46.0),
+            (1, 3, "F", "H", 46.0),
+            (1, 4, "F", "H", 46.0),
+        ]
+        return _build_upstream(
+            tmp_path,
+            n_conformers=n_conformers,
+            weights=[1.0 / n_conformers] * n_conformers,
+            h_shieldings=h_shieldings,
+            c_shieldings=c_shieldings,
+            couplings=couplings,
+        )
+
+    def test_partners_unset_no_f_groups_in_1h_xml(self, rdkit, tmp_path):
+        # Default behavior (no partners): the 1H XML for CH3F should
+        # include H groups + H-H J's only. F atoms are absent.
+        up = self._build_methyl_fluoride_upstream(tmp_path)
+        m = _run_aggregate(tmp_path, up, "smiles=CF")
+        h_xml_path = next(
+            Path(a["path_abs"]) for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_mnova_1h"
+        )
+        text = h_xml_path.read_text(encoding="utf-8")
+        # One H group, no F group.
+        assert text.count("<group ") == 1
+
+    def test_partners_f_includes_f_in_1h_xml(self, rdkit, tmp_path):
+        # With mnova_heteronuclear_partners=F, the 1H XML for CH3F
+        # gains an F group with the H-F J's wired up.
+        up = self._build_methyl_fluoride_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=CF",
+            "mnova_heteronuclear_partners=F",
+        )
+        h_xml_path = next(
+            Path(a["path_abs"]) for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_mnova_1h"
+        )
+        text = h_xml_path.read_text(encoding="utf-8")
+        # Two groups: one H (the methyl, HARD-collapsed number=3),
+        # one F (number=1).
+        assert text.count("<group ") == 2
+        assert 'number="3"' in text  # methyl
+        assert 'number="1"' in text  # single F
+        # H-F J coupling present (≈ 46 Hz). Check both directions.
+        assert "46.000000" in text
+
+    def test_partners_f_carries_calibrated_jhf(self, rdkit, tmp_path):
+        # The 1H-19F calibration is identity (slope=1, intercept=0),
+        # so the J value passes through unchanged. This test pins
+        # that the dispatch reaches the H-F label rather than
+        # silently skipping the pair.
+        up = self._build_methyl_fluoride_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=CF",
+            "mnova_heteronuclear_partners=F",
+        )
+        # No mnova_xml_skipped failure — topology + partner all fine.
+        codes = [f["error"] for f in m.get("failures", [])]
+        assert "mnova_xml_skipped" not in codes
+
+    def test_invalid_partner_element_fails_argv_parse(self, tmp_path):
+        # Typos like "Fl" (intending fluorine) should fail at config-
+        # parse time rather than silently producing wrong-element
+        # groups. argv_parse_failed fires before run() ingests
+        # upstream, so we don't even need a valid upstream manifest.
+        bogus = tmp_path / "ignored.json"
+        bogus.write_text("{}")
+        ptr = Pointer.of(ok=True, manifest_path=bogus).to_json_line()
+        call_dir = tmp_path / "calls" / "nmr_aggregate"
+        call_dir.mkdir(parents=True)
+        cwd = os.getcwd()
+        os.chdir(call_dir)
+        try:
+            rc = NmrAggregate().invoke(
+                ["nmr_aggregate", ptr,
+                 "smiles=CF", "mnova_heteronuclear_partners=Fl"],
+            )
+        finally:
+            os.chdir(cwd)
+        # Soft-fail invariant: rc=0; failure recorded in manifest.
+        assert rc == 0
+        m_path = call_dir / "outputs" / "manifest.json"
+        m = json.loads(m_path.read_text(encoding="utf-8"))
+        codes = [f["error"] for f in m.get("failures", [])]
+        assert any("argv_parse_failed" in c for c in codes)

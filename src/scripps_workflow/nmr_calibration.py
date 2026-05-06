@@ -80,7 +80,102 @@ NMR_CALIBRATION: dict[tuple[str, str, str, str], dict[str, Any]] = {
         "source": "Bally Rablen 2011 (J. Org. Chem. 76, 4818)",
         "valid_range_ppm": None,
     },
+    # ----------------------------------------------------------------
+    # Heteronuclear J-coupling calibrations.
+    #
+    # The published references for ¹H-¹⁹F, ¹³C-¹⁹F, and ¹⁹F-¹⁹F
+    # couplings on mPW1PW91/pcJ-2 are sparse / sample-dependent
+    # (Bally/Rablen explicitly only fit ¹H-¹H), so we ship identity
+    # scaling (slope=1.0, intercept=0.0) as a reasonable starting
+    # point. Operators with a published coefficient pair should
+    # override these via the calibration_overrides config knob.
+    # TODO(labounad): collect literature references (Bagno's mPW1PW91
+    # ¹H-¹⁹F work is a candidate) and replace identity entries.
+    # ----------------------------------------------------------------
+    ("mPW1PW91", "pcJ-2", "CHCl3", "1H-19F_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹H-¹⁹F calibration)",
+        "valid_range_ppm": None,
+    },
+    ("mPW1PW91", "pcJ-2", "CHCl3", "19F-19F_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹⁹F-¹⁹F calibration)",
+        "valid_range_ppm": None,
+    },
+    ("mPW1PW91", "pcJ-2", "CHCl3", "1H-13C_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹H-¹³C calibration)",
+        "valid_range_ppm": None,
+    },
 }
+
+
+# --------------------------------------------------------------------
+# Canonical isotope notation for J-coupling calibration lookups
+# --------------------------------------------------------------------
+
+
+#: Default isotope label per element. NMR coupling calibrations are
+#: indexed by (functional, basis, solvent, "<isoA>-<isoB>_J") where
+#: <isoA>/<isoB> are the natural-abundance major isotopes for the
+#: chemistry the lab cares about. ¹⁴N is the natural-abundance major
+#: but most NMR work uses ¹⁵N (enriched), so we default to ¹⁵N for
+#: lookups; the operator can override by passing an explicit nucleus
+#: string to :func:`lookup_calibration`.
+_DEFAULT_ISOTOPE_BY_ELEMENT: dict[str, str] = {
+    "H": "1H",
+    "C": "13C",
+    "N": "15N",
+    "O": "17O",
+    "F": "19F",
+    "P": "31P",
+    "Si": "29Si",
+}
+
+#: Mass number used for ordering pair labels (lighter isotope first).
+#: This convention makes ``1H-19F`` canonical regardless of which
+#: side ORCA happens to print first in its coupling output.
+_MASS_BY_ELEMENT: dict[str, int] = {
+    "H": 1,
+    "C": 13,
+    "N": 15,
+    "O": 17,
+    "F": 19,
+    "P": 31,
+    "Si": 29,
+}
+
+
+def canonical_j_nucleus_label(elem_a: str, elem_b: str) -> str:
+    """Return the calibration-table nucleus label for an element pair.
+
+    Maps element symbols (e.g. ``"H"``, ``"F"``) to the corresponding
+    isotope-based label used in :data:`NMR_CALIBRATION` keys (``"1H"``,
+    ``"19F"``), then joins them lighter-first as ``"<isoA>-<isoB>_J"``.
+
+    Examples::
+
+        canonical_j_nucleus_label("H", "H")  -> "1H-1H_J"
+        canonical_j_nucleus_label("H", "F")  -> "1H-19F_J"
+        canonical_j_nucleus_label("F", "H")  -> "1H-19F_J"
+        canonical_j_nucleus_label("C", "F")  -> "13C-19F_J"
+
+    Unknown elements pass through to the bare element symbol with a
+    ``?`` mass marker (so a typo is visible in the manifest rather
+    than silently looking up the wrong calibration). The lookup will
+    then miss and the caller can decide whether to fall back to
+    identity or fail.
+    """
+    iso_a = _DEFAULT_ISOTOPE_BY_ELEMENT.get(elem_a, f"?{elem_a}")
+    iso_b = _DEFAULT_ISOTOPE_BY_ELEMENT.get(elem_b, f"?{elem_b}")
+    mass_a = _MASS_BY_ELEMENT.get(elem_a, 999)
+    mass_b = _MASS_BY_ELEMENT.get(elem_b, 999)
+    if mass_a > mass_b:
+        iso_a, iso_b = iso_b, iso_a
+    return f"{iso_a}-{iso_b}_J"
 
 
 # --------------------------------------------------------------------
@@ -157,6 +252,7 @@ def lookup_calibration(
 
 __all__ = [
     "NMR_CALIBRATION",
+    "canonical_j_nucleus_label",
     "lookup_calibration",
     "predict_chemical_shift",
     "predict_coupling_constant",
