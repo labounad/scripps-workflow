@@ -55,21 +55,32 @@ def render_shift_svg(
     *,
     mol: Any,
     groups: list[EquivalenceGroup],
+    xyz_text: Optional[str] = None,
     width: int = 900,
     height: int = 600,
 ) -> str:
-    """Render the molecule as 2D SVG with each group's atoms annotated.
+    """Render the molecule as a 2D SVG snapshot with shift annotations.
 
-    Computes a fresh 2D layout via ``AllChem.Compute2DCoords`` (so the
-    diagram looks like a typical chemistry drawing rather than a
-    flattened 3D projection). Annotates one atom per group with the
-    predicted shift + group name; other atoms in a HARD group remain
-    unlabeled to keep the diagram readable.
+    When ``xyz_text`` is provided, the molecule's 3D coordinates are
+    PCA-aligned (largest variance → x, smallest → z) and projected
+    onto the x-y plane. RDKit's drawer then renders the actual 3D
+    shape rather than a schematic 2D layout — bond angles, ring
+    puckers, etc. all reflect the real geometry. This is the "snapshot
+    of the 3D structure" view, which matches what shows up in the
+    3Dmol.js HTML viewer.
 
-    The returned string is a complete ``<?xml ... ?>`` SVG document
-    suitable for writing to disk or embedding in HTML.
+    Without ``xyz_text``, falls back to ``AllChem.Compute2DCoords`` —
+    a clean schematic chemistry diagram. Use that mode when no
+    geometry is available (e.g., SMILES-only path with no upstream
+    conformer).
 
-    RDKit is required.
+    Annotates one atom per group with the predicted shift + group
+    name; other atoms in a HARD group remain unlabeled to keep the
+    visual clean.
+
+    Returns a complete ``<?xml ... ?>`` SVG document. RDKit is
+    required; ``xyz_text``-driven snapshots additionally require numpy
+    (already in the ``chem`` extra alongside RDKit).
     """
     from rdkit import Chem  # type: ignore[import-not-found]
     from rdkit.Chem import AllChem  # type: ignore[import-not-found]
@@ -78,7 +89,15 @@ def render_shift_svg(
     # Work on a copy so we don't mutate the caller's mol (the aggregator
     # builds the mol once and reuses it for both ¹H and ¹³C diagrams).
     mol_copy = Chem.Mol(mol)
-    AllChem.Compute2DCoords(mol_copy)
+
+    # Choose the 2D layout source: 3D snapshot (xyz-driven) or
+    # schematic (RDKit's Compute2DCoords).
+    if xyz_text:
+        used_3d = _set_2d_conformer_from_xyz(mol_copy, xyz_text)
+    else:
+        used_3d = False
+    if not used_3d:
+        AllChem.Compute2DCoords(mol_copy)
 
     # Annotate one atom per group. For HARD (collapsed) groups the
     # annotated atom is the first one in atom_indices; the others stay
@@ -103,6 +122,58 @@ def render_shift_svg(
     drawer.DrawMolecule(mol_copy)
     drawer.FinishDrawing()
     return drawer.GetDrawingText()
+
+
+def _set_2d_conformer_from_xyz(mol: Any, xyz_text: str) -> bool:
+    """Replace ``mol``'s conformer with a 2D projection of ``xyz_text``.
+
+    Pipeline:
+
+    1. Parse atomic coordinates from the xyz string.
+    2. Center on the centroid.
+    3. Rotate via PCA so the molecule's largest variance aligns with
+       the x-axis, second-largest with y, and smallest variance points
+       along z. This puts the molecule's "best 2D view" in the x-y
+       plane regardless of how RDKit happened to embed it.
+    4. Drop the z component and install the result as a fresh 2D
+       conformer on ``mol``.
+
+    Returns ``True`` if the projection succeeded, ``False`` if the xyz
+    text didn't yield enough atom positions to cover ``mol`` (in which
+    case the caller should fall back to ``Compute2DCoords``).
+
+    Requires numpy. RDKit is imported inside via the caller; we keep
+    the numpy import local so the module loads cleanly in numpy-less
+    environments (only the snapshot mode actually needs it).
+    """
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    positions = _parse_xyz_positions(xyz_text)
+    n_atoms = mol.GetNumAtoms()
+    if len(positions) < n_atoms:
+        return False
+
+    try:
+        import numpy as np  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+
+    coords_3d = np.array([positions[i] for i in range(n_atoms)], dtype=float)
+    centered = coords_3d - coords_3d.mean(axis=0)
+    # PCA: covariance matrix → eigenvectors give the principal axes.
+    # eigh returns eigenvalues ascending; we want the largest two as
+    # the in-plane axes, so we reverse the column order.
+    cov = centered.T @ centered
+    _, eigvecs = np.linalg.eigh(cov)
+    rotation = eigvecs[:, ::-1]  # columns: largest, middle, smallest variance
+    aligned = centered @ rotation
+
+    new_conf = Chem.Conformer(n_atoms)
+    for i in range(n_atoms):
+        new_conf.SetAtomPosition(i, (float(aligned[i, 0]), float(aligned[i, 1]), 0.0))
+    mol.RemoveAllConformers()
+    mol.AddConformer(new_conf, assignId=True)
+    return True
 
 
 # --------------------------------------------------------------------
@@ -199,7 +270,13 @@ const xyzData = $xyz_data;
 const labels = $labels_json;
 const viewer = $$3Dmol.createViewer("viewer", {backgroundColor: "white"});
 viewer.addModel(xyzData, "xyz");
-viewer.setStyle({}, {stick: {radius: 0.15}, sphere: {radius: 0.3, scale: 0.25}});
+// Ball-and-stick: spheres scaled to ~24% of VdW radius (so heavier
+// atoms naturally appear larger), sticks at 0.13 Å. Tweak STICK_R
+// and SPHERE_SCALE to taste — 0.13 + 0.24 is the lab default;
+// 0.20 + 0.35 reads chunkier, 0.10 + 0.18 is more wireframe-y.
+const STICK_R = 0.13;
+const SPHERE_SCALE = 0.24;
+viewer.setStyle({}, {stick: {radius: STICK_R}, sphere: {scale: SPHERE_SCALE}});
 for (const lbl of labels) {
   viewer.addLabel(lbl.text, {
     position: lbl.position,

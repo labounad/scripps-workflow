@@ -1468,10 +1468,14 @@ class NmrAggregate(Node):
         (just logged at INFO level).
         """
         title = f"Predicted {nucleus} NMR shifts"
-        # SVG.
+        # SVG. Pass xyz_text so the renderer produces a 3D-snapshot
+        # (PCA-aligned projection of the actual geometry) rather than
+        # RDKit's schematic 2D layout. When xyz is absent it falls
+        # back to Compute2DCoords automatically.
         svg_text = render_shift_svg(
             mol=mol,
             groups=avg_groups,
+            xyz_text=xyz_text,
             width=int(cfg["diagrams_width"]),
             height=int(cfg["diagrams_height"]),
         )
