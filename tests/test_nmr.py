@@ -793,3 +793,121 @@ class TestNmrAggregateMnovaXml:
             float(s.find("population").text) for s in systems
         )
         assert populations == pytest.approx([0.3, 0.7])
+
+
+# --------------------------------------------------------------------
+# nmr_aggregate molecule-diagram artifacts (SVG + HTML)
+# --------------------------------------------------------------------
+
+
+class TestNmrAggregateDiagrams:
+    """Integration tests for predicted_structure_*.svg / .html artifacts.
+
+    These share the methane fixture from the mnova-XML tests above —
+    the diagram emission piggybacks on the same equivalence grouping,
+    so a happy-path mnova XML run also produces happy-path diagrams.
+    """
+
+    @pytest.fixture
+    def rdkit(self):
+        return pytest.importorskip("rdkit")
+
+    def test_default_emits_svg_and_html_per_nucleus(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        diagrams = _files_by_label(m, "predicted_structure_")
+        labels = sorted(a["label"] for a in diagrams)
+        assert labels == [
+            "predicted_structure_13c_html",
+            "predicted_structure_13c_svg",
+            "predicted_structure_1h_html",
+            "predicted_structure_1h_svg",
+        ]
+        # SVG files must round-trip through ElementTree.
+        import xml.etree.ElementTree as ET
+        for a in diagrams:
+            if a["format"] == "svg":
+                ET.fromstring(Path(a["path_abs"]).read_text(encoding="utf-8"))
+
+    def test_svg_contains_predicted_shift(self, rdkit, tmp_path):
+        # Methane H predicted shift: (30.5 − 31.8447) / −1.0698 ≈ 1.26 ppm.
+        up = _build_methane_upstream(tmp_path, n_conformers=1, weights=[1.0])
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        svg_path = next(
+            Path(a["path_abs"]) for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_structure_1h_svg"
+        )
+        text = svg_path.read_text(encoding="utf-8")
+        # Substring check: "1.26" appears in the rendered atomNote.
+        assert "1.26" in text
+
+    def test_html_embeds_xyz_data(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path, n_conformers=1, weights=[1.0])
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        html_path = next(
+            Path(a["path_abs"]) for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_structure_1h_html"
+        )
+        text = html_path.read_text(encoding="utf-8")
+        # 3Dmol.js CDN script + the methane xyz (atom count 5).
+        assert "3Dmol-min.js" in text
+        assert "\"5" in text or '"5\\n' in text  # xyz starts with atom count
+
+    def test_diagrams_disabled(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=C", "diagrams_enabled=false",
+        )
+        assert _files_by_label(m, "predicted_structure_") == []
+
+    def test_html_skipped_when_no_readable_xyz(self, rdkit, tmp_path):
+        # write_xyz=False → path_abs points at the task_dir, which is
+        # not a readable xyz. SVG still emits (Compute2DCoords needs
+        # only the Mol from SMILES); HTML is silently skipped.
+        up = _build_methane_upstream(tmp_path, write_xyz=False)
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        labels = {
+            a["label"] for a in _files_by_label(m, "predicted_structure_")
+        }
+        assert "predicted_structure_1h_svg" in labels
+        assert "predicted_structure_13c_svg" in labels
+        # HTML needs xyz → not emitted in this scenario.
+        assert "predicted_structure_1h_html" not in labels
+        assert "predicted_structure_13c_html" not in labels
+
+    def test_diagrams_skipped_when_topology_unavailable(
+        self, rdkit, tmp_path
+    ):
+        # No SMILES + no readable xyz → topology fails, BOTH XML and
+        # diagrams skip. The same mnova_xml_skipped failure record
+        # covers both visualization paths (Mol is shared).
+        up = _build_methane_upstream(tmp_path, write_xyz=False)
+        m = _run_aggregate(tmp_path, up)
+        codes = [f["error"] for f in m.get("failures", [])]
+        assert "mnova_xml_skipped" in codes
+        assert _files_by_label(m, "predicted_structure_") == []
+
+    def test_only_1h_diagram_when_nuclei_filtered(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=C", "mnova_nuclei=1H",
+        )
+        labels = {
+            a["label"] for a in _files_by_label(m, "predicted_structure_")
+        }
+        assert "predicted_structure_1h_svg" in labels
+        assert "predicted_structure_1h_html" in labels
+        assert "predicted_structure_13c_svg" not in labels
+        assert "predicted_structure_13c_html" not in labels
+
+    def test_diagrams_only_when_mnova_disabled(self, rdkit, tmp_path):
+        # Operator wants the visualization but not the mnova XMLs.
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=C", "mnova_enabled=false",
+        )
+        # No mnova XMLs.
+        assert _files_by_label(m, "predicted_mnova_") == []
+        # But diagrams DO emit.
+        diagrams = _files_by_label(m, "predicted_structure_")
+        assert len(diagrams) == 4  # 2 nuclei × (svg + html)

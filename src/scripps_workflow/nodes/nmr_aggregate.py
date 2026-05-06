@@ -21,11 +21,20 @@ four mnova-spinsim XML files:
       ``<spin-system>`` per conformer with Boltzmann weight as
       ``<population>``, lets mnova render the conformational
       ensemble directly. Emission is gated by ``mnova_per_conformer``.
+    * ``predicted_structure_*.svg`` — 2D molecule diagram with each
+      equivalence group's atoms annotated by predicted shift + group
+      name. Browser-viewable, embeddable in reports.
+    * ``predicted_structure_*.html`` — standalone HTML page with an
+      embedded 3Dmol.js viewer; user can drag to rotate, scroll to
+      zoom, and read all the labels in 3D. Loads 3Dmol.js from CDN.
 
-mnova XML emission needs a SMILES (or, as fallback, a parseable xyz)
-to drive the equivalence detector. Without either, XML emission is
+mnova XML emission and the diagrams BOTH need a SMILES (or, as
+fallback, a parseable xyz) to drive the equivalence detector and
+shape the visualization. Without either, all visualization paths are
 skipped with a structured ``mnova_xml_skipped:topology_unavailable``
-failure record; the CSV path keeps running unaffected.
+failure record; the CSV path keeps running unaffected. The XML and
+diagram outputs are independently gated by ``mnova_enabled`` and
+``diagrams_enabled`` respectively.
 
 The compute path lives in :mod:`scripps_workflow.nodes.orca_thermo_array`,
 extended to chain freq + high-level SP + NMR shielding(s) + J-coupling jobs
@@ -101,6 +110,14 @@ Config keys (``key=value`` tokens or one JSON object):
                                        whose DFT shifts spread above
                                        this — catches diastereotopic
                                        CH₂ in chiral environments).
+
+    diagrams_enabled         [true]    emit SVG + HTML molecule diagrams
+                                       per requested nucleus. Reuses
+                                       ``mnova_nuclei`` for nucleus
+                                       selection and ``smiles`` /
+                                       xyz fallback for the structure.
+    diagrams_width           [900]     diagram canvas width (px).
+    diagrams_height          [600]     diagram canvas height (px).
 """
 
 from __future__ import annotations
@@ -118,6 +135,7 @@ from ..equivalence import (
 )
 from ..hashing import sha256_file
 from ..mnova_xml import SpectrumConfig, SpinSystem, render_mnova_xml
+from ..molecule_diagram import render_shift_html, render_shift_svg
 from ..nmr_calibration import (
     lookup_calibration,
     predict_chemical_shift,
@@ -192,6 +210,24 @@ DEFAULT_MNOVA_FILENAME_FMT: str = "predicted_mnova_{nucleus}.xml"
 DEFAULT_MNOVA_PER_CONFORMER_FILENAME_FMT: str = (
     "predicted_mnova_{nucleus}_per_conformer.xml"
 )
+
+# --------------------------------------------------------------------
+# Molecule-diagram artifacts (2D SVG + 3D HTML viewer)
+# --------------------------------------------------------------------
+
+#: Per-nucleus 2D SVG depiction of the molecule with each
+#: equivalence-group's atoms annotated by predicted shift + group name.
+DEFAULT_DIAGRAM_SVG_FILENAME_FMT: str = "predicted_structure_{nucleus}.svg"
+
+#: Per-nucleus standalone HTML page with an embedded 3Dmol.js viewer.
+#: Loads the molecule's optimized 3D geometry and labels each group at
+#: its centroid. The user can drag to rotate, scroll to zoom.
+DEFAULT_DIAGRAM_HTML_FILENAME_FMT: str = "predicted_structure_{nucleus}.html"
+
+#: SVG / HTML canvas dimensions in pixels. 900x600 fits comfortably on
+#: a laptop screen and matches a typical lab notebook export size.
+DEFAULT_DIAGRAM_WIDTH: int = 900
+DEFAULT_DIAGRAM_HEIGHT: int = 600
 
 
 SHIFT_CSV_COLUMNS: tuple[str, ...] = (
@@ -794,6 +830,15 @@ class NmrAggregate(Node):
                 raw.get("mnova_tol_shift_ppm"),
                 DEFAULT_MNOVA_TOL_SHIFT_PPM,
             ),
+            # Molecule-diagram artifacts (2D SVG + 3D HTML viewer).
+            # Reuses ``mnova_nuclei`` to decide which nuclei to depict.
+            "diagrams_enabled": parse_bool(raw.get("diagrams_enabled"), True),
+            "diagrams_width": parse_int(
+                raw.get("diagrams_width"), DEFAULT_DIAGRAM_WIDTH
+            ),
+            "diagrams_height": parse_int(
+                raw.get("diagrams_height"), DEFAULT_DIAGRAM_HEIGHT
+            ),
         }
 
     def run(self, ctx: NodeContext) -> None:
@@ -1141,9 +1186,9 @@ class NmrAggregate(Node):
             },
         )
 
-        # ---- mnova-spinsim XML emission (optional) ----
-        if cfg["mnova_enabled"]:
-            self._emit_mnova_xmls(
+        # ---- mnova-spinsim XML + diagram artifacts (optional) ----
+        if cfg["mnova_enabled"] or cfg["diagrams_enabled"]:
+            self._emit_visualizations(
                 ctx=ctx,
                 cfg=cfg,
                 confs=confs,
@@ -1158,10 +1203,10 @@ class NmrAggregate(Node):
             )
 
     # ------------------------------------------------------------------
-    # mnova XML emission
+    # Visualization emission (mnova XML + molecule diagrams)
     # ------------------------------------------------------------------
 
-    def _emit_mnova_xmls(
+    def _emit_visualizations(
         self,
         *,
         ctx: NodeContext,
@@ -1176,26 +1221,38 @@ class NmrAggregate(Node):
         cal_c: Optional[dict[str, Any]],
         cal_jhh: Optional[dict[str, Any]],
     ) -> None:
-        """Render mnova-spinsim XMLs and add them to the manifest.
+        """Render mnova XMLs + molecule-diagram artifacts.
 
-        Two files per requested nucleus: a pre-averaged spin-system
-        (population=1, shifts and J's already Boltzmann-averaged) and,
-        when ``mnova_per_conformer`` is true, a per-conformer file
-        (one ``<spin-system>`` per conformer with its Boltzmann weight
-        as ``<population>``). Failure-mode contract:
+        Both visualization paths share the same equivalence-group
+        computation (one call per nucleus), so we keep them in one
+        method to avoid recomputing the structural classification.
+        Each output type is independently gated:
+
+        * ``mnova_enabled`` controls XML emission (pre-averaged + the
+          optional per-conformer file when ``mnova_per_conformer``).
+        * ``diagrams_enabled`` controls the SVG + HTML diagrams.
+
+        Failure-mode contract:
 
         * ``mnova_xml_skipped:topology_unavailable`` — neither the
           provided SMILES nor the xyz fallback yields a usable Mol.
-          No XML files are written. The CSV path keeps running.
-        * ``mnova_xml_skipped:no_calibration_for_<nucleus>`` —
-          calibration entry missing for a requested nucleus. That
-          nucleus's XML is skipped (we can't convert σ → δ without
-          the calibration), but other nuclei still emit.
+          ALL visualization artifacts are skipped (XML and diagrams
+          both need the Mol). The CSV path keeps running.
+        * Per-nucleus skips are silent (logged at INFO level): a
+          molecule with no H atoms simply doesn't get ¹H artifacts;
+          a missing calibration entry blocks XML for that nucleus
+          but the SVG/HTML diagrams emit raw shifts so you still get
+          a structure visualization.
+
+        Per-conformer SVG/HTML diagrams are NOT emitted (would
+        produce N files per nucleus for N conformers — too noisy).
+        Diagrams use Boltzmann-averaged shifts only.
         """
         nuclei = [t for t in cfg["mnova_nuclei"].split(",") if t]
 
         # Build the Mol once — equivalence detection is purely structural,
-        # so the same Mol works for both ¹H and ¹³C XML emission.
+        # so the same Mol works for both ¹H and ¹³C and for both XML
+        # and diagram emission.
         mol = self._build_mnova_mol(cfg, confs)
         if mol is None:
             ctx.fail(
@@ -1203,10 +1260,19 @@ class NmrAggregate(Node):
                 reason="topology_unavailable",
                 detail=(
                     "neither smiles= nor xyz fallback produced a usable Mol; "
-                    "set smiles=... in node config to enable mnova XML emission"
+                    "set smiles=... in node config to enable mnova XML / "
+                    "diagram emission"
                 ),
             )
             return
+
+        # XYZ text for the 3D HTML viewer. Drawn from the first
+        # conformer with a readable xyz at path_abs (any conformer
+        # works — the molecule is the same; only the geometry differs
+        # per conformer and any geometry visualizes the structure).
+        # ``None`` means HTML emission is silently skipped; SVG still
+        # works since it computes its own 2D layout.
+        xyz_text = self._first_conformer_xyz_text(confs)
 
         outputs_dir = ctx.outputs_dir
         outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -1214,8 +1280,7 @@ class NmrAggregate(Node):
         for nuc in nuclei:
             element, cal_shift = ("H", cal_h) if nuc == "1H" else ("C", cal_c)
             # Skip silently when the molecule has no atoms of this
-            # nucleus (e.g., a perfluorinated molecule asking for ¹H,
-            # or a hydrocarbon asking for ¹³C with cal_c missing).
+            # nucleus (e.g., a perfluorinated molecule asking for ¹H).
             has_atoms = any(
                 entry.get("element") == element for entry in by_atom.values()
             )
@@ -1224,14 +1289,14 @@ class NmrAggregate(Node):
             if cal_shift is None:
                 # The CSV path already surfaces calibration_not_found
                 # for nuclei that have atoms in the data — no need to
-                # double-fire from the XML path. Just log + skip.
+                # double-fire from the XML/diagram paths. Just log + skip.
                 logging_utils.log_warn(
-                    f"nmr-aggregate: skipping {nuc} mnova XML "
+                    f"nmr-aggregate: skipping {nuc} visualizations "
                     f"(no calibration entry for {nuc})"
                 )
                 continue
 
-            # Pre-averaged groups + spin-system.
+            # Pre-averaged groups (shared between XML and diagrams).
             avg_shifts = _shifts_by_atom_from_by_atom(
                 by_atom=by_atom, element=element, cal=cal_shift
             )
@@ -1240,7 +1305,7 @@ class NmrAggregate(Node):
                 # element, but the calibration filter dropped all of
                 # them (shouldn't happen unless the dict shape is bad).
                 logging_utils.log_info(
-                    f"nmr-aggregate: skipping {nuc} mnova XML "
+                    f"nmr-aggregate: skipping {nuc} visualizations "
                     f"(no {element} atoms with parseable shielding)"
                 )
                 continue
@@ -1259,76 +1324,235 @@ class NmrAggregate(Node):
             )
             if not avg_groups:
                 continue
-            avg_system = SpinSystem(groups=tuple(avg_groups), population=1.0)
 
-            spec = _spectrum_config_for(cfg, nucleus=nuc)
-            xml_text = render_mnova_xml([avg_system], spectrum=spec)
-            file_path = outputs_dir / DEFAULT_MNOVA_FILENAME_FMT.format(
-                nucleus=nuc.lower()
-            )
-            file_path.write_text(xml_text, encoding="utf-8")
-            ctx.add_artifact(
-                "files",
-                {
-                    "label": f"predicted_mnova_{nuc.lower()}",
-                    "path_abs": str(file_path.resolve()),
-                    "sha256": sha256_file(file_path),
-                    "format": "xml",
-                    "n_groups": len(avg_groups),
-                    "nucleus": nuc,
-                    "mode": "pre_averaged",
-                },
-            )
-            logging_utils.log_info(
-                f"nmr-aggregate: wrote {file_path.name} "
-                f"({len(avg_groups)} group(s))"
-            )
+            # ---- mnova XML (gated by mnova_enabled) ----
+            if cfg["mnova_enabled"]:
+                self._emit_mnova_xml_for_nucleus(
+                    ctx=ctx,
+                    cfg=cfg,
+                    nucleus=nuc,
+                    element=element,
+                    avg_groups=avg_groups,
+                    confs=confs,
+                    norm_weights=norm_weights,
+                    per_conformer_shieldings=per_conformer_shieldings,
+                    per_conformer_couplings=per_conformer_couplings,
+                    cal_shift=cal_shift,
+                    cal_jhh=cal_jhh,
+                    mol=mol,
+                    outputs_dir=outputs_dir,
+                )
 
-            # Per-conformer file (optional).
-            if not cfg["mnova_per_conformer"]:
-                continue
-            per_systems = self._build_per_conformer_systems(
-                mol=mol,
-                element=element,
-                nucleus=nuc,
-                cfg=cfg,
-                confs=confs,
-                norm_weights=norm_weights,
-                per_conformer_shieldings=per_conformer_shieldings,
-                per_conformer_couplings=per_conformer_couplings,
-                cal_shift=cal_shift,
-                cal_jhh=cal_jhh,
-            )
-            if not per_systems:
-                logging_utils.log_info(
-                    f"nmr-aggregate: skipping {nuc} per-conformer mnova XML "
-                    f"(no conformers with usable data)"
+            # ---- Molecule diagrams (gated by diagrams_enabled) ----
+            if cfg["diagrams_enabled"]:
+                self._emit_diagrams_for_nucleus(
+                    ctx=ctx,
+                    cfg=cfg,
+                    nucleus=nuc,
+                    avg_groups=avg_groups,
+                    mol=mol,
+                    xyz_text=xyz_text,
+                    outputs_dir=outputs_dir,
                 )
-                continue
-            per_xml = render_mnova_xml(per_systems, spectrum=spec)
-            per_path = (
-                outputs_dir
-                / DEFAULT_MNOVA_PER_CONFORMER_FILENAME_FMT.format(
-                    nucleus=nuc.lower()
-                )
-            )
-            per_path.write_text(per_xml, encoding="utf-8")
-            ctx.add_artifact(
-                "files",
-                {
-                    "label": f"predicted_mnova_{nuc.lower()}_per_conformer",
-                    "path_abs": str(per_path.resolve()),
-                    "sha256": sha256_file(per_path),
-                    "format": "xml",
-                    "n_spin_systems": len(per_systems),
-                    "nucleus": nuc,
-                    "mode": "per_conformer",
-                },
-            )
+
+    def _emit_mnova_xml_for_nucleus(
+        self,
+        *,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        nucleus: str,
+        element: str,
+        avg_groups: list[EquivalenceGroup],
+        confs: list[dict[str, Any]],
+        norm_weights: list[Optional[float]],
+        per_conformer_shieldings: list[Optional[list[dict[str, Any]]]],
+        per_conformer_couplings: list[Optional[list[dict[str, Any]]]],
+        cal_shift: dict[str, Any],
+        cal_jhh: Optional[dict[str, Any]],
+        mol: Any,
+        outputs_dir: Path,
+    ) -> None:
+        """Render and write the mnova XML(s) for one nucleus.
+
+        Always emits the pre-averaged file. Optionally emits the
+        per-conformer file when ``mnova_per_conformer`` is true and
+        any conformer has usable data.
+        """
+        avg_system = SpinSystem(groups=tuple(avg_groups), population=1.0)
+        spec = _spectrum_config_for(cfg, nucleus=nucleus)
+
+        xml_text = render_mnova_xml([avg_system], spectrum=spec)
+        file_path = outputs_dir / DEFAULT_MNOVA_FILENAME_FMT.format(
+            nucleus=nucleus.lower()
+        )
+        file_path.write_text(xml_text, encoding="utf-8")
+        ctx.add_artifact(
+            "files",
+            {
+                "label": f"predicted_mnova_{nucleus.lower()}",
+                "path_abs": str(file_path.resolve()),
+                "sha256": sha256_file(file_path),
+                "format": "xml",
+                "n_groups": len(avg_groups),
+                "nucleus": nucleus,
+                "mode": "pre_averaged",
+            },
+        )
+        logging_utils.log_info(
+            f"nmr-aggregate: wrote {file_path.name} "
+            f"({len(avg_groups)} group(s))"
+        )
+
+        if not cfg["mnova_per_conformer"]:
+            return
+        per_systems = self._build_per_conformer_systems(
+            mol=mol,
+            element=element,
+            nucleus=nucleus,
+            cfg=cfg,
+            confs=confs,
+            norm_weights=norm_weights,
+            per_conformer_shieldings=per_conformer_shieldings,
+            per_conformer_couplings=per_conformer_couplings,
+            cal_shift=cal_shift,
+            cal_jhh=cal_jhh,
+        )
+        if not per_systems:
             logging_utils.log_info(
-                f"nmr-aggregate: wrote {per_path.name} "
-                f"({len(per_systems)} conformer(s))"
+                f"nmr-aggregate: skipping {nucleus} per-conformer mnova XML "
+                f"(no conformers with usable data)"
             )
+            return
+        per_xml = render_mnova_xml(per_systems, spectrum=spec)
+        per_path = (
+            outputs_dir
+            / DEFAULT_MNOVA_PER_CONFORMER_FILENAME_FMT.format(
+                nucleus=nucleus.lower()
+            )
+        )
+        per_path.write_text(per_xml, encoding="utf-8")
+        ctx.add_artifact(
+            "files",
+            {
+                "label": f"predicted_mnova_{nucleus.lower()}_per_conformer",
+                "path_abs": str(per_path.resolve()),
+                "sha256": sha256_file(per_path),
+                "format": "xml",
+                "n_spin_systems": len(per_systems),
+                "nucleus": nucleus,
+                "mode": "per_conformer",
+            },
+        )
+        logging_utils.log_info(
+            f"nmr-aggregate: wrote {per_path.name} "
+            f"({len(per_systems)} conformer(s))"
+        )
+
+    def _emit_diagrams_for_nucleus(
+        self,
+        *,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        nucleus: str,
+        avg_groups: list[EquivalenceGroup],
+        mol: Any,
+        xyz_text: Optional[str],
+        outputs_dir: Path,
+    ) -> None:
+        """Write the SVG (always) and HTML (if xyz available) diagrams.
+
+        SVG comes from RDKit's :mod:`rdMolDraw2D` and uses a fresh 2D
+        layout, so it works whether or not we have 3D coords. HTML
+        needs a real xyz to drive the 3Dmol.js viewer; if no
+        conformer's xyz is readable, the HTML is silently skipped
+        (just logged at INFO level).
+        """
+        title = f"Predicted {nucleus} NMR shifts"
+        # SVG.
+        svg_text = render_shift_svg(
+            mol=mol,
+            groups=avg_groups,
+            width=int(cfg["diagrams_width"]),
+            height=int(cfg["diagrams_height"]),
+        )
+        svg_path = outputs_dir / DEFAULT_DIAGRAM_SVG_FILENAME_FMT.format(
+            nucleus=nucleus.lower()
+        )
+        svg_path.write_text(svg_text, encoding="utf-8")
+        ctx.add_artifact(
+            "files",
+            {
+                "label": f"predicted_structure_{nucleus.lower()}_svg",
+                "path_abs": str(svg_path.resolve()),
+                "sha256": sha256_file(svg_path),
+                "format": "svg",
+                "n_groups": len(avg_groups),
+                "nucleus": nucleus,
+            },
+        )
+        logging_utils.log_info(f"nmr-aggregate: wrote {svg_path.name}")
+
+        # HTML (3Dmol.js). Needs a real xyz; silently skip if absent.
+        if not xyz_text:
+            logging_utils.log_info(
+                f"nmr-aggregate: skipping {nucleus} HTML viewer "
+                f"(no readable xyz on any conformer's path_abs)"
+            )
+            return
+        html_text = render_shift_html(
+            groups=avg_groups,
+            xyz_text=xyz_text,
+            title=title,
+            width=int(cfg["diagrams_width"]),
+            height=int(cfg["diagrams_height"]),
+        )
+        html_path = outputs_dir / DEFAULT_DIAGRAM_HTML_FILENAME_FMT.format(
+            nucleus=nucleus.lower()
+        )
+        html_path.write_text(html_text, encoding="utf-8")
+        ctx.add_artifact(
+            "files",
+            {
+                "label": f"predicted_structure_{nucleus.lower()}_html",
+                "path_abs": str(html_path.resolve()),
+                "sha256": sha256_file(html_path),
+                "format": "html",
+                "n_groups": len(avg_groups),
+                "nucleus": nucleus,
+            },
+        )
+        logging_utils.log_info(f"nmr-aggregate: wrote {html_path.name}")
+
+    def _first_conformer_xyz_text(
+        self, confs: list[dict[str, Any]]
+    ) -> Optional[str]:
+        """Return the first readable xyz text from the conformer list.
+
+        Used as the 3D-coordinate source for :func:`render_shift_html`.
+        Any conformer's xyz is fine since they're all the same molecule
+        — geometry differs per conformer but the visual structure is
+        the same. Returns ``None`` if no conformer has a readable xyz
+        (e.g., the legacy test fixture where ``path_abs`` is a directory
+        rather than a file).
+        """
+        for c in confs:
+            path = c.get("path_abs")
+            if not isinstance(path, str):
+                continue
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except Exception:
+                continue
+            # Sanity: an xyz starts with an integer atom count.
+            head = text.lstrip().splitlines()[:1]
+            if not head:
+                continue
+            try:
+                int(head[0].split()[0])
+            except (ValueError, IndexError):
+                continue
+            return text
+        return None
 
     def _build_mnova_mol(
         self, cfg: dict[str, Any], confs: list[dict[str, Any]]
@@ -1427,6 +1651,10 @@ __all__ = [
     "COUPLING_CSV_COLUMNS",
     "DEFAULT_COUPLING_BASIS",
     "DEFAULT_COUPLING_METHOD",
+    "DEFAULT_DIAGRAM_HEIGHT",
+    "DEFAULT_DIAGRAM_HTML_FILENAME_FMT",
+    "DEFAULT_DIAGRAM_SVG_FILENAME_FMT",
+    "DEFAULT_DIAGRAM_WIDTH",
     "DEFAULT_MNOVA_FIELD_MHZ_C",
     "DEFAULT_MNOVA_FIELD_MHZ_H",
     "DEFAULT_MNOVA_FILENAME_FMT",
