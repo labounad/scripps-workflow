@@ -5,12 +5,27 @@ call, walks each conformer's task directory, parses chemical shieldings and
 J-coupling tables from the (compound) ORCA output, applies population-weighted
 averaging using the Boltzmann weights the thermo aggregator already computed,
 then applies linear-scaling correction (cheshire / Bally-Rablen) to produce
-predicted experimental observables. Writes two CSVs:
+predicted experimental observables. Writes two CSVs and (optionally) up to
+four mnova-spinsim XML files:
 
     * ``predicted_shifts.csv`` — per atom: index, element, σ_iso_avg,
       δ_predicted, calibration source.
     * ``predicted_couplings.csv`` — per (i, j) pair: indices, elements,
       J_total_avg, J_predicted, calibration source.
+    * ``predicted_mnova_1h.xml`` / ``predicted_mnova_13c.xml`` —
+      pre-averaged spin-system files for the mnova spin-simulator,
+      with chemical equivalence detected via
+      :mod:`scripps_workflow.equivalence` (homotopic groups collapse,
+      AA'BB'-style magnetically inequivalent groups stay split).
+    * ``predicted_mnova_*_per_conformer.xml`` — one
+      ``<spin-system>`` per conformer with Boltzmann weight as
+      ``<population>``, lets mnova render the conformational
+      ensemble directly. Emission is gated by ``mnova_per_conformer``.
+
+mnova XML emission needs a SMILES (or, as fallback, a parseable xyz)
+to drive the equivalence detector. Without either, XML emission is
+skipped with a structured ``mnova_xml_skipped:topology_unavailable``
+failure record; the CSV path keeps running unaffected.
 
 The compute path lives in :mod:`scripps_workflow.nodes.orca_thermo_array`,
 extended to chain freq + high-level SP + NMR shielding(s) + J-coupling jobs
@@ -60,6 +75,32 @@ Config keys (``key=value`` tokens or one JSON object):
     output_couplings_csv     [predicted_couplings.csv]
     skip_couplings           [false]   skip J table parse + write
     fail_policy              [soft]
+
+    smiles                   [None]    canonical SMILES driving the
+                                       equivalence detector. When
+                                       absent the emitter falls back
+                                       to xyz perception of any
+                                       conformer's geometry.
+    mnova_enabled            [true]    master toggle for XML emission.
+    mnova_per_conformer      [true]    also emit per-conformer XMLs.
+    mnova_nuclei             [1H,13C]  comma-separated; "1H", "13C",
+                                       or "1H,13C". Each requested
+                                       nucleus produces its own file.
+    mnova_field_mhz_h        [400.13]  ¹H Larmor frequency.
+    mnova_field_mhz_c        [100.61]  ¹³C Larmor frequency.
+    mnova_line_width_hz_h    [1.0]     simulated linewidth, ¹H.
+    mnova_line_width_hz_c    [5.0]     simulated linewidth, ¹³C.
+    mnova_from_ppm_h         [0.0]     spectrum window low edge, ¹H.
+    mnova_to_ppm_h           [12.0]    spectrum window high edge, ¹H.
+    mnova_from_ppm_c         [0.0]     spectrum window low edge, ¹³C.
+    mnova_to_ppm_c           [220.0]   spectrum window high edge, ¹³C.
+    mnova_points             [16384]   FID points for the simulation.
+    mnova_tol_jcoupling_hz   [0.5]     magnetic-equivalence tolerance.
+    mnova_tol_shift_ppm      [0.05]    data-aware refinement tolerance
+                                       (splits topological classes
+                                       whose DFT shifts spread above
+                                       this — catches diastereotopic
+                                       CH₂ in chiral environments).
 """
 
 from __future__ import annotations
@@ -70,7 +111,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import logging_utils
+from ..equivalence import (
+    EquivalenceGroup,
+    compute_equivalence_groups,
+    mol_from_smiles_or_xyz,
+)
 from ..hashing import sha256_file
+from ..mnova_xml import SpectrumConfig, SpinSystem, render_mnova_xml
 from ..nmr_calibration import (
     lookup_calibration,
     predict_chemical_shift,
@@ -82,7 +129,7 @@ from ..orca import (
     parse_orca_shieldings,
     pick_orca_outputs,
 )
-from ..parsing import normalize_optional_str, parse_bool
+from ..parsing import normalize_optional_str, parse_bool, parse_float, parse_int
 
 
 DEFAULT_SOLVENT: str = "CHCl3"
@@ -98,6 +145,53 @@ DEFAULT_COUPLING_BASIS: str = "pcJ-2"
 
 DEFAULT_OUTPUT_SHIFTS_CSV: str = "predicted_shifts.csv"
 DEFAULT_OUTPUT_COUPLINGS_CSV: str = "predicted_couplings.csv"
+
+# --------------------------------------------------------------------
+# mnova-spinsim XML emission
+# --------------------------------------------------------------------
+
+#: Comma-separated list of nuclei the XML emitter is willing to render.
+#: Order is irrelevant — each nucleus produces an independent XML file.
+DEFAULT_MNOVA_NUCLEI: str = "1H,13C"
+
+#: Larmor frequency presets in MHz on a 400 MHz spectrometer (¹H Larmor
+#: ≈ field × 42.577; ¹³C ≈ field × 10.708). Override when the user's
+#: spectrometer is different (e.g., 600 MHz → 600.13 / 150.92).
+DEFAULT_MNOVA_FIELD_MHZ_H: float = 400.13
+DEFAULT_MNOVA_FIELD_MHZ_C: float = 100.61
+
+#: Per-nucleus simulated linewidth (Hz). ¹H signals are typically narrow
+#: (1 Hz at half-height in fluid solution); broadband-decoupled ¹³C is
+#: deliberately broader to reflect the spectrum's actual visual.
+DEFAULT_MNOVA_LINE_WIDTH_HZ_H: float = 1.0
+DEFAULT_MNOVA_LINE_WIDTH_HZ_C: float = 5.0
+
+#: Spectrum window (ppm) per nucleus. Defaults bracket organic
+#: molecules' typical chemical-shift ranges with a small margin.
+DEFAULT_MNOVA_FROM_PPM_H: float = 0.0
+DEFAULT_MNOVA_TO_PPM_H: float = 12.0
+DEFAULT_MNOVA_FROM_PPM_C: float = 0.0
+DEFAULT_MNOVA_TO_PPM_C: float = 220.0
+
+#: FID points for the simulated spectrum. 16k matches the reference
+#: file (SF_M_001.xml); higher values give finer resolution at the
+#: cost of mnova render time.
+DEFAULT_MNOVA_POINTS: int = 16384
+
+#: Equivalence detection tolerances. ``tol_jcoupling_hz`` controls
+#: the magnetic-equivalence J-vector test (HARD vs SOFT dispatch).
+#: ``tol_shift_ppm`` controls the data-aware refinement that splits
+#: topological classes whose DFT shifts spread above noise (e.g.,
+#: diastereotopic CH₂ in chiral environments).
+DEFAULT_MNOVA_TOL_JCOUPLING_HZ: float = 0.5
+DEFAULT_MNOVA_TOL_SHIFT_PPM: float = 0.05
+
+#: Output filenames. Per nucleus we emit one pre-averaged file and
+#: optionally one per-conformer file (controlled by mnova_per_conformer).
+DEFAULT_MNOVA_FILENAME_FMT: str = "predicted_mnova_{nucleus}.xml"
+DEFAULT_MNOVA_PER_CONFORMER_FILENAME_FMT: str = (
+    "predicted_mnova_{nucleus}_per_conformer.xml"
+)
 
 
 SHIFT_CSV_COLUMNS: tuple[str, ...] = (
@@ -424,6 +518,155 @@ def write_couplings_csv(
 
 
 # --------------------------------------------------------------------
+# mnova XML helpers (shape adapters between aggregator state +
+# scripps_workflow.equivalence / scripps_workflow.mnova_xml inputs)
+# --------------------------------------------------------------------
+
+
+def _shifts_by_atom_from_by_atom(
+    *,
+    by_atom: dict[int, dict[str, Any]],
+    element: str,
+    cal: dict[str, Any],
+) -> dict[int, float]:
+    """Convert the aggregator's averaged ``by_atom`` map to the
+    ``{atom_idx → predicted δ_ppm}`` shape that
+    :func:`compute_equivalence_groups` expects.
+
+    Filters to the requested ``element`` and applies the cheshire-
+    style linear scaling ``δ = (σ − intercept) / slope`` per atom.
+    Atoms whose entry has no parseable σ are silently dropped.
+    """
+    out: dict[int, float] = {}
+    for atom_idx, entry in by_atom.items():
+        if entry.get("element") != element:
+            continue
+        sigma = entry.get("sigma_iso_avg_ppm")
+        if not isinstance(sigma, (int, float)):
+            continue
+        out[int(atom_idx)] = predict_chemical_shift(
+            float(sigma), slope=cal["slope"], intercept=cal["intercept"]
+        )
+    return out
+
+
+def _shifts_by_atom_from_per_conformer(
+    *,
+    shieldings: list[dict[str, Any]],
+    element: str,
+    cal: dict[str, Any],
+) -> dict[int, float]:
+    """Same as :func:`_shifts_by_atom_from_by_atom` but operating on
+    a single conformer's parsed shielding rows (raw σ per atom).
+
+    Linear scaling commutes with averaging, so applying the
+    calibration here (per conformer) is mathematically equivalent
+    to applying it post-Boltzmann; we apply early because the
+    equivalence detector wants δ for its data-aware refinement
+    threshold (also in ppm).
+    """
+    out: dict[int, float] = {}
+    for row in shieldings:
+        if row.get("element") != element:
+            continue
+        sigma = row.get("sigma_iso_ppm")
+        if not isinstance(sigma, (int, float)):
+            continue
+        out[int(row["atom_index"])] = predict_chemical_shift(
+            float(sigma), slope=cal["slope"], intercept=cal["intercept"]
+        )
+    return out
+
+
+def _calibrated_jhh_matrix_from_by_pair(
+    by_pair: dict[tuple[int, int], dict[str, Any]],
+    cal_jhh: Optional[dict[str, Any]],
+) -> dict[tuple[int, int], float]:
+    """Convert aggregator's averaged ``by_pair`` map to the
+    canonical-pair-keyed J matrix the equivalence detector wants.
+
+    Filters to ¹H–¹H pairs (the only ones our default coupling
+    pipeline computes) and applies the Bally/Rablen scaling
+    ``J_pred = slope · J_calc + intercept`` when available. When
+    no calibration is loaded, raw J's are passed through.
+    """
+    out: dict[tuple[int, int], float] = {}
+    for key, entry in by_pair.items():
+        if not (
+            entry.get("elem_i") == "H" and entry.get("elem_j") == "H"
+        ):
+            continue
+        j_avg = entry.get("J_total_avg_hz")
+        if not isinstance(j_avg, (int, float)):
+            continue
+        if cal_jhh is not None:
+            out[key] = predict_coupling_constant(
+                float(j_avg),
+                slope=cal_jhh["slope"],
+                intercept=cal_jhh["intercept"],
+            )
+        else:
+            out[key] = float(j_avg)
+    return out
+
+
+def _calibrated_jhh_matrix_from_per_conformer(
+    couplings: list[dict[str, Any]],
+    cal_jhh: Optional[dict[str, Any]],
+) -> dict[tuple[int, int], float]:
+    """Per-conformer version of :func:`_calibrated_jhh_matrix_from_by_pair`.
+
+    Operates on parsed coupling rows from one ORCA J-coupling output.
+    """
+    out: dict[tuple[int, int], float] = {}
+    for row in couplings:
+        if not (row.get("elem_i") == "H" and row.get("elem_j") == "H"):
+            continue
+        j_total = row.get("J_total_hz")
+        if not isinstance(j_total, (int, float)):
+            continue
+        i, j = int(row["i"]), int(row["j"])
+        key = (min(i, j), max(i, j))
+        if cal_jhh is not None:
+            out[key] = predict_coupling_constant(
+                float(j_total),
+                slope=cal_jhh["slope"],
+                intercept=cal_jhh["intercept"],
+            )
+        else:
+            out[key] = float(j_total)
+    return out
+
+
+def _spectrum_config_for(
+    cfg: dict[str, Any], *, nucleus: str
+) -> SpectrumConfig:
+    """Build a :class:`SpectrumConfig` for the requested nucleus.
+
+    The aggregator stores per-nucleus knobs as flat ``mnova_*_h`` /
+    ``mnova_*_c`` keys for GUI ergonomics; this helper picks the
+    right pair and packages them into the renderer's dataclass.
+    """
+    if nucleus == "1H":
+        return SpectrumConfig(
+            frequency_mhz=float(cfg["mnova_field_mhz_h"]),
+            points=int(cfg["mnova_points"]),
+            from_ppm=float(cfg["mnova_from_ppm_h"]),
+            to_ppm=float(cfg["mnova_to_ppm_h"]),
+            line_width_hz=float(cfg["mnova_line_width_hz_h"]),
+        )
+    if nucleus == "13C":
+        return SpectrumConfig(
+            frequency_mhz=float(cfg["mnova_field_mhz_c"]),
+            points=int(cfg["mnova_points"]),
+            from_ppm=float(cfg["mnova_from_ppm_c"]),
+            to_ppm=float(cfg["mnova_to_ppm_c"]),
+            line_width_hz=float(cfg["mnova_line_width_hz_c"]),
+        )
+    raise ValueError(f"_spectrum_config_for: unsupported nucleus {nucleus!r}")
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -480,6 +723,26 @@ class NmrAggregate(Node):
             if "/" in val or val.startswith("."):
                 raise ValueError(f"{name} must be a basename, got {val!r}")
 
+        # mnova-spinsim XML emission knobs. SMILES is the topology
+        # source the equivalence detector needs; if absent, the
+        # emitter falls back to xyz perception (charge=0 assumed)
+        # and skips XML emission only if both routes fail.
+        smiles = normalize_optional_str(raw.get("smiles"))
+        mnova_enabled = parse_bool(raw.get("mnova_enabled"), True)
+        mnova_per_conformer = parse_bool(raw.get("mnova_per_conformer"), True)
+        mnova_nuclei = (
+            normalize_optional_str(raw.get("mnova_nuclei"))
+            or DEFAULT_MNOVA_NUCLEI
+        )
+        # Validate: each token must be one of the supported nuclei.
+        nuclei_tokens = [t.strip() for t in mnova_nuclei.split(",") if t.strip()]
+        for tok in nuclei_tokens:
+            if tok not in ("1H", "13C"):
+                raise ValueError(
+                    f"mnova_nuclei: unsupported token {tok!r}; "
+                    f"expected one of '1H', '13C' (comma-separated)"
+                )
+
         return {
             "solvent": solvent,
             "shielding_method_h": shielding_method_h,
@@ -491,6 +754,46 @@ class NmrAggregate(Node):
             "output_shifts_csv": output_shifts_csv,
             "output_couplings_csv": output_couplings_csv,
             "skip_couplings": parse_bool(raw.get("skip_couplings"), False),
+            # mnova XML emission
+            "smiles": smiles,
+            "mnova_enabled": mnova_enabled,
+            "mnova_per_conformer": mnova_per_conformer,
+            "mnova_nuclei": ",".join(nuclei_tokens),
+            "mnova_field_mhz_h": parse_float(
+                raw.get("mnova_field_mhz_h"), DEFAULT_MNOVA_FIELD_MHZ_H
+            ),
+            "mnova_field_mhz_c": parse_float(
+                raw.get("mnova_field_mhz_c"), DEFAULT_MNOVA_FIELD_MHZ_C
+            ),
+            "mnova_line_width_hz_h": parse_float(
+                raw.get("mnova_line_width_hz_h"), DEFAULT_MNOVA_LINE_WIDTH_HZ_H
+            ),
+            "mnova_line_width_hz_c": parse_float(
+                raw.get("mnova_line_width_hz_c"), DEFAULT_MNOVA_LINE_WIDTH_HZ_C
+            ),
+            "mnova_from_ppm_h": parse_float(
+                raw.get("mnova_from_ppm_h"), DEFAULT_MNOVA_FROM_PPM_H
+            ),
+            "mnova_to_ppm_h": parse_float(
+                raw.get("mnova_to_ppm_h"), DEFAULT_MNOVA_TO_PPM_H
+            ),
+            "mnova_from_ppm_c": parse_float(
+                raw.get("mnova_from_ppm_c"), DEFAULT_MNOVA_FROM_PPM_C
+            ),
+            "mnova_to_ppm_c": parse_float(
+                raw.get("mnova_to_ppm_c"), DEFAULT_MNOVA_TO_PPM_C
+            ),
+            "mnova_points": parse_int(
+                raw.get("mnova_points"), DEFAULT_MNOVA_POINTS
+            ),
+            "mnova_tol_jcoupling_hz": parse_float(
+                raw.get("mnova_tol_jcoupling_hz"),
+                DEFAULT_MNOVA_TOL_JCOUPLING_HZ,
+            ),
+            "mnova_tol_shift_ppm": parse_float(
+                raw.get("mnova_tol_shift_ppm"),
+                DEFAULT_MNOVA_TOL_SHIFT_PPM,
+            ),
         }
 
     def run(self, ctx: NodeContext) -> None:
@@ -838,11 +1141,306 @@ class NmrAggregate(Node):
             },
         )
 
+        # ---- mnova-spinsim XML emission (optional) ----
+        if cfg["mnova_enabled"]:
+            self._emit_mnova_xmls(
+                ctx=ctx,
+                cfg=cfg,
+                confs=confs,
+                norm_weights=norm_weights,
+                per_conformer_shieldings=per_conformer_shieldings,
+                per_conformer_couplings=per_conformer_couplings,
+                by_atom=by_atom,
+                by_pair=by_pair,
+                cal_h=cal_h,
+                cal_c=cal_c,
+                cal_jhh=cal_jhh,
+            )
+
+    # ------------------------------------------------------------------
+    # mnova XML emission
+    # ------------------------------------------------------------------
+
+    def _emit_mnova_xmls(
+        self,
+        *,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        confs: list[dict[str, Any]],
+        norm_weights: list[Optional[float]],
+        per_conformer_shieldings: list[Optional[list[dict[str, Any]]]],
+        per_conformer_couplings: list[Optional[list[dict[str, Any]]]],
+        by_atom: dict[int, dict[str, Any]],
+        by_pair: dict[tuple[int, int], dict[str, Any]],
+        cal_h: Optional[dict[str, Any]],
+        cal_c: Optional[dict[str, Any]],
+        cal_jhh: Optional[dict[str, Any]],
+    ) -> None:
+        """Render mnova-spinsim XMLs and add them to the manifest.
+
+        Two files per requested nucleus: a pre-averaged spin-system
+        (population=1, shifts and J's already Boltzmann-averaged) and,
+        when ``mnova_per_conformer`` is true, a per-conformer file
+        (one ``<spin-system>`` per conformer with its Boltzmann weight
+        as ``<population>``). Failure-mode contract:
+
+        * ``mnova_xml_skipped:topology_unavailable`` — neither the
+          provided SMILES nor the xyz fallback yields a usable Mol.
+          No XML files are written. The CSV path keeps running.
+        * ``mnova_xml_skipped:no_calibration_for_<nucleus>`` —
+          calibration entry missing for a requested nucleus. That
+          nucleus's XML is skipped (we can't convert σ → δ without
+          the calibration), but other nuclei still emit.
+        """
+        nuclei = [t for t in cfg["mnova_nuclei"].split(",") if t]
+
+        # Build the Mol once — equivalence detection is purely structural,
+        # so the same Mol works for both ¹H and ¹³C XML emission.
+        mol = self._build_mnova_mol(cfg, confs)
+        if mol is None:
+            ctx.fail(
+                "mnova_xml_skipped",
+                reason="topology_unavailable",
+                detail=(
+                    "neither smiles= nor xyz fallback produced a usable Mol; "
+                    "set smiles=... in node config to enable mnova XML emission"
+                ),
+            )
+            return
+
+        outputs_dir = ctx.outputs_dir
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        for nuc in nuclei:
+            element, cal_shift = ("H", cal_h) if nuc == "1H" else ("C", cal_c)
+            # Skip silently when the molecule has no atoms of this
+            # nucleus (e.g., a perfluorinated molecule asking for ¹H,
+            # or a hydrocarbon asking for ¹³C with cal_c missing).
+            has_atoms = any(
+                entry.get("element") == element for entry in by_atom.values()
+            )
+            if not has_atoms:
+                continue
+            if cal_shift is None:
+                # The CSV path already surfaces calibration_not_found
+                # for nuclei that have atoms in the data — no need to
+                # double-fire from the XML path. Just log + skip.
+                logging_utils.log_warn(
+                    f"nmr-aggregate: skipping {nuc} mnova XML "
+                    f"(no calibration entry for {nuc})"
+                )
+                continue
+
+            # Pre-averaged groups + spin-system.
+            avg_shifts = _shifts_by_atom_from_by_atom(
+                by_atom=by_atom, element=element, cal=cal_shift
+            )
+            if not avg_shifts:
+                # Defensive: has_atoms said we have atoms of this
+                # element, but the calibration filter dropped all of
+                # them (shouldn't happen unless the dict shape is bad).
+                logging_utils.log_info(
+                    f"nmr-aggregate: skipping {nuc} mnova XML "
+                    f"(no {element} atoms with parseable shielding)"
+                )
+                continue
+            j_matrix_avg = (
+                _calibrated_jhh_matrix_from_by_pair(by_pair, cal_jhh)
+                if nuc == "1H"
+                else {}
+            )
+            avg_groups = compute_equivalence_groups(
+                mol=mol,
+                element=element,
+                shifts_by_atom=avg_shifts,
+                j_matrix=j_matrix_avg,
+                tol_jcoupling_hz=cfg["mnova_tol_jcoupling_hz"],
+                tol_shift_ppm=cfg["mnova_tol_shift_ppm"],
+            )
+            if not avg_groups:
+                continue
+            avg_system = SpinSystem(groups=tuple(avg_groups), population=1.0)
+
+            spec = _spectrum_config_for(cfg, nucleus=nuc)
+            xml_text = render_mnova_xml([avg_system], spectrum=spec)
+            file_path = outputs_dir / DEFAULT_MNOVA_FILENAME_FMT.format(
+                nucleus=nuc.lower()
+            )
+            file_path.write_text(xml_text, encoding="utf-8")
+            ctx.add_artifact(
+                "files",
+                {
+                    "label": f"predicted_mnova_{nuc.lower()}",
+                    "path_abs": str(file_path.resolve()),
+                    "sha256": sha256_file(file_path),
+                    "format": "xml",
+                    "n_groups": len(avg_groups),
+                    "nucleus": nuc,
+                    "mode": "pre_averaged",
+                },
+            )
+            logging_utils.log_info(
+                f"nmr-aggregate: wrote {file_path.name} "
+                f"({len(avg_groups)} group(s))"
+            )
+
+            # Per-conformer file (optional).
+            if not cfg["mnova_per_conformer"]:
+                continue
+            per_systems = self._build_per_conformer_systems(
+                mol=mol,
+                element=element,
+                nucleus=nuc,
+                cfg=cfg,
+                confs=confs,
+                norm_weights=norm_weights,
+                per_conformer_shieldings=per_conformer_shieldings,
+                per_conformer_couplings=per_conformer_couplings,
+                cal_shift=cal_shift,
+                cal_jhh=cal_jhh,
+            )
+            if not per_systems:
+                logging_utils.log_info(
+                    f"nmr-aggregate: skipping {nuc} per-conformer mnova XML "
+                    f"(no conformers with usable data)"
+                )
+                continue
+            per_xml = render_mnova_xml(per_systems, spectrum=spec)
+            per_path = (
+                outputs_dir
+                / DEFAULT_MNOVA_PER_CONFORMER_FILENAME_FMT.format(
+                    nucleus=nuc.lower()
+                )
+            )
+            per_path.write_text(per_xml, encoding="utf-8")
+            ctx.add_artifact(
+                "files",
+                {
+                    "label": f"predicted_mnova_{nuc.lower()}_per_conformer",
+                    "path_abs": str(per_path.resolve()),
+                    "sha256": sha256_file(per_path),
+                    "format": "xml",
+                    "n_spin_systems": len(per_systems),
+                    "nucleus": nuc,
+                    "mode": "per_conformer",
+                },
+            )
+            logging_utils.log_info(
+                f"nmr-aggregate: wrote {per_path.name} "
+                f"({len(per_systems)} conformer(s))"
+            )
+
+    def _build_mnova_mol(
+        self, cfg: dict[str, Any], confs: list[dict[str, Any]]
+    ) -> Optional[Any]:
+        """Build the RDKit Mol used for equivalence detection.
+
+        Tries SMILES first (clean canonical structure, deterministic
+        atom ordering matched with smiles_to_3d's xyz). Falls back to
+        xyz perception via :func:`mol_from_smiles_or_xyz` on any
+        conformer's staged xyz (atom indices match ORCA's output by
+        construction). Returns ``None`` only if both routes fail.
+        """
+        smi = cfg.get("smiles")
+        if smi:
+            mol = mol_from_smiles_or_xyz(smiles=smi)
+            if mol is not None:
+                return mol
+            logging_utils.log_warn(
+                "nmr-aggregate: SMILES failed to parse; falling back to xyz"
+            )
+
+        for c in confs:
+            path = c.get("path_abs")
+            if not isinstance(path, str):
+                continue
+            try:
+                xyz_text = Path(path).read_text(encoding="utf-8")
+            except Exception:
+                continue
+            mol = mol_from_smiles_or_xyz(xyz_text=xyz_text, charge=0)
+            if mol is not None:
+                return mol
+        return None
+
+    def _build_per_conformer_systems(
+        self,
+        *,
+        mol: Any,
+        element: str,
+        nucleus: str,
+        cfg: dict[str, Any],
+        confs: list[dict[str, Any]],
+        norm_weights: list[Optional[float]],
+        per_conformer_shieldings: list[Optional[list[dict[str, Any]]]],
+        per_conformer_couplings: list[Optional[list[dict[str, Any]]]],
+        cal_shift: dict[str, Any],
+        cal_jhh: Optional[dict[str, Any]],
+    ) -> list[SpinSystem]:
+        """Build one :class:`SpinSystem` per conformer with weight populations.
+
+        Conformers with ``None`` weight or empty shielding data are
+        skipped. The returned list keeps source-conformer order
+        (the orchestrator stage 5 sort happens INSIDE
+        :func:`compute_equivalence_groups` via min atom index).
+        """
+        systems: list[SpinSystem] = []
+        for conf, w, shieldings, couplings in zip(
+            confs,
+            norm_weights,
+            per_conformer_shieldings,
+            per_conformer_couplings,
+        ):
+            if not isinstance(w, (int, float)):
+                continue
+            if not shieldings:
+                continue
+            shifts = _shifts_by_atom_from_per_conformer(
+                shieldings=shieldings, element=element, cal=cal_shift
+            )
+            if not shifts:
+                continue
+            j_matrix = (
+                _calibrated_jhh_matrix_from_per_conformer(
+                    couplings or [], cal_jhh
+                )
+                if nucleus == "1H"
+                else {}
+            )
+            groups = compute_equivalence_groups(
+                mol=mol,
+                element=element,
+                shifts_by_atom=shifts,
+                j_matrix=j_matrix,
+                tol_jcoupling_hz=cfg["mnova_tol_jcoupling_hz"],
+                tol_shift_ppm=cfg["mnova_tol_shift_ppm"],
+            )
+            if not groups:
+                continue
+            systems.append(
+                SpinSystem(groups=tuple(groups), population=float(w))
+            )
+        return systems
+
 
 __all__ = [
     "COUPLING_CSV_COLUMNS",
     "DEFAULT_COUPLING_BASIS",
     "DEFAULT_COUPLING_METHOD",
+    "DEFAULT_MNOVA_FIELD_MHZ_C",
+    "DEFAULT_MNOVA_FIELD_MHZ_H",
+    "DEFAULT_MNOVA_FILENAME_FMT",
+    "DEFAULT_MNOVA_FROM_PPM_C",
+    "DEFAULT_MNOVA_FROM_PPM_H",
+    "DEFAULT_MNOVA_LINE_WIDTH_HZ_C",
+    "DEFAULT_MNOVA_LINE_WIDTH_HZ_H",
+    "DEFAULT_MNOVA_NUCLEI",
+    "DEFAULT_MNOVA_PER_CONFORMER_FILENAME_FMT",
+    "DEFAULT_MNOVA_POINTS",
+    "DEFAULT_MNOVA_TO_PPM_C",
+    "DEFAULT_MNOVA_TO_PPM_H",
+    "DEFAULT_MNOVA_TOL_JCOUPLING_HZ",
+    "DEFAULT_MNOVA_TOL_SHIFT_PPM",
     "DEFAULT_OUTPUT_COUPLINGS_CSV",
     "DEFAULT_OUTPUT_SHIFTS_CSV",
     "DEFAULT_SHIELDING_BASIS_C",

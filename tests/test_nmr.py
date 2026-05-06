@@ -382,6 +382,7 @@ def _build_upstream(
     h_shieldings: list[tuple[int, str, float, float]],
     c_shieldings: list[tuple[int, str, float, float]],
     couplings: list[tuple[int, int, str, str, float]] | None,
+    xyz_text: str | None = None,
 ) -> Path:
     """Build a synthetic thermo_aggregate upstream manifest with task dirs.
 
@@ -389,6 +390,12 @@ def _build_upstream(
     (orca_nmr_h.out / _c.out / _j.out) populated with the supplied
     tables — the same shielding/coupling values per conformer so the
     Boltzmann average is just the input value.
+
+    When ``xyz_text`` is provided, a real xyz file is written into each
+    task_dir at ``input.xyz`` and ``path_abs`` points at it (matching
+    production manifests from ``orca_thermo_array``). Otherwise
+    ``path_abs`` is the task_dir itself, which the legacy CSV-only
+    tests don't exercise.
     """
     up_dir = tmp_path / "upstream"
     out_dir = up_dir / "outputs"
@@ -413,10 +420,16 @@ def _build_upstream(
         (d / "orca_nmr_c.out").write_text(c_text, encoding="utf-8")
         if couplings is not None:
             (d / "orca_nmr_j.out").write_text(j_text, encoding="utf-8")
+        if xyz_text is not None:
+            xyz_file = d / "input.xyz"
+            xyz_file.write_text(xyz_text, encoding="utf-8")
+            path_abs = str(xyz_file.resolve())
+        else:
+            path_abs = str(d.resolve())  # ContentRecord requires str
         confs.append({
             "index": i,
             "label": f"conf_{i:04d}",
-            "path_abs": str(d.resolve()),  # ContentRecord requires str
+            "path_abs": path_abs,
             "task_dir_abs": str(d.resolve()),
             "boltzmann_weight": float(weights[i - 1]),
         })
@@ -575,3 +588,203 @@ class TestNmrAggregateHHContract:
         failure_codes = [f["error"] for f in m.get("failures", [])]
         assert "no_hh_couplings_parsed" in failure_codes
         assert m["ok"] is False
+
+
+# --------------------------------------------------------------------
+# nmr_aggregate mnova XML emission
+# --------------------------------------------------------------------
+
+# Methane xyz (tetrahedral C with 4 H's) — RDKit's DetermineBonds
+# perceives 4 C-H single bonds cleanly. Atom order matches what
+# `Chem.AddHs(Chem.MolFromSmiles("C"))` produces: C at 0, H's at 1-4.
+_METHANE_XYZ = (
+    "5\n"
+    "methane\n"
+    "C  0.0000000  0.0000000  0.0000000\n"
+    "H  0.6300000  0.6300000  0.6300000\n"
+    "H -0.6300000 -0.6300000  0.6300000\n"
+    "H -0.6300000  0.6300000 -0.6300000\n"
+    "H  0.6300000 -0.6300000 -0.6300000\n"
+)
+
+
+def _build_methane_upstream(tmp_path: Path, *, n_conformers: int = 2,
+                             weights: list[float] | None = None,
+                             write_xyz: bool = True) -> Path:
+    """Methane fixture: 1 C + 4 homotopic H's. Used by the mnova XML
+    integration tests. Atom indices match `Chem.AddHs(MolFromSmiles("C"))`."""
+    if weights is None:
+        weights = [1.0 / n_conformers] * n_conformers
+    h_shieldings = [
+        (1, "H", 30.5, 5.0),
+        (2, "H", 30.5, 5.0),
+        (3, "H", 30.5, 5.0),
+        (4, "H", 30.5, 5.0),
+    ]
+    c_shieldings = [(0, "C", 184.0, 0.0)]
+    return _build_upstream(
+        tmp_path,
+        n_conformers=n_conformers,
+        weights=weights,
+        h_shieldings=h_shieldings,
+        c_shieldings=c_shieldings,
+        couplings=[],  # methane has no observable H-H J's
+        xyz_text=_METHANE_XYZ if write_xyz else None,
+    )
+
+
+def _files_by_label(manifest: dict, label_prefix: str) -> list[dict]:
+    return [
+        a for a in manifest["artifacts"]["files"]
+        if a.get("label", "").startswith(label_prefix)
+    ]
+
+
+class TestNmrAggregateMnovaXml:
+    """Integration tests for the mnova-spinsim XML artifacts.
+
+    All tests require RDKit because the equivalence detector is
+    chirality-aware-canonical-rank-driven. Skipped on stripped envs.
+    """
+
+    @pytest.fixture
+    def rdkit(self):
+        return pytest.importorskip("rdkit")
+
+    def test_default_emits_four_xmls(self, rdkit, tmp_path):
+        # Methane + SMILES "C" + both nuclei requested + per-conformer
+        # enabled (defaults). Expect: 1h pre + 1h per-conf + 13c pre +
+        # 13c per-conf = 4 XML files.
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+
+        xmls = _files_by_label(m, "predicted_mnova_")
+        labels = sorted(a["label"] for a in xmls)
+        assert labels == [
+            "predicted_mnova_13c",
+            "predicted_mnova_13c_per_conformer",
+            "predicted_mnova_1h",
+            "predicted_mnova_1h_per_conformer",
+        ]
+        # Each XML must round-trip through ElementTree.
+        import xml.etree.ElementTree as ET
+        for a in xmls:
+            text = Path(a["path_abs"]).read_text(encoding="utf-8")
+            root = ET.fromstring(text)
+            assert root.tag == "mnova-spinsim"
+
+    def test_methyl_collapses_to_one_hard_group(self, rdkit, tmp_path):
+        # The 4 H's of methane are homotopic -> tier HARD ->
+        # single <group number="4">.
+        up = _build_methane_upstream(tmp_path, n_conformers=1, weights=[1.0])
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        h_xml = next(
+            Path(a["path_abs"]) for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_mnova_1h"
+        )
+        text = h_xml.read_text(encoding="utf-8")
+        # Single group, number=4. Methane has 4 H's so number=4.
+        assert text.count("<group ") == 1
+        assert 'number="4"' in text
+        # Predicted δ via WP04 calibration: (30.5 - 31.8447) / -1.0698
+        # ≈ 1.2569 ppm.
+        import re
+        m_shift = re.search(r"<shift>(\d+\.\d+)</shift>", text)
+        assert m_shift is not None
+        assert float(m_shift.group(1)) == pytest.approx(1.257, abs=0.01)
+
+    def test_disabled_emits_no_xml(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=C", "mnova_enabled=false",
+        )
+        assert _files_by_label(m, "predicted_mnova_") == []
+        # No mnova_xml_skipped failure either — disabled is a clean opt-out.
+        codes = [f["error"] for f in m.get("failures", [])]
+        assert not any("mnova_xml_skipped" in c for c in codes)
+
+    def test_topology_unavailable_skips_with_failure(self, rdkit, tmp_path):
+        # No SMILES provided AND no usable xyz at path_abs (write_xyz=False
+        # leaves path_abs pointing at the task_dir, which read_text rejects).
+        up = _build_methane_upstream(tmp_path, write_xyz=False)
+        m = _run_aggregate(tmp_path, up)  # no smiles= token
+
+        codes = [f["error"] for f in m.get("failures", [])]
+        # Failure record fires once: "topology_unavailable".
+        assert "mnova_xml_skipped" in codes
+        skipped = [f for f in m["failures"] if f["error"] == "mnova_xml_skipped"]
+        assert any(
+            f.get("reason") == "topology_unavailable" for f in skipped
+        )
+        # No XMLs emitted.
+        assert _files_by_label(m, "predicted_mnova_") == []
+        # CSVs still emit (independent code path).
+        assert _files_by_label(m, "predicted_shifts_csv")
+        assert _files_by_label(m, "predicted_couplings_csv")
+
+    def test_xyz_fallback_works_without_smiles(self, rdkit, tmp_path):
+        # No SMILES, but path_abs is a real methane xyz file. The
+        # aggregator's xyz fallback should perceive the bonds and
+        # build a Mol that drives equivalence detection.
+        up = _build_methane_upstream(tmp_path)  # write_xyz=True by default
+        m = _run_aggregate(tmp_path, up)  # no smiles= token
+
+        codes = [f["error"] for f in m.get("failures", [])]
+        # No topology-unavailable failure — xyz fallback succeeded.
+        skipped = [
+            f for f in m.get("failures", [])
+            if f["error"] == "mnova_xml_skipped"
+            and f.get("reason") == "topology_unavailable"
+        ]
+        assert not skipped
+        # All four XMLs emit.
+        labels = sorted(
+            a["label"] for a in _files_by_label(m, "predicted_mnova_")
+        )
+        assert "predicted_mnova_1h" in labels
+        assert "predicted_mnova_13c" in labels
+
+    def test_only_1h_when_nuclei_filtered(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=C", "mnova_nuclei=1H",
+        )
+        labels = {a["label"] for a in _files_by_label(m, "predicted_mnova_")}
+        # Only ¹H artifacts; ¹³C is suppressed.
+        assert "predicted_mnova_1h" in labels
+        assert "predicted_mnova_13c" not in labels
+        assert "predicted_mnova_1h_per_conformer" in labels
+        assert "predicted_mnova_13c_per_conformer" not in labels
+
+    def test_per_conformer_disabled(self, rdkit, tmp_path):
+        up = _build_methane_upstream(tmp_path, n_conformers=2)
+        m = _run_aggregate(
+            tmp_path, up, "smiles=C", "mnova_per_conformer=false",
+        )
+        labels = {a["label"] for a in _files_by_label(m, "predicted_mnova_")}
+        # Only pre-averaged files; per-conformer suppressed.
+        assert "predicted_mnova_1h" in labels
+        assert "predicted_mnova_13c" in labels
+        assert "predicted_mnova_1h_per_conformer" not in labels
+        assert "predicted_mnova_13c_per_conformer" not in labels
+
+    def test_per_conformer_carries_boltzmann_populations(self, rdkit, tmp_path):
+        # Two conformers with weights 0.7 and 0.3; per-conformer XML
+        # should have two <spin-system> blocks with those populations.
+        up = _build_methane_upstream(
+            tmp_path, n_conformers=2, weights=[0.7, 0.3],
+        )
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        per_conf_path = next(
+            Path(a["path_abs"]) for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_mnova_1h_per_conformer"
+        )
+        text = per_conf_path.read_text(encoding="utf-8")
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(text)
+        systems = root.findall("spin-system")
+        assert len(systems) == 2
+        populations = sorted(
+            float(s.find("population").text) for s in systems
+        )
+        assert populations == pytest.approx([0.3, 0.7])
