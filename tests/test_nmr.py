@@ -553,7 +553,12 @@ class TestNmrAggregateHHContract:
                 (3, 4, "H", "H", 7.7),
             ],
         )
-        m = _run_aggregate(tmp_path, up)
+        # Disable mnova XML emission — this test is about the H-H
+        # coupling-table failure contract, not the mnova path. Without
+        # mnova_enabled=false, the missing-smiles fallback would fire
+        # mnova_xml_skipped:topology_unavailable and flip ok to false,
+        # masking the real signal we want to verify here.
+        m = _run_aggregate(tmp_path, up, "mnova_enabled=false")
 
         failure_codes = [f["error"] for f in m.get("failures", [])]
         # Pre-fix this would have flagged "incomplete_hh_coupling_table"
