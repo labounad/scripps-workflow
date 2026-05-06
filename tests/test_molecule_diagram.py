@@ -80,30 +80,72 @@ class TestRenderShiftSvg:
         # Round-trips through ElementTree.
         ET.fromstring(svg)
 
-    def test_atom_note_includes_shift_and_group_name(self, rdkit):
+    def test_annotations_increase_svg_content(self, rdkit):
+        # RDKit's MolDraw2DSVG renders text as glyph paths (a sequence
+        # of <path> elements with curve/line commands), not <text>
+        # nodes. So we can't substring-search for the literal "1.26".
+        # The functional invariant we CAN check: passing groups
+        # produces measurably more drawing content than passing none,
+        # because the atom-note glyphs add path elements.
         from rdkit import Chem
         mol = Chem.AddHs(Chem.MolFromSmiles("C"))
-        groups = [_hard_methyl(name="A", shift=1.26)]
-        svg = render_shift_svg(mol=mol, groups=groups)
-        # The atom note is rendered into the SVG as a <text> element.
-        # We don't pin the exact glyph layout — just check the substrings
-        # that should appear in the rendered text.
-        assert "1.26" in svg
-        # The "(A)" annotation should appear somewhere in the SVG.
-        # RDKit may break it across separate <text> spans, so check loosely.
-        assert "A" in svg
+        svg_bare = render_shift_svg(mol=mol, groups=[])
+        svg_annotated = render_shift_svg(
+            mol=mol, groups=[_hard_methyl(name="A", shift=1.26)]
+        )
+        # Annotated SVG must have noticeably more content (multiple
+        # extra path elements for the digits and parens of "1.26 (A) ×3").
+        assert len(svg_annotated) > len(svg_bare) + 100
+        # And both must round-trip through ElementTree.
+        ET.fromstring(svg_bare)
+        ET.fromstring(svg_annotated)
 
-    def test_hard_group_carries_multiplicity_factor(self, rdkit):
+    def test_annotated_atom_carries_atomnote_property(self, rdkit):
+        # Functional check on the OTHER side of the renderer: when we
+        # call render_shift_svg, the renderer's internal mol copy gets
+        # an atomNote property set on the anchor atom. We test this by
+        # patching the SVG-emitting step (rdMolDraw2D) to capture the
+        # mol it sees.
         from rdkit import Chem
+        from rdkit.Chem.Draw import rdMolDraw2D
         mol = Chem.AddHs(Chem.MolFromSmiles("C"))
         groups = [_hard_methyl(name="A", shift=1.26)]
-        svg = render_shift_svg(mol=mol, groups=groups)
-        # ×4 should appear (methane has 4 H atoms in the HARD group).
-        # Wait — methyl_group has 3 atoms in atom_indices. Adjust:
-        # a methane all-H group would have atom_indices=(1,2,3,4) and number=4,
-        # but our _hard_methyl fixture uses 3 atoms (a CH₃ within a larger mol).
-        # Either way, the multiplicity factor should match number.
-        assert f"×{groups[0].number}" in svg or f"&#215;{groups[0].number}" in svg or f"×{groups[0].number}" in svg
+
+        captured: dict = {}
+        original = rdMolDraw2D.MolDraw2DSVG
+
+        class _Spy:
+            def __init__(self, w, h):
+                self._inner = original(w, h)
+
+            def drawOptions(self):
+                return self._inner.drawOptions()
+
+            def DrawMolecule(self, mol_arg):
+                captured["mol"] = mol_arg
+                return self._inner.DrawMolecule(mol_arg)
+
+            def FinishDrawing(self):
+                return self._inner.FinishDrawing()
+
+            def GetDrawingText(self):
+                return self._inner.GetDrawingText()
+
+        rdMolDraw2D.MolDraw2DSVG = _Spy
+        try:
+            render_shift_svg(mol=mol, groups=groups)
+        finally:
+            rdMolDraw2D.MolDraw2DSVG = original
+
+        # Anchor atom (first in atom_indices) carries the formatted
+        # atomNote.
+        anchor = captured["mol"].GetAtomWithIdx(groups[0].atom_indices[0])
+        assert anchor.HasProp("atomNote")
+        note = anchor.GetProp("atomNote")
+        assert "1.26" in note
+        assert "(A)" in note
+        # HARD group + size > 1 → multiplicity factor included.
+        assert f"×{groups[0].number}" in note
 
     def test_empty_groups_still_renders_a_molecule(self, rdkit):
         # No annotations = bare molecule diagram.

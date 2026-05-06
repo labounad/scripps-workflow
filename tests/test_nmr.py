@@ -553,12 +553,15 @@ class TestNmrAggregateHHContract:
                 (3, 4, "H", "H", 7.7),
             ],
         )
-        # Disable mnova XML emission — this test is about the H-H
-        # coupling-table failure contract, not the mnova path. Without
-        # mnova_enabled=false, the missing-smiles fallback would fire
-        # mnova_xml_skipped:topology_unavailable and flip ok to false,
-        # masking the real signal we want to verify here.
-        m = _run_aggregate(tmp_path, up, "mnova_enabled=false")
+        # Disable both visualization paths — this test is about the
+        # H-H coupling-table failure contract, not the mnova or
+        # diagram paths. Both would otherwise fire
+        # mnova_xml_skipped:topology_unavailable for the missing
+        # smiles/xyz, flipping ok to false and masking the real
+        # signal we want to verify here.
+        m = _run_aggregate(
+            tmp_path, up, "mnova_enabled=false", "diagrams_enabled=false",
+        )
 
         failure_codes = [f["error"] for f in m.get("failures", [])]
         # Pre-fix this would have flagged "incomplete_hh_coupling_table"
@@ -829,8 +832,15 @@ class TestNmrAggregateDiagrams:
             if a["format"] == "svg":
                 ET.fromstring(Path(a["path_abs"]).read_text(encoding="utf-8"))
 
-    def test_svg_contains_predicted_shift(self, rdkit, tmp_path):
-        # Methane H predicted shift: (30.5 − 31.8447) / −1.0698 ≈ 1.26 ppm.
+    def test_svg_renders_with_annotations(self, rdkit, tmp_path):
+        # RDKit's MolDraw2DSVG renders text as glyph paths, not <text>
+        # nodes — so the literal "1.26" never appears in the SVG even
+        # though it's drawn visually. We instead verify the SVG is
+        # well-formed and non-trivial (the atom-note glyphs add real
+        # drawing content). The exact-text-was-set invariant is
+        # tested in test_molecule_diagram.py via a mol-spy.
+        import xml.etree.ElementTree as ET
+
         up = _build_methane_upstream(tmp_path, n_conformers=1, weights=[1.0])
         m = _run_aggregate(tmp_path, up, "smiles=C")
         svg_path = next(
@@ -838,8 +848,18 @@ class TestNmrAggregateDiagrams:
             if a["label"] == "predicted_structure_1h_svg"
         )
         text = svg_path.read_text(encoding="utf-8")
-        # Substring check: "1.26" appears in the rendered atomNote.
-        assert "1.26" in text
+        # Well-formed XML + non-trivial size (rendered methane plus
+        # the methyl-group annotation should easily clear 1 KB).
+        ET.fromstring(text)
+        assert len(text) > 1000
+        # n_groups is recorded on the artifact metadata for downstream
+        # consumers — that's the structural-correctness signal that
+        # complements the rendered-svg-was-non-empty check above.
+        svg_artifact = next(
+            a for a in m["artifacts"]["files"]
+            if a["label"] == "predicted_structure_1h_svg"
+        )
+        assert svg_artifact["n_groups"] == 1  # methane: one HARD group of 4 H's
 
     def test_html_embeds_xyz_data(self, rdkit, tmp_path):
         up = _build_methane_upstream(tmp_path, n_conformers=1, weights=[1.0])
