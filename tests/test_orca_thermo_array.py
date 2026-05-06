@@ -577,10 +577,14 @@ class TestHappyPath:
         # Default behavior: composite freq + high-level SP separated by
         # ``$new_job``. The rendered orca_thermo.inp contains BOTH the
         # low-level freq keywords AND the wB97M-V/def2-TZVPP SP block.
+        # The default carries RIJCOSX + DEFGRID3 because wB97M-V's VV10
+        # nonlocal kernel needs RI-J for the Coulomb integrals to be
+        # tractable at TZVPP and DEFGRID3 to get the thermo right
+        # (commit 99f8f85).
         m = _run_node(tmp_path)
         assert (
             m["inputs"]["singlepoint_keywords"]
-            == "wB97M-V def2-TZVPP TightSCF"
+            == "wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3"
         )
         arr = m["artifacts"]["array"]
         task1_inp = (
@@ -588,7 +592,7 @@ class TestHappyPath:
         )
         text = task1_inp.read_text()
         assert "$new_job" in text
-        assert "! wB97M-V def2-TZVPP TightSCF" in text
+        assert "! wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3" in text
         # Both jobs share the staged xyz geometry.
         assert text.count("* xyzfile 0 1 input.xyz") == 2
 
@@ -896,9 +900,13 @@ class TestNodeWiring:
 
     def test_default_singlepoint_keywords_constant(self):
         # The composite Gibbs protocol pairs the r2scan-3c freq with a
-        # wB97M-V/def2-TZVPP single point on the same geometry.
+        # wB97M-V/def2-TZVPP single point on the same geometry. RIJCOSX
+        # is required for wB97M-V's VV10 nonlocal kernel to be tractable
+        # at TZVPP; DEFGRID3 makes the SCF convergence + thermochemistry
+        # numerically stable. (commit 99f8f85)
         assert (
-            ota.DEFAULT_SINGLEPOINT_KEYWORDS == "wB97M-V def2-TZVPP TightSCF"
+            ota.DEFAULT_SINGLEPOINT_KEYWORDS
+            == "wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3"
         )
 
     def test_filename_constants(self):

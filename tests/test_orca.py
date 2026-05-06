@@ -303,6 +303,12 @@ class TestMakeOrcaCompoundInput:
             solvent=None,
             xyz_filename="input.xyz",
         )
+        # Because the freq job is r2scan-3c (a composite *-3c method),
+        # the post-job auto-receives a `%method DFTDOPT 0 / DoGCP false`
+        # reset block — see _DISPERSION_RESET_BLOCK + commit 68efec0.
+        # Without it ORCA aborts the wB97M-V SP with "DFT-NL dispersion
+        # correction can not be applied together with D3/D4" because the
+        # composite's D3/gCP flags leak across $new_job.
         expected = (
             "! r2scan-3c TightSCF Freq\n"
             "\n"
@@ -323,6 +329,11 @@ class TestMakeOrcaCompoundInput:
             "end\n"
             "\n"
             "%maxcore 4000\n"
+            "\n"
+            "%method\n"
+            "  DFTDOPT 0\n"
+            "  DoGCP false\n"
+            "end\n"
             "\n"
             "* xyzfile 0 1 input.xyz\n"
         )
