@@ -564,3 +564,67 @@ class TestComputeEquivalenceGroups:
         assert sum(g.number for g in groups) == 9
         # The methylene H's stayed as one HARD group of 2.
         assert any(g.number == 2 and g.tier == Tier.HARD for g in hard)
+
+    def test_achiral_molecule_no_false_split_even_when_shifts_spread(
+        self, rdkit
+    ):
+        # Regression for the live-run bug on ethanol (workflow run 102271):
+        # 2-conformer Boltzmann ensemble didn't sample methyl C₃ rotation
+        # uniformly, so DFT gave the 3 methyl H's σ values spread by
+        # ~0.14 ppm (> tol_shift_ppm=0.05). Pre-fix, the data-aware
+        # refinement split the methyl class into 3 NONE singletons,
+        # producing 6 H groups (A/B/C/D/E/F) instead of 3 (methyl+
+        # methylene+OH). Post-fix, refinement is gated on stereo
+        # presence; ethanol has no chiral center → refinement skipped
+        # → topology rules → methyl + methylene collapse correctly.
+        from rdkit import Chem  # noqa: WPS433
+        mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+        h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
+        # Identify by parent: methyl C has 3 H neighbors, methylene C
+        # has 2, hydroxyl O has 1.
+        methyl_hs: list[int] = []
+        methylene_hs: list[int] = []
+        hydroxyl_hs: list[int] = []
+        for h in h_atoms:
+            parent = mol.GetAtomWithIdx(h).GetNeighbors()[0]
+            if parent.GetSymbol() == "O":
+                hydroxyl_hs.append(h)
+                continue
+            n_h = sum(
+                1 for n in parent.GetNeighbors() if n.GetSymbol() == "H"
+            )
+            if n_h == 3:
+                methyl_hs.append(h)
+            elif n_h == 2:
+                methylene_hs.append(h)
+        assert len(methyl_hs) == 3 and len(methylene_hs) == 2
+
+        # Synthetic shifts that mimic the ethanol bug — methyl spread
+        # 0.13 ppm, methylene spread 0.25 ppm — both exceed
+        # tol_shift_ppm=0.05 but should NOT trigger refinement
+        # because the molecule is achiral.
+        shifts = {}
+        shifts[methyl_hs[0]] = 1.20
+        shifts[methyl_hs[1]] = 1.09
+        shifts[methyl_hs[2]] = 1.16
+        shifts[methylene_hs[0]] = 3.65
+        shifts[methylene_hs[1]] = 3.90
+        shifts[hydroxyl_hs[0]] = 2.50
+
+        groups = compute_equivalence_groups(
+            mol=mol,
+            element="H",
+            shifts_by_atom=shifts,
+            j_matrix={},
+            tol_jcoupling_hz=0.5,
+            tol_shift_ppm=0.05,
+        )
+        # 3 groups: methyl (HARD, number=3), methylene (HARD,
+        # number=2), OH (NONE, number=1). NOT 6.
+        assert len(groups) == 3
+        hard = [g for g in groups if g.tier == Tier.HARD]
+        none = [g for g in groups if g.tier == Tier.NONE]
+        assert len(hard) == 2
+        assert len(none) == 1
+        # Sizes match the chemistry.
+        assert sorted(g.number for g in groups) == [1, 2, 3]

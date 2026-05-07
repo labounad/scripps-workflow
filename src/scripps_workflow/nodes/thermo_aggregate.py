@@ -594,15 +594,24 @@ class ThermoAggregate(Node):
             records, delta_g_kcal, weights, cumulative
         ):
             # ``path_abs`` is the schema's required canonical-path field.
-            # For per-conformer records the *task directory* is the
-            # natural "where this conformer's data lives" anchor — fall
-            # back to the CSV path itself if (very rarely) we somehow
-            # got here without a task_dir, just to satisfy the schema.
+            # Convention (matches orca_thermo_array): point at the actual
+            # input.xyz file inside the task_dir when one exists. Several
+            # downstream consumers (e.g., nmr_aggregate's mnova-XML +
+            # SVG/HTML diagram emitters) read path_abs as a file and
+            # tolerate it being a directory only as a soft fallback.
+            # If no input.xyz is present (rare; legacy task layouts),
+            # fall back to the task_dir itself.
             task_dir_abs = r.get("task_dir") or str(csv_path)
+            xyz_in_task = Path(task_dir_abs) / "input.xyz"
+            path_abs_canonical = (
+                str(xyz_in_task.resolve())
+                if xyz_in_task.exists()
+                else task_dir_abs
+            )
             ctx.add_artifact(
                 "conformers",
                 {
-                    "path_abs": task_dir_abs,
+                    "path_abs": path_abs_canonical,
                     "index": int(r["index"]),
                     "label": f"conf_{int(r['index']):04d}",
                     "task_dir_abs": task_dir_abs,

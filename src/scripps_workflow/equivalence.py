@@ -32,18 +32,25 @@ The dispatch is mechanical:
    This catches "homotopic" cleanly even when the symmetry operation
    is a non-trivial rotation/reflection.
 
-2. **Data-aware refinement.** RDKit's ``includeChirality=True`` only
-   propagates atom-level CIP flags (``@`` tags) — it does NOT split
-   prochiral H's attached to a carbon adjacent to a chiral center.
-   Diastereotopic CH₂ pairs in chiral environments therefore look
-   topologically identical to RDKit even though they're chemically
-   distinct. We compensate by inspecting the DFT-computed shifts: if
-   class members have shifts that spread more than ``tol_shift_ppm``,
-   the class gets split into singletons. The DFT calculation respects
-   3D geometry, so a spread above noise is reliable evidence that the
-   atoms aren't really equivalent. Genuinely-equivalent classes
-   (methyls, achiral CH₂) have sub-tolerance spread after Boltzmann
-   averaging, so this refinement leaves them alone.
+2. **Data-aware refinement (gated on stereo).** RDKit's
+   ``includeChirality=True`` only propagates atom-level CIP flags
+   (``@`` tags) — it does NOT split prochiral H's attached to a
+   carbon adjacent to a chiral center. Diastereotopic CH₂ pairs in
+   chiral environments therefore look topologically identical to
+   RDKit even though they're chemically distinct. When the molecule
+   has stereo info (chiral centers, stereo bonds), we compensate by
+   inspecting the DFT-computed shifts: if class members spread more
+   than ``tol_shift_ppm``, the class gets split into singletons.
+
+   When the molecule has NO stereo info, the refinement is skipped
+   entirely. Same-rank atoms are then chemically equivalent under
+   fast rotation / NMR timescale by symmetry, and any within-class
+   shift variation is sampling noise from a finite-conformer
+   Boltzmann ensemble (a 2-conformer run on ethanol doesn't sample
+   methyl C₃ rotation uniformly, leaving 0.1-0.3 ppm artifactual
+   spread on what should be a single methyl peak). Skipping the
+   refinement in the achiral case prevents false-splitting that
+   would emit 3 separate "A/B/C" groups for one methyl.
 
 3. Within each (refined) class of size ≥ 2, test whether every
    member's J-coupling vector to every other atom matches (within
@@ -386,6 +393,34 @@ def classify_class_tier(
 # --------------------------------------------------------------------
 
 
+def _mol_has_stereo(mol: Any) -> bool:
+    """True if ``mol`` carries any stereochemistry that could create
+    rank-indistinguishable diastereotopic atoms.
+
+    Checks for atom-level chirality tags (``@``-bearing centers in the
+    SMILES) and stereo bonds (E/Z designations). A molecule with
+    neither has no diastereotopicity that would be invisible to
+    :func:`topological_classes` — same-rank atoms are then chemically
+    equivalent, and any shift variation within a class is sampling
+    noise that the equivalence detector should not interpret as a
+    splitting signal.
+
+    Lazy RDKit import: this function is only called from
+    :func:`compute_equivalence_groups` (which already needs RDKit),
+    so the import is inside the function body to keep the module
+    loadable without RDKit.
+    """
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    for atom in mol.GetAtoms():
+        if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
+            return True
+    for bond in mol.GetBonds():
+        if bond.GetStereo() != Chem.BondStereo.STEREONONE:
+            return True
+    return False
+
+
 def _avg_or_none(vals: list[Optional[float]]) -> Optional[float]:
     """Mean over the non-None entries, or None if every entry is None."""
     finite = [v for v in vals if isinstance(v, (int, float))]
@@ -481,23 +516,35 @@ def compute_equivalence_groups(
         return []
 
     # Data-aware refinement (see step 2 in docstring above).
-    refined: list[list[int]] = []
-    for cls in classes:
-        if len(cls) <= 1:
-            refined.append(cls)
-            continue
-        vals = [shifts_by_atom.get(a) for a in cls]
-        finite = [v for v in vals if isinstance(v, (int, float))]
-        if len(finite) < 2 or (max(finite) - min(finite)) <= tol_shift_ppm:
-            refined.append(cls)
-        else:
-            # Class members have meaningfully different DFT shifts —
-            # they're really distinct (e.g., diastereotopic CH₂ in a
-            # chiral environment). Split into singletons; each will
-            # later classify as Tier.NONE.
-            for a in cls:
-                refined.append([a])
-    classes = refined
+    #
+    # The refinement only matters when the molecule has stereo info
+    # that could create rank-indistinguishable diastereotopic atoms
+    # (chiral centers, stereo bonds). For purely achiral molecules,
+    # same-rank atoms ARE chemically equivalent under fast rotation
+    # / NMR timescale by symmetry — any shift variation within a
+    # class is DFT noise from a finite-conformer Boltzmann ensemble
+    # (e.g., 2-conformer methyl groups don't sample C3 rotation
+    # uniformly), not a real diastereotopic signal. Skipping the
+    # refinement in the achiral case prevents false-splitting of
+    # methyls / methylenes when sampling is incomplete.
+    if _mol_has_stereo(mol):
+        refined: list[list[int]] = []
+        for cls in classes:
+            if len(cls) <= 1:
+                refined.append(cls)
+                continue
+            vals = [shifts_by_atom.get(a) for a in cls]
+            finite = [v for v in vals if isinstance(v, (int, float))]
+            if len(finite) < 2 or (max(finite) - min(finite)) <= tol_shift_ppm:
+                refined.append(cls)
+            else:
+                # Class members have meaningfully different DFT shifts —
+                # they're really distinct (e.g., diastereotopic CH₂ in a
+                # chiral environment). Split into singletons; each will
+                # later classify as Tier.NONE.
+                for a in cls:
+                    refined.append([a])
+        classes = refined
 
     # All atoms of this element across every class. Used as the universe
     # for the magnetic-equivalence test ("J-vector to other atoms").

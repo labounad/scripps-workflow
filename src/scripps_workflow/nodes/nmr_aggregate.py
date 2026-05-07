@@ -1905,28 +1905,56 @@ class NmrAggregate(Node):
         Used as the 3D-coordinate source for :func:`render_shift_html`.
         Any conformer's xyz is fine since they're all the same molecule
         — geometry differs per conformer but the visual structure is
-        the same. Returns ``None`` if no conformer has a readable xyz
-        (e.g., the legacy test fixture where ``path_abs`` is a directory
-        rather than a file).
+        the same. Returns ``None`` if no conformer has a readable xyz.
+
+        Tries ``path_abs`` first (the canonical convention from
+        ``orca_thermo_array``), then falls back to
+        ``task_dir_abs/input.xyz`` (the legacy/recovered convention
+        for upstream nodes that point ``path_abs`` at a task directory
+        instead of a file). Older ``thermo_aggregate`` builds shipped
+        directories in ``path_abs``; the fallback keeps those runs
+        compatible without a re-run.
         """
         for c in confs:
-            path = c.get("path_abs")
-            if not isinstance(path, str):
-                continue
-            try:
-                text = Path(path).read_text(encoding="utf-8")
-            except Exception:
-                continue
-            # Sanity: an xyz starts with an integer atom count.
-            head = text.lstrip().splitlines()[:1]
-            if not head:
-                continue
-            try:
-                int(head[0].split()[0])
-            except (ValueError, IndexError):
-                continue
-            return text
+            for candidate in self._xyz_path_candidates(c):
+                text = self._read_as_xyz(candidate)
+                if text is not None:
+                    return text
         return None
+
+    @staticmethod
+    def _xyz_path_candidates(conf: dict[str, Any]) -> list[str]:
+        """Ordered list of paths to try for a conformer's xyz."""
+        paths: list[str] = []
+        primary = conf.get("path_abs")
+        if isinstance(primary, str):
+            paths.append(primary)
+        task_dir = conf.get("task_dir_abs")
+        if isinstance(task_dir, str):
+            # Convention: orca_thermo_array stages each conformer's
+            # input as <task_dir>/input.xyz.
+            paths.append(str(Path(task_dir) / "input.xyz"))
+        return paths
+
+    @staticmethod
+    def _read_as_xyz(path: str) -> Optional[str]:
+        """Read ``path`` and return its content if it parses as xyz format.
+
+        Returns ``None`` when the path doesn't exist, is a directory,
+        or doesn't start with an integer atom count.
+        """
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception:
+            return None
+        head = text.lstrip().splitlines()[:1]
+        if not head:
+            return None
+        try:
+            int(head[0].split()[0])
+        except (ValueError, IndexError):
+            return None
+        return text
 
     def _build_mnova_mol(
         self, cfg: dict[str, Any], confs: list[dict[str, Any]]

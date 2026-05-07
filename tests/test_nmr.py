@@ -881,9 +881,12 @@ class TestNmrAggregateDiagrams:
         assert _files_by_label(m, "predicted_structure_") == []
 
     def test_html_skipped_when_no_readable_xyz(self, rdkit, tmp_path):
-        # write_xyz=False → path_abs points at the task_dir, which is
-        # not a readable xyz. SVG still emits (Compute2DCoords needs
-        # only the Mol from SMILES); HTML is silently skipped.
+        # write_xyz=False → path_abs points at the task_dir AND no
+        # input.xyz exists inside it. Both the primary (path_abs) and
+        # the fallback (task_dir_abs/input.xyz) lookups fail, so HTML
+        # is silently skipped. SVG still emits since it doesn't need
+        # the xyz at all (Compute2DCoords runs on the SMILES-derived
+        # Mol).
         up = _build_methane_upstream(tmp_path, write_xyz=False)
         m = _run_aggregate(tmp_path, up, "smiles=C")
         labels = {
@@ -894,6 +897,36 @@ class TestNmrAggregateDiagrams:
         # HTML needs xyz → not emitted in this scenario.
         assert "predicted_structure_1h_html" not in labels
         assert "predicted_structure_13c_html" not in labels
+
+    def test_html_uses_task_dir_xyz_fallback_when_path_abs_is_dir(
+        self, rdkit, tmp_path
+    ):
+        # Regression for the live-run bug: thermo_aggregate (older
+        # builds) wrote conformer records with path_abs=task_dir
+        # (a directory). nmr_aggregate's _first_conformer_xyz_text
+        # tried to read it as a file and bailed → HTML skipped.
+        # Post-fix, the fallback also tries task_dir_abs/input.xyz
+        # and finds the staged input geometry there.
+        up = _build_methane_upstream(tmp_path)  # writes input.xyz
+        # Patch the upstream manifest so path_abs points at the
+        # task_dir instead of the input.xyz file (mimics the legacy
+        # thermo_aggregate shape that triggered the bug).
+        up_dict = json.loads(up.read_text(encoding="utf-8"))
+        for c in up_dict["artifacts"]["conformers"]:
+            c["path_abs"] = c["task_dir_abs"]  # directory, not xyz
+        up.write_text(
+            json.dumps(up_dict, indent=2) + "\n", encoding="utf-8"
+        )
+        m = _run_aggregate(tmp_path, up, "smiles=C")
+        labels = {
+            a["label"] for a in _files_by_label(m, "predicted_structure_")
+        }
+        # SVG always works.
+        assert "predicted_structure_1h_svg" in labels
+        # HTML now ALSO works because the fallback found
+        # task_dir/input.xyz.
+        assert "predicted_structure_1h_html" in labels
+        assert "predicted_structure_13c_html" in labels
 
     def test_diagrams_skipped_when_topology_unavailable(
         self, rdkit, tmp_path
