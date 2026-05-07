@@ -23,15 +23,20 @@ group name (``A``, ``B``, ...) so the diagram acts as a legend for
 reading the simulated spectrum: peak in spectrum at 1.26 ppm with
 ``name="A"`` corresponds to the atoms labeled "1.26 (A)" on the diagram.
 
-Label-placement convention:
+Label format and placement:
 
-* For HARD groups (size ≥ 2 — methyls, symmetric methylenes), one label
-  at the centroid of the contributing atoms with text
-  ``"{shift:.2f} ({name}) ×{N}"``. Avoids cluttering the diagram with
-  N identical labels.
-* For SOFT and NONE groups (size 1 in either case — diastereotopic
-  CH₂, isolated CH, AA'BB' members), one label at the single atom
-  with text ``"{shift:.2f} ({name})"``.
+* Format ``"{name}: {shift:.2f} ({number})"`` — group letter, colon,
+  predicted δ in ppm, multiplicity in parens. Example: ``"A: 1.16 (3)"``
+  for a methyl HARD group; ``"D: 2.50 (1)"`` for a hydroxyl singleton.
+* HTML viewer renders this as TWO co-located 3Dmol.js labels with
+  different fonts: bold "A" right-aligned + light ": 1.16 (3)"
+  left-aligned. 3Dmol.js can't mix fonts in a single label, so the
+  two-label trick keeps the bold/light distinction Lucas requested.
+* For HARD groups (size ≥ 2 — methyls, symmetric methylenes), labels
+  anchor at the centroid of the contributing atoms (one label-pair
+  per group, not per atom).
+* For SOFT and NONE groups (size 1 atoms — diastereotopic CH₂,
+  isolated CH, AA'BB' members), labels anchor at the single atom.
 
 .. _3Dmol.js: https://3dmol.csb.pitt.edu
 """
@@ -99,19 +104,19 @@ def render_shift_svg(
     if not used_3d:
         AllChem.Compute2DCoords(mol_copy)
 
-    # Annotate one atom per group. For HARD (collapsed) groups the
-    # annotated atom is the first one in atom_indices; the others stay
-    # bare so the visual stays clean.
+    # Annotate one atom per group with format "A: 1.16 (3)" — group
+    # letter, colon, shift, multiplicity in parens. For HARD groups
+    # the annotated atom is the first one in atom_indices; the others
+    # stay bare so the visual stays clean.
     for group in groups:
         if not group.atom_indices:
             continue
         anchor_idx = group.atom_indices[0]
         atom = mol_copy.GetAtomWithIdx(anchor_idx)
-        if group.number > 1 and group.tier == Tier.HARD:
-            note = f"{group.shift_avg_ppm:.2f} ({group.name}) ×{group.number}"
-        else:
-            note = f"{group.shift_avg_ppm:.2f} ({group.name})"
-        atom.SetProp("atomNote", note)
+        atom.SetProp(
+            "atomNote",
+            f"{group.name}: {group.shift_avg_ppm:.2f} ({group.number})",
+        )
 
     drawer = rdMolDraw2D.MolDraw2DSVG(int(width), int(height))
     opts = drawer.drawOptions()
@@ -211,17 +216,28 @@ def _parse_xyz_positions(xyz_text: str) -> list[tuple[float, float, float]]:
     return positions
 
 
-def _label_for_group(
+def _labels_for_group(
     group: EquivalenceGroup,
     positions: list[tuple[float, float, float]],
-) -> Optional[dict[str, Any]]:
-    """Compute one label entry per group (centroid + text), or None.
+) -> list[dict[str, Any]]:
+    """Build the two 3Dmol.js label entries for one equivalence group.
 
-    HARD groups get a centroid label including the multiplicity factor
-    (``×N``); other groups get a single-atom label. Returns ``None`` if
-    the group's atoms are out-of-range for the supplied positions list
-    (defensive — shouldn't happen if positions and mol come from the
-    same xyz, but guards against caller errors).
+    Each group renders as TWO co-located labels at the centroid (HARD
+    collapsed atoms) or single atom position (NONE/SOFT singleton):
+
+    * Bold group letter, ``alignment="centerRight"`` so the text grows
+      leftward and ends at the anchor.
+    * Light shift + multiplicity (``": 1.16 (3)"``),
+      ``alignment="centerLeft"`` so the text grows rightward starting
+      at the anchor.
+
+    Together they read as ``"A: 1.16 (3)"`` with mixed Helvetica Neue
+    Bold / Light weights — 3Dmol.js can't mix fonts within a single
+    label, so the two-label trick is necessary.
+
+    Returns ``[]`` if the group's atom indices are out of range for
+    the supplied positions list (defensive — shouldn't happen if
+    positions and mol come from the same xyz).
     """
     valid = [
         positions[idx]
@@ -229,15 +245,25 @@ def _label_for_group(
         if 0 <= idx < len(positions)
     ]
     if not valid:
-        return None
+        return []
     cx = sum(p[0] for p in valid) / len(valid)
     cy = sum(p[1] for p in valid) / len(valid)
     cz = sum(p[2] for p in valid) / len(valid)
-    if group.number > 1 and group.tier == Tier.HARD:
-        text = f"{group.shift_avg_ppm:.2f} ({group.name}) ×{group.number}"
-    else:
-        text = f"{group.shift_avg_ppm:.2f} ({group.name})"
-    return {"position": {"x": cx, "y": cy, "z": cz}, "text": text}
+    pos = {"x": cx, "y": cy, "z": cz}
+    return [
+        {
+            "position": pos,
+            "text": group.name,
+            "font": "Helvetica Neue Bold",
+            "alignment": "centerRight",
+        },
+        {
+            "position": pos,
+            "text": f": {group.shift_avg_ppm:.2f} ({group.number})",
+            "font": "Helvetica Neue Light",
+            "alignment": "centerLeft",
+        },
+    ]
 
 
 # Standalone HTML template. Uses string.Template with $-substitutions
@@ -263,7 +289,7 @@ _HTML_TPL = Template("""\
 <h1>$title</h1>
 <div id="viewer"></div>
 <p class="legend">
-  Each label shows <code>predicted δ (group)</code>. HARD-equivalent groups (methyls, symmetric methylenes) show a multiplicity factor like <code>×3</code>. Drag to rotate, scroll to zoom. Powered by <a href="https://3dmol.csb.pitt.edu">3Dmol.js</a>.
+  Each label reads <code>group: shift (multiplicity)</code> — e.g., <code>A: 1.16 (3)</code> for a methyl. The bold letter identifies the spin-system group; the light portion is the predicted &delta; (ppm) and the number of equivalent nuclei. Drag to rotate, scroll to zoom. Powered by <a href="https://3dmol.csb.pitt.edu">3Dmol.js</a>.
 </p>
 <script>
 const xyzData = $xyz_data;
@@ -284,6 +310,8 @@ for (const lbl of labels) {
     backgroundOpacity: 0.85,
     fontColor: "black",
     fontSize: 11,
+    font: lbl.font,
+    alignment: lbl.alignment,
     borderColor: "#999",
     borderThickness: 0.5,
     inFront: true,
@@ -325,9 +353,7 @@ def render_shift_html(
     positions = _parse_xyz_positions(xyz_text)
     labels: list[dict[str, Any]] = []
     for group in groups:
-        entry = _label_for_group(group, positions)
-        if entry is not None:
-            labels.append(entry)
+        labels.extend(_labels_for_group(group, positions))
 
     return _HTML_TPL.substitute(
         title=html.escape(title),

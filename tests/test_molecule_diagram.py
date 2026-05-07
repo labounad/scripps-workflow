@@ -138,14 +138,11 @@ class TestRenderShiftSvg:
             rdMolDraw2D.MolDraw2DSVG = original
 
         # Anchor atom (first in atom_indices) carries the formatted
-        # atomNote.
+        # atomNote in the new "A: 1.16 (3)" style.
         anchor = captured["mol"].GetAtomWithIdx(groups[0].atom_indices[0])
         assert anchor.HasProp("atomNote")
         note = anchor.GetProp("atomNote")
-        assert "1.26" in note
-        assert "(A)" in note
-        # HARD group + size > 1 → multiplicity factor included.
-        assert f"×{groups[0].number}" in note
+        assert note == f"A: 1.26 ({groups[0].number})"
 
     def test_empty_groups_still_renders_a_molecule(self, rdkit):
         # No annotations = bare molecule diagram.
@@ -220,28 +217,28 @@ class TestRenderShiftHtml:
         html_text = render_shift_html(
             groups=groups, xyz_text=_TETRA_XYZ, title="t",
         )
-        # Find the embedded labels JSON. Each entry has position + text.
         # Centroid of (1,1,1), (-1,-1,1), (-1,1,-1), (1,-1,-1) is (0,0,0).
         assert '"x": 0.0' in html_text
         assert '"y": 0.0' in html_text
         assert '"z": 0.0' in html_text
-        # Label text carries the multiplicity factor (JSON-escaped × → ×).
-        assert "1.26 (A) \\u00d74" in html_text
+        # New format: TWO labels per group, bold letter + light shift.
+        assert '"text": "A"' in html_text
+        assert "Helvetica Neue Bold" in html_text
+        assert '"text": ": 1.26 (4)"' in html_text
+        assert "Helvetica Neue Light" in html_text
 
     def test_singleton_group_atom_position_label(self):
-        # NONE-tier group → label at the single atom's position
-        # (no multiplicity factor).
+        # NONE-tier group → labels at the single atom's position. Same
+        # two-label format; multiplicity is (1) for singletons.
         groups = [_none_h(name="B", atom_idx=2, shift=3.50)]
         html_text = render_shift_html(
             groups=groups, xyz_text=_TETRA_XYZ, title="t",
         )
         # Atom 2 in _TETRA_XYZ is at (-1, 1, -1).
         assert '"x": -1.0' in html_text
-        assert '"text": "3.50 (B)"' in html_text
-        # No multiplicity factor on a singleton.
-        assert "\\u00d7" not in html_text.split('"text": "3.50 (B)"')[0].split(
-            '"x": -1.0'
-        )[1]
+        # Bold letter + light shift:multiplicity pair.
+        assert '"text": "B"' in html_text
+        assert '"text": ": 3.50 (1)"' in html_text
 
     def test_title_html_escaped(self):
         # XML/HTML special chars in the title shouldn't break the page.
@@ -267,8 +264,9 @@ class TestRenderShiftHtml:
         html_text = render_shift_html(
             groups=groups, xyz_text=_TETRA_XYZ, title="t",
         )
-        # No "(X)" label in the labels JSON.
-        assert '"text": "2.00 (X)"' not in html_text
+        # No "X" group label in the labels JSON.
+        assert '"text": "X"' not in html_text
+        assert '"text": ": 2.00 (1)"' not in html_text
 
     def test_dimensions_propagate(self):
         html_text = render_shift_html(
