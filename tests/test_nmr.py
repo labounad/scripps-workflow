@@ -1088,6 +1088,43 @@ class TestCalibratedJMatrix:
         assert (0, 1) in out
 
 
+class TestJRoundDown:
+    """Pure-function test for _round_small_js_to_zero."""
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            (0.10, 0.0),
+            (0.25, 0.0),    # exactly at threshold → rounded
+            (-0.20, 0.0),
+            (0.26, 0.26),   # just above threshold → unchanged
+            (7.50, 7.50),
+            (-13.6, -13.6),
+        ],
+    )
+    def test_round_threshold(self, value, expected):
+        from scripps_workflow.nodes.nmr_aggregate import _round_small_js_to_zero
+        out = _round_small_js_to_zero({(0, 1): value}, threshold_hz=0.25)
+        assert out[(0, 1)] == pytest.approx(expected)
+
+    def test_threshold_zero_disables(self):
+        from scripps_workflow.nodes.nmr_aggregate import _round_small_js_to_zero
+        out = _round_small_js_to_zero({(0, 1): 0.10}, threshold_hz=0.0)
+        assert out[(0, 1)] == pytest.approx(0.10)
+
+
+class TestAggregatorDefaults:
+    def test_default_frequencies_match_600mhz_spectrometer(self):
+        from scripps_workflow.nodes.nmr_aggregate import (
+            DEFAULT_MNOVA_FIELD_MHZ_C,
+            DEFAULT_MNOVA_FIELD_MHZ_H,
+            DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ,
+        )
+        assert DEFAULT_MNOVA_FIELD_MHZ_H == pytest.approx(600.15)
+        assert DEFAULT_MNOVA_FIELD_MHZ_C == pytest.approx(150.94)
+        assert DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ == pytest.approx(0.25)
+
+
 class TestNmrAggregateHeteronuclear:
     """End-to-end aggregator runs with heteronuclear partners.
 

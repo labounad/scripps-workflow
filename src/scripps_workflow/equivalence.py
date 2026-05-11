@@ -421,6 +421,78 @@ def _mol_has_stereo(mol: Any) -> bool:
     return False
 
 
+def _is_force_hard_class(
+    class_atoms: list[int],
+    mol: Any,
+    stereo_present: bool,
+) -> bool:
+    """True if a class is structurally guaranteed to be magnetically
+    equivalent regardless of J asymmetry from frozen-geometry DFT.
+
+    Two cases:
+
+    * **Methyl-style (size ≥ 3, same parent C, single-bond
+      connectivity).** C₃ rotation exchanges all 3 H's on the NMR
+      timescale; equivalence holds in any molecule, chiral or
+      achiral. (Methyls in 2-bromobutane (S) included.)
+
+    * **Achiral methylene-style (size 2, same parent C, single-bond
+      connectivity, no stereo in the molecule).** The two H's
+      exchange under C₂ rotation of the parent C, and in an achiral
+      surrounding they see the same environment from both positions.
+      In a chiral molecule the H's may be diastereotopic — falls
+      through to the normal mag-equiv path, where the data-aware
+      refinement can still split them via shift spread.
+
+    Note: this is structurally restrictive on purpose. We're NOT
+    saying "any same-parent class is HARD" — that would wrongly
+    collapse diastereotopic CH₂ in chiral molecules. We're saying
+    "same-parent classes that are structurally rotation-symmetric
+    are HARD even when DFT data looks asymmetric."
+    """
+    if len(class_atoms) < 2:
+        return False
+
+    # All members must be H atoms attached to the same parent atom.
+    parents: set[int] = set()
+    for a in class_atoms:
+        atom = mol.GetAtomWithIdx(a)
+        if atom.GetSymbol() != "H":
+            return False
+        neighbors = atom.GetNeighbors()
+        if len(neighbors) != 1:
+            return False
+        parents.add(neighbors[0].GetIdx())
+    if len(parents) != 1:
+        return False
+
+    # Parent must be a carbon with at least one single-bond
+    # non-hydrogen connection to the rest of the molecule (so it's
+    # genuinely rotatable, not a bare CH4 / CH3 anion).
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    parent_idx = parents.pop()
+    parent = mol.GetAtomWithIdx(parent_idx)
+    if parent.GetSymbol() != "C":
+        return False
+    has_single_to_heavy = any(
+        b.GetBondType() == Chem.BondType.SINGLE
+        and b.GetOtherAtom(parent).GetSymbol() != "H"
+        for b in parent.GetBonds()
+    )
+    if not has_single_to_heavy:
+        return False
+
+    # Methyl-style: always force HARD (C₃ rotation universal).
+    if len(class_atoms) >= 3:
+        return True
+
+    # Methylene-style: force HARD only when the molecule lacks stereo.
+    # In chiral environments the two H's may be diastereotopic; let
+    # the data-aware refinement decide via shift spread.
+    return not stereo_present
+
+
 def _avg_or_none(vals: list[Optional[float]]) -> Optional[float]:
     """Mean over the non-None entries, or None if every entry is None."""
     finite = [v for v in vals if isinstance(v, (int, float))]
@@ -553,8 +625,22 @@ def compute_equivalence_groups(
     )
 
     # Stage 1: classify each class + collect its atoms.
+    #
+    # Structural force-HARD shortcut: H atoms sharing a parent C with
+    # rotatable single-bond connectivity are equivalent by molecular
+    # symmetry (C₃ rotation for methyls, C₂ for symmetric methylenes)
+    # regardless of how asymmetric the DFT-computed J's look across
+    # frozen conformer geometries. The mag-equiv test fails for these
+    # in practice — real ethanol methyl J's vary 5–15 Hz across H
+    # atoms in a 2-conformer ensemble because rotation isn't sampled.
+    # Bypass the test for the cases where chemistry is unambiguous:
+    # methyls always, methylenes when the molecule is achiral.
+    stereo_present = _mol_has_stereo(mol)
     classified: list[tuple[Tier, list[int]]] = []
     for cls in classes:
+        if _is_force_hard_class(cls, mol, stereo_present):
+            classified.append((Tier.HARD, cls))
+            continue
         others = [a for a in all_elem_atoms if a not in cls]
         tier = classify_class_tier(
             class_atoms=cls,

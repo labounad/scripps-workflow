@@ -565,6 +565,54 @@ class TestComputeEquivalenceGroups:
         # The methylene H's stayed as one HARD group of 2.
         assert any(g.number == 2 and g.tier == Tier.HARD for g in hard)
 
+    def test_force_hard_methyl_despite_asymmetric_js(self, rdkit):
+        # Regression for the live ethanol run: real DFT on 2 conformers
+        # gave methyl H–H J's that spread 5–15 Hz across atoms (no
+        # rotation averaging), so the magnetic-equivalence test would
+        # flag the class as SOFT. Force-HARD shortcut: size ≥ 3 +
+        # same parent C → always HARD regardless of J asymmetry,
+        # because methyl C₃ rotation is universal in solution NMR.
+        from rdkit import Chem  # noqa: WPS433
+        mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+        h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
+        # Identify the 3 methyl H's (parent C with 3 H neighbors).
+        methyl_hs: list[int] = []
+        for h in h_atoms:
+            parent = mol.GetAtomWithIdx(h).GetNeighbors()[0]
+            if parent.GetSymbol() == "C" and sum(
+                1 for n in parent.GetNeighbors() if n.GetSymbol() == "H"
+            ) == 3:
+                methyl_hs.append(h)
+        assert len(methyl_hs) == 3
+        shifts = {h: 1.16 for h in h_atoms}
+        # Wildly asymmetric J's between methyl H's — pre-fix this
+        # would fail the mag-equiv test (any tol up to 10 Hz) → SOFT.
+        # Post-fix: same-parent shortcut forces HARD.
+        m1, m2, m3 = methyl_hs
+        non_methyl = [h for h in h_atoms if h not in methyl_hs]
+        j_matrix: dict[tuple[int, int], float] = {}
+        # Give methyl H's WIDELY different J's to the methylene H's.
+        if len(non_methyl) >= 2:
+            j_matrix[(min(m1, non_methyl[0]), max(m1, non_methyl[0]))] = 5.0
+            j_matrix[(min(m1, non_methyl[1]), max(m1, non_methyl[1]))] = 15.0
+            j_matrix[(min(m2, non_methyl[0]), max(m2, non_methyl[0]))] = 15.0
+            j_matrix[(min(m2, non_methyl[1]), max(m2, non_methyl[1]))] = 5.0
+            j_matrix[(min(m3, non_methyl[0]), max(m3, non_methyl[0]))] = 2.0
+            j_matrix[(min(m3, non_methyl[1]), max(m3, non_methyl[1]))] = 2.0
+
+        groups = compute_equivalence_groups(
+            mol=mol, element="H",
+            shifts_by_atom=shifts, j_matrix=j_matrix,
+            tol_jcoupling_hz=0.5, tol_shift_ppm=0.05,
+        )
+        methyl_group = next(
+            (g for g in groups if set(g.atom_indices) == set(methyl_hs)),
+            None,
+        )
+        assert methyl_group is not None
+        assert methyl_group.tier == Tier.HARD
+        assert methyl_group.number == 3
+
     def test_achiral_molecule_no_false_split_even_when_shifts_spread(
         self, rdkit
     ):

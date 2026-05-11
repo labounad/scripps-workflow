@@ -95,8 +95,8 @@ Config keys (``key=value`` tokens or one JSON object):
     mnova_nuclei             [1H,13C]  comma-separated; "1H", "13C",
                                        or "1H,13C". Each requested
                                        nucleus produces its own file.
-    mnova_field_mhz_h        [400.13]  ¹H Larmor frequency.
-    mnova_field_mhz_c        [100.61]  ¹³C Larmor frequency.
+    mnova_field_mhz_h        [600.15]  ¹H Larmor frequency.
+    mnova_field_mhz_c        [150.94]  ¹³C Larmor frequency.
     mnova_line_width_hz_h    [1.0]     simulated linewidth, ¹H.
     mnova_line_width_hz_c    [5.0]     simulated linewidth, ¹³C.
     mnova_from_ppm_h         [0.0]     spectrum window low edge, ¹H.
@@ -110,6 +110,10 @@ Config keys (``key=value`` tokens or one JSON object):
                                        whose DFT shifts spread above
                                        this — catches diastereotopic
                                        CH₂ in chiral environments).
+    mnova_j_round_threshold_hz [0.25]  any predicted |J| ≤ this gets
+                                       set to 0 before emission.
+                                       Cleans near-zero noise from
+                                       the simulated spectrum.
 
     diagrams_enabled         [true]    emit SVG + HTML molecule diagrams
                                        per requested nucleus. Reuses
@@ -173,11 +177,11 @@ DEFAULT_OUTPUT_COUPLINGS_CSV: str = "predicted_couplings.csv"
 #: Order is irrelevant — each nucleus produces an independent XML file.
 DEFAULT_MNOVA_NUCLEI: str = "1H,13C"
 
-#: Larmor frequency presets in MHz on a 400 MHz spectrometer (¹H Larmor
-#: ≈ field × 42.577; ¹³C ≈ field × 10.708). Override when the user's
-#: spectrometer is different (e.g., 600 MHz → 600.13 / 150.92).
-DEFAULT_MNOVA_FIELD_MHZ_H: float = 400.13
-DEFAULT_MNOVA_FIELD_MHZ_C: float = 100.61
+#: Larmor frequency presets in MHz for the lab's 600 MHz spectrometer
+#: (¹H Larmor ≈ field × 42.577; ¹³C ≈ field × 10.708). Override when
+#: the user's spectrometer is different (e.g., 400 MHz → 400.13 / 100.61).
+DEFAULT_MNOVA_FIELD_MHZ_H: float = 600.15
+DEFAULT_MNOVA_FIELD_MHZ_C: float = 150.94
 
 #: Per-nucleus simulated linewidth (Hz). ¹H signals are typically narrow
 #: (1 Hz at half-height in fluid solution); broadband-decoupled ¹³C is
@@ -204,6 +208,14 @@ DEFAULT_MNOVA_POINTS: int = 16384
 #: diastereotopic CH₂ in chiral environments).
 DEFAULT_MNOVA_TOL_JCOUPLING_HZ: float = 0.5
 DEFAULT_MNOVA_TOL_SHIFT_PPM: float = 0.05
+
+#: J-coupling round-down threshold (Hz). After calibration, any J with
+#: |J| ≤ this gets snapped to 0 before being emitted to mnova XML or
+#: used in equivalence detection. Removes near-zero noise (typically
+#: long-range / through-space artifacts) that would otherwise clutter
+#: the simulated spectrum with sub-linewidth splittings. Set to 0 to
+#: disable the round-down entirely.
+DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ: float = 0.25
 
 #: Output filenames. Per nucleus we emit one pre-averaged file and
 #: optionally one per-conformer file (controlled by mnova_per_conformer).
@@ -710,6 +722,23 @@ def _calibrated_j_matrix_from_per_conformer(
     return out
 
 
+def _round_small_js_to_zero(
+    j_matrix: dict[tuple[int, int], float],
+    threshold_hz: float,
+) -> dict[tuple[int, int], float]:
+    """Snap |J| ≤ ``threshold_hz`` to 0 in place-equivalent fashion.
+
+    Returns a new dict; doesn't mutate the input. Threshold ≤ 0
+    disables the round-down (passes everything through unchanged).
+    """
+    if threshold_hz <= 0:
+        return dict(j_matrix)
+    return {
+        key: (0.0 if abs(j) <= threshold_hz else j)
+        for key, j in j_matrix.items()
+    }
+
+
 def _parse_partner_list(raw: Any) -> list[str]:
     """Parse the ``mnova_heteronuclear_partners`` config value.
 
@@ -1154,6 +1183,10 @@ class NmrAggregate(Node):
             "mnova_tol_shift_ppm": parse_float(
                 raw.get("mnova_tol_shift_ppm"),
                 DEFAULT_MNOVA_TOL_SHIFT_PPM,
+            ),
+            "mnova_j_round_threshold_hz": parse_float(
+                raw.get("mnova_j_round_threshold_hz"),
+                DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ,
             ),
             # Molecule-diagram artifacts (2D SVG + 3D HTML viewer).
             # Reuses ``mnova_nuclei`` to decide which nuclei to depict.
@@ -1673,6 +1706,10 @@ class NmrAggregate(Node):
                     allowed_element_pairs=pair_set,
                     cals_by_label=cals_by_label,
                 )
+                j_matrix_avg = _round_small_js_to_zero(
+                    j_matrix_avg,
+                    float(cfg["mnova_j_round_threshold_hz"]),
+                )
             else:
                 j_matrix_avg = {}
 
@@ -2041,6 +2078,10 @@ class NmrAggregate(Node):
                     allowed_element_pairs=pair_set,
                     cals_by_label=cals_by_label,
                 )
+                j_matrix = _round_small_js_to_zero(
+                    j_matrix,
+                    float(cfg["mnova_j_round_threshold_hz"]),
+                )
             else:
                 j_matrix = {}
             partner_shifts = _partner_shifts_per_conformer(
@@ -2088,6 +2129,7 @@ __all__ = [
     "DEFAULT_MNOVA_TO_PPM_C",
     "DEFAULT_MNOVA_TO_PPM_H",
     "DEFAULT_MNOVA_TOL_JCOUPLING_HZ",
+    "DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ",
     "DEFAULT_MNOVA_TOL_SHIFT_PPM",
     "DEFAULT_OUTPUT_COUPLINGS_CSV",
     "DEFAULT_OUTPUT_SHIFTS_CSV",

@@ -32,6 +32,15 @@ Label format and placement:
   different fonts: bold "A" right-aligned + light ": 1.16 (3)"
   left-aligned. 3Dmol.js can't mix fonts in a single label, so the
   two-label trick keeps the bold/light distinction Lucas requested.
+
+  Font caveat: 3Dmol.js's :class:`LabelSpec` has only ``font`` (no
+  ``fontWeight`` / ``fontStyle``). The string is passed straight to
+  canvas font matching. On macOS, ``"Helvetica Neue Bold"`` and
+  ``"Helvetica Neue Light"`` are registered as standalone font NAMES
+  that resolve to the correct weight variants. On Windows/Linux,
+  those names typically aren't matched and the labels fall back to
+  the system default font with no weight distinction. The HTML
+  still renders correctly — just without the bold/light contrast.
 * For HARD groups (size ≥ 2 — methyls, symmetric methylenes), labels
   anchor at the centroid of the contributing atoms (one label-pair
   per group, not per atom).
