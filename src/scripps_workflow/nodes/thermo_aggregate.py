@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import logging_utils
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
 from ..orca import (
@@ -83,7 +84,6 @@ from ..orca import (
     parse_orca_thermochem,
     pick_orca_outputs,
 )
-from ..parsing import normalize_optional_str, parse_float, parse_int
 from ..thermo import (
     boltzmann_weights,
     cumulative_weights_by_dg,
@@ -433,6 +433,122 @@ def locate_tasks_root(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+_STANDARD_STATE_TOKENS: frozenset[str] = frozenset(
+    {"1atm", "1m", "1mol", "1molar"}
+)
+
+
+def _positive_temperature_validator(value: float) -> float:
+    """Reject T ≤ 0. Distinct from a ``min_value=0``: that wording
+    would say ``must be >= 0``, but Boltzmann reweighting and RT
+    factors blow up at T=0, so it really needs to be strictly
+    positive. Kept as a validator (rather than ``min_value=1e-6``)
+    so the error message remains the historical ``must be positive``
+    that existing tests grep for.
+    """
+    if value <= 0:
+        raise ValueError(f"must be positive, got {value!r}")
+    return value
+
+
+def _standard_state_validator(value: str) -> str:
+    """Lowercase and validate the ``standard_state`` token.
+
+    Accepts any case (``"1M"`` / ``"1m"`` / ``"1Molar"``) and returns
+    the lowercase form so downstream code can compare against the
+    canonical token set without re-lowercasing.
+    """
+    v = value.strip().lower()
+    if v not in _STANDARD_STATE_TOKENS:
+        raise ValueError(
+            f"must be one of {sorted(_STANDARD_STATE_TOKENS)}, "
+            f"got {value!r}"
+        )
+    return v
+
+
+def _basename_validator(value: str) -> str:
+    """Reject path-like strings (with ``/`` or leading ``.``).
+
+    Mirrors the ``nmr_aggregate`` validator. Kept inline rather than
+    promoted to ``config_schema`` so the framework module stays free
+    of node-specific policy.
+    """
+    if "/" in value or value.startswith("."):
+        raise ValueError(f"must be a basename, got {value!r}")
+    return value
+
+
+SCHEMA = NodeSchema(
+    step_name="thermo_aggregate",
+    cli_entrypoint="wf-thermo-aggregate",
+    module_path="scripps_workflow.nodes.thermo_aggregate",
+    overview=(
+        "Composite-Gibbs aggregator over an upstream freq+SP conformer "
+        "array. Emits one CSV with absolute / relative energies, "
+        "Boltzmann weights, and cumulative-weight columns. Composite "
+        "protocol: ``G_composite = E_SP_high + (G - E_el)_low``, with "
+        "a fallback to ``G_low`` when no high-level SP energy is "
+        "available."
+    ),
+    fields=(
+        ConfigField(
+            name="temperature_k",
+            type="float",
+            default=DEFAULT_TEMPERATURE_K,
+            validator=_positive_temperature_validator,
+            description=(
+                "Temperature (K) for the Boltzmann reweighting and the "
+                "standard-state correction. Matches ORCA's own default. "
+                "Must be strictly positive."
+            ),
+        ),
+        ConfigField(
+            name="standard_state",
+            type="str",
+            default=DEFAULT_STANDARD_STATE,
+            choices=("1atm", "1m", "1mol", "1molar"),
+            validator=_standard_state_validator,
+            description=(
+                "Standard-state convention. ``1atm`` (default) keeps "
+                "ΔG referenced to the gas-phase 1 atm convention. Any "
+                "of ``1m``/``1mol``/``1molar`` applies the Ben-Naim "
+                "RT·ln(24.46) shift to the relative ΔG column."
+            ),
+        ),
+        ConfigField(
+            name="output_csv",
+            type="str",
+            default=DEFAULT_OUTPUT_CSV,
+            validator=_basename_validator,
+            description=(
+                "Basename of the per-conformer CSV written to "
+                "``outputs/`` in the call directory."
+            ),
+        ),
+        ConfigField(
+            name="n_tasks_override",
+            type="int",
+            default=0,
+            aliases=("n_tasks",),
+            min_value=0,
+            description=(
+                "Override the n_tasks count taken from the upstream "
+                "manifest. ``0`` (default) means use the upstream "
+                "value. Positive values truncate or extend the walk. "
+                "Legacy argv token ``n_tasks=`` is accepted as an "
+                "alias so old workflow JSONs keep working."
+            ),
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -445,39 +561,7 @@ class ThermoAggregate(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        temperature_k = parse_float(
-            raw.get("temperature_k"), DEFAULT_TEMPERATURE_K
-        )
-        if temperature_k <= 0:
-            raise ValueError(
-                f"temperature_k must be positive, got {temperature_k!r}"
-            )
-
-        ss = normalize_optional_str(raw.get("standard_state"))
-        standard_state = (ss or DEFAULT_STANDARD_STATE).lower()
-        if standard_state not in {"1atm", "1m", "1mol", "1molar"}:
-            raise ValueError(
-                f"standard_state must be '1atm' or '1M', got {raw.get('standard_state')!r}"
-            )
-
-        output_csv = (
-            normalize_optional_str(raw.get("output_csv"))
-            or DEFAULT_OUTPUT_CSV
-        )
-        if "/" in output_csv or output_csv.startswith("."):
-            raise ValueError(
-                f"output_csv must be a basename, got {output_csv!r}"
-            )
-
-        return {
-            "temperature_k": temperature_k,
-            "standard_state": standard_state,
-            "output_csv": output_csv,
-            # parse_int isn't used here but exposing the int default to
-            # the manifest is useful for debugging operators reading
-            # ``inputs``. Keep the explicit cast so JSON round-trips.
-            "n_tasks_override": parse_int(raw.get("n_tasks"), 0),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config
