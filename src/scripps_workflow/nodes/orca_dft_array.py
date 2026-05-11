@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .. import logging_utils
 from ..hashing import sha256_file
@@ -70,9 +70,9 @@ from ..orca import (
     parse_orca_final_energy,
     write_energy_file,
 )
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 from ..parsing import (
     normalize_optional_str,
-    parse_bool,
     parse_int,
     parse_optional_int,
 )
@@ -118,12 +118,256 @@ ORCA_OPT_XYZ: str = "orca_opt.xyz"
 
 def normalize_max_concurrency(raw_cfg: dict[str, Any]) -> int:
     """Read ``max_concurrency`` (with ``batchsize`` / ``max_nodes``
-    aliases) and clamp to ``>= 1``."""
+    aliases) and clamp to ``>= 1``.
+
+    Kept as a standalone helper (rather than folding entirely into the
+    schema coercer) because the test surface still exercises it directly
+    with a raw dict.
+    """
     v = raw_cfg.get(
         "max_concurrency",
         raw_cfg.get("max_nodes", raw_cfg.get("batchsize", 10)),
     )
     return max(1, parse_int(v, 10))
+
+
+def _max_concurrency_coercer(value: Any) -> int:
+    """Schema-friendly variant: takes a single value (post alias lookup
+    by ``apply_schema``) and mirrors ``normalize_max_concurrency``'s
+    permissive int parsing + clamp-to-1.
+
+    Permissive on garbage by design — the legacy contract is that a
+    typo'd ``max_concurrency`` falls back to ``10`` rather than killing
+    the run before SLURM submission.
+    """
+    return max(1, parse_int(value, 10))
+
+
+def _reject_empty_keywords(raw: dict[str, Any]) -> None:
+    """Raise if ``raw["keywords"]`` is present-but-empty.
+
+    The schema's empty-→-default short-circuit treats ``keywords=""``
+    and "key absent" identically (both use the default). Legacy
+    parse_config rejected the former specifically — an operator who
+    types ``keywords=`` is signalling intent to override but botched
+    the value, and silently filling in the default would mask that.
+    Both array nodes have the same invariant; this helper is the
+    one-liner they both call after ``apply_schema``.
+    """
+    if "keywords" in raw and not str(raw["keywords"]).strip():
+        raise ValueError("keywords: must be non-empty")
+
+
+def _clamp_min_int(*, lower: int, default: int) -> Callable[[Any], int]:
+    """Build a coercer that mirrors the legacy ``max(lower, parse_int(v, default))``.
+
+    The SLURM-array nodes historically clamp resource knobs (maxcore,
+    nprocs, monitor_interval_s, monitor_timeout_min) up to a sane
+    floor rather than raising — an operator who passes ``maxcore=100``
+    gets ``maxcore=500`` rather than a parse failure, because ORCA
+    crashes below ~500MB and the floor is harmless to enforce.
+
+    ``min_value`` on ``ConfigField`` *raises* instead, which breaks
+    that contract; this coercer preserves it.
+    """
+    def _coerce(value: Any) -> int:
+        return max(lower, parse_int(value, default))
+
+    return _coerce
+
+
+def _make_slurm_array_fields(
+    *,
+    default_keywords: str,
+    default_nprocs: int = 8,
+) -> tuple[ConfigField, ...]:
+    """Build the common SLURM-array-driver config fields shared by
+    ``orca_dft_array`` and ``orca_thermo_array``.
+
+    The two nodes have identical SLURM/queue/multiplicity surfaces; only
+    the ORCA simple-input ``keywords`` and ``nprocs`` defaults differ.
+    Factored out so the schemas stay in sync — and so the docs
+    generator renders parallel sections without copy-paste drift.
+    """
+    return (
+        ConfigField(
+            name="max_concurrency",
+            type="int",
+            default=10,
+            aliases=("max_nodes", "batchsize"),
+            coercer=_max_concurrency_coercer,
+            description=(
+                "``%M`` for SLURM ``--array=1-N%M`` — at most this "
+                "many array tasks run concurrently. Aliases "
+                "``max_nodes``/``batchsize`` accepted for back-compat. "
+                "Garbage values silently fall back to ``10``; values "
+                "below 1 are clamped to 1."
+            ),
+        ),
+        ConfigField(
+            name="charge",
+            type="int",
+            default=0,
+            description="Molecular charge.",
+        ),
+        ConfigField(
+            name="unpaired_electrons",
+            type="int",
+            default=0,
+            min_value=0,
+            description="Unpaired electrons (used to compute multiplicity).",
+        ),
+        ConfigField(
+            name="multiplicity",
+            type="json",
+            default=None,
+            coercer=parse_optional_int,
+            description=(
+                "Explicit spin multiplicity override. ``None`` / "
+                "``auto`` / empty → computed as "
+                "``unpaired_electrons + 1`` (DFT) or "
+                "``2 * unpaired_electrons + 1`` (GOAT)."
+            ),
+        ),
+        ConfigField(
+            name="solvent",
+            type="str",
+            default=None,
+            coercer=normalize_optional_str,
+            description=(
+                "Implicit-solvent name (CPCM token). ``none``/"
+                "``null``/``auto`` / empty → vacuum."
+            ),
+        ),
+        ConfigField(
+            name="smd_solvent",
+            type="str",
+            default=None,
+            coercer=normalize_optional_str,
+            description=(
+                "SMD solvent name (gets passed as ``CPCM(SMD,<name>)``). "
+                "Mutually independent of ``solvent``."
+            ),
+        ),
+        ConfigField(
+            name="keywords",
+            type="str",
+            default=default_keywords,
+            description=(
+                "ORCA simple-input line for the primary calculation. "
+                "Whitespace-stripped."
+            ),
+        ),
+        ConfigField(
+            name="maxcore",
+            type="int",
+            default=4000,
+            coercer=_clamp_min_int(lower=500, default=4000),
+            description=(
+                "Per-process memory budget (MB) passed via "
+                "``%maxcore``. Values below ``500`` are silently "
+                "clamped up — ORCA crashes below ~500MB on most "
+                "non-trivial systems."
+            ),
+        ),
+        ConfigField(
+            name="nprocs",
+            type="int",
+            default=default_nprocs,
+            coercer=_clamp_min_int(lower=1, default=default_nprocs),
+            description=(
+                "OpenMPI processes per ORCA task (``%pal nprocs``). "
+                "Values below 1 are silently clamped to 1."
+            ),
+        ),
+        ConfigField(
+            name="time_limit",
+            type="str",
+            default="12:00:00",
+            description=(
+                "SLURM ``--time=`` value. ``HH:MM:SS`` or ``D-HH:MM``."
+            ),
+        ),
+        ConfigField(
+            name="partition",
+            type="str",
+            default=None,
+            coercer=normalize_optional_str,
+            description=(
+                "SLURM partition name. ``None`` / ``auto`` / empty → "
+                "cluster default."
+            ),
+        ),
+        ConfigField(
+            name="job_name",
+            type="str",
+            default=None,
+            coercer=normalize_optional_str,
+            description=(
+                "SLURM job-name prefix. ``None`` → auto-derived from "
+                "the workflow step name."
+            ),
+        ),
+        ConfigField(
+            name="orca_module",
+            type="str",
+            default=DEFAULT_ORCA_MODULE,
+            description=(
+                "Lmod module name ``module load``-ed inside the "
+                "per-task wrapper."
+            ),
+        ),
+        ConfigField(
+            name="submit",
+            type="bool",
+            default=True,
+            description=(
+                "If false, write the SLURM script + per-task input "
+                "files but skip ``sbatch``. Useful for dry-run "
+                "inspection."
+            ),
+        ),
+        ConfigField(
+            name="monitor",
+            type="bool",
+            default=True,
+            description=(
+                "If true, the node blocks on the array job and "
+                "watches per-task progress; if false, ``sbatch`` "
+                "and exit immediately."
+            ),
+        ),
+        ConfigField(
+            name="monitor_interval_s",
+            type="int",
+            default=60,
+            coercer=_clamp_min_int(lower=5, default=60),
+            description=(
+                "Seconds between progress polls when "
+                "``monitor=true``. Values below 5 are clamped to 5."
+            ),
+        ),
+        ConfigField(
+            name="monitor_timeout_min",
+            type="int",
+            default=0,
+            coercer=_clamp_min_int(lower=0, default=0),
+            description=(
+                "Wall-clock cap on the monitor loop. ``0`` (default) "
+                "= no cap, wait forever."
+            ),
+        ),
+        ConfigField(
+            name="silence_openib",
+            type="bool",
+            default=True,
+            description=(
+                "Set ``OMPI_MCA_btl=^openib`` to silence the "
+                "verbose Infiniband warnings on the Scripps "
+                "cluster."
+            ),
+        ),
+    )
 
 
 def resolve_multiplicity(
@@ -282,6 +526,29 @@ def collect_optimized_outputs(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+SCHEMA = NodeSchema(
+    step_name="orca_dft_array",
+    cli_entrypoint="wf-orca-dft-array",
+    module_path="scripps_workflow.nodes.orca_dft_array",
+    overview=(
+        "SLURM-array DFT geometry optimizer. Walks an upstream "
+        "conformer ensemble, writes one ORCA input per conformer, "
+        "submits as a SLURM job array, and (optionally) blocks on "
+        "completion. Emits per-task ``orca.out`` plus a consolidated "
+        "manifest with parsed final energies."
+    ),
+    fields=_make_slurm_array_fields(
+        default_keywords=DEFAULT_KEYWORDS,
+        default_nprocs=8,
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -294,48 +561,8 @@ class OrcaDftArray(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        max_concurrency = normalize_max_concurrency(raw)
-
-        unpaired = parse_int(raw.get("unpaired_electrons"), 0)
-        mult_override = parse_optional_int(raw.get("multiplicity"))
-
-        keywords = str(raw.get("keywords", DEFAULT_KEYWORDS)).strip()
-        if not keywords:
-            raise ValueError("keywords must be non-empty")
-
-        maxcore = max(500, parse_int(raw.get("maxcore"), 4000))
-        nprocs = max(1, parse_int(raw.get("nprocs"), 8))
-
-        time_limit = str(raw.get("time_limit", "12:00:00")).strip() or "12:00:00"
-        partition = normalize_optional_str(raw.get("partition"))
-
-        orca_module = str(
-            raw.get("orca_module", DEFAULT_ORCA_MODULE)
-        ).strip() or DEFAULT_ORCA_MODULE
-
-        monitor_interval_s = max(5, parse_int(raw.get("monitor_interval_s"), 60))
-        monitor_timeout_min = max(0, parse_int(raw.get("monitor_timeout_min"), 0))
-
-        return {
-            "max_concurrency": max_concurrency,
-            "charge": parse_int(raw.get("charge"), 0),
-            "unpaired_electrons": unpaired,
-            "multiplicity": mult_override,
-            "solvent": normalize_optional_str(raw.get("solvent")),
-            "smd_solvent": normalize_optional_str(raw.get("smd_solvent")),
-            "keywords": keywords,
-            "maxcore": maxcore,
-            "nprocs": nprocs,
-            "time_limit": time_limit,
-            "partition": partition,
-            "job_name": normalize_optional_str(raw.get("job_name")),
-            "orca_module": orca_module,
-            "submit": parse_bool(raw.get("submit"), True),
-            "monitor": parse_bool(raw.get("monitor"), True),
-            "monitor_interval_s": monitor_interval_s,
-            "monitor_timeout_min": monitor_timeout_min,
-            "silence_openib": parse_bool(raw.get("silence_openib"), True),
-        }
+        _reject_empty_keywords(raw)
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

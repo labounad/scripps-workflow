@@ -58,7 +58,7 @@ from typing import Any, Iterable
 from .. import logging_utils
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
-from ..parsing import parse_bool, parse_int
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 
 # --------------------------------------------------------------------
 # Constants
@@ -383,6 +383,114 @@ def run_xtb(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+SCHEMA = NodeSchema(
+    step_name="xtb_calc",
+    cli_entrypoint="wf-xtb",
+    module_path="scripps_workflow.nodes.xtb_calc",
+    overview=(
+        "Chain node — runs one or more xTB operations (optimize, "
+        "sp_energy, sp_gradient, sp_hessian) on the first ``.xyz`` "
+        "artifact from the upstream node. Emits per-op subdirectories "
+        "plus a consolidated ``wf.result.v1`` manifest with parsed "
+        "energies / gradient norm / hessian summary."
+    ),
+    fields=(
+        ConfigField(
+            name="theory",
+            type="str",
+            default="GFN2-XTB",
+            choices=("GFN-FF", "GFN1-XTB", "GFN2-XTB"),
+            coercer=normalize_theory,
+            description=(
+                "xTB theory level. Aliases (case-insensitive): "
+                "``GFN2`` / ``GFN2-XTB`` / ``GFN2XTB`` → GFN2-XTB; "
+                "``GFN1`` / ``GFN1-XTB`` → GFN1-XTB; "
+                "``GFN-FF`` / ``GFNFF`` / ``GFF`` → GFN-FF."
+            ),
+        ),
+        ConfigField(
+            name="charge",
+            type="int",
+            default=0,
+            description="Molecular charge (passed to xtb via --chrg).",
+        ),
+        ConfigField(
+            name="unpaired_electrons",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "Number of unpaired electrons (passed to xtb via "
+                "--uhf). 0 = closed-shell singlet."
+            ),
+        ),
+        ConfigField(
+            name="solvent",
+            type="str",
+            default=None,
+            coercer=normalize_solvent,
+            description=(
+                "ALPB solvent name. ``none``/``null``/``vacuum`` and "
+                "empty string all map to vacuum (no implicit solvent). "
+                "See ``ALPB_SOLVENTS`` for the supported list."
+            ),
+        ),
+        ConfigField(
+            name="opt_level",
+            type="str",
+            default="tight",
+            coercer=normalize_opt_level,
+            description=(
+                "xTB geometry-optimization convergence level. See "
+                "``OPT_LEVELS`` for the supported tokens (e.g. "
+                "``crude``/``loose``/``normal``/``tight``/"
+                "``vtight``/``extreme``)."
+            ),
+        ),
+        ConfigField(
+            name="calculations",
+            type="json",
+            default=["optimize"],
+            coercer=parse_calculations,
+            description=(
+                "Which xTB operations to run, in canonical order. "
+                "Accepts a list, CSV string, single token, or a "
+                "JSON object using GUI labels as keys (e.g. "
+                '``{"SP Energy": true, "Geometry Optimization": true}``). '
+                "Tokens: ``optimize``, ``sp_energy``, "
+                "``sp_gradient``, ``sp_hessian``."
+            ),
+        ),
+        ConfigField(
+            name="threads",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "OMP_NUM_THREADS for the xtb process. ``0`` (default) "
+                "means auto-detect from the SLURM allocation if "
+                "available, else 1."
+            ),
+        ),
+        ConfigField(
+            name="write_json",
+            type="bool",
+            default=True,
+            description=(
+                "Whether xtb should emit ``xtbout.json`` alongside "
+                "the text ``xtb.out``. Disable to save disk for "
+                "large screening sweeps."
+            ),
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -402,18 +510,7 @@ class XtbCalc(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        # Raise on unknown values up-front so a typo becomes
-        # ``argv_parse_failed`` rather than a silent wrong-theory run.
-        return {
-            "theory": normalize_theory(raw.get("theory", "GFN2-XTB")),
-            "charge": parse_int(raw.get("charge"), 0),
-            "unpaired_electrons": parse_int(raw.get("unpaired_electrons"), 0),
-            "solvent": normalize_solvent(raw.get("solvent")),
-            "opt_level": normalize_opt_level(raw.get("opt_level", "tight")),
-            "calculations": parse_calculations(raw.get("calculations")),
-            "threads": parse_int(raw.get("threads"), 0),
-            "write_json": parse_bool(raw.get("write_json"), True),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

@@ -49,9 +49,9 @@ from pathlib import Path
 from typing import Any
 
 from .. import logging_utils
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
-from ..parsing import parse_float, parse_int
 
 # Import shared helpers from xtb_calc rather than duplicate. If a third
 # node grows the same dependency, factor these out into a shared util
@@ -339,6 +339,108 @@ def run_crest(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+def _positive_float(value: float) -> float:
+    """Validator: strict ``> 0`` (vs. ``min_value=0`` which is ``>= 0``)."""
+    if value <= 0:
+        raise ValueError(f"must be > 0, got {value!r}")
+    return value
+
+
+SCHEMA = NodeSchema(
+    step_name="crest",
+    cli_entrypoint="wf-crest",
+    module_path="scripps_workflow.nodes.crest",
+    overview=(
+        "Chain node — runs CREST conformer search on the first ``.xyz`` "
+        "artifact from upstream. Emits a conformer ensemble (one xyz "
+        "per conformer) plus the CREST log files. Defaults to iMTD-GC "
+        "at GFN2-XTB."
+    ),
+    fields=(
+        ConfigField(
+            name="theory",
+            type="str",
+            default="GFN2-XTB",
+            coercer=normalize_theory,
+            description=(
+                "xTB theory level CREST uses internally. See "
+                "``_THEORY_ALIASES`` for case-insensitive aliases."
+            ),
+        ),
+        ConfigField(
+            name="charge",
+            type="int",
+            default=0,
+            description="Molecular charge passed to CREST.",
+        ),
+        ConfigField(
+            name="unpaired_electrons",
+            type="int",
+            default=0,
+            min_value=0,
+            description="Unpaired electrons (CREST's ``--uhf``).",
+        ),
+        ConfigField(
+            name="solvent",
+            type="str",
+            default=None,
+            coercer=normalize_solvent,
+            description=(
+                "ALPB solvent name. ``none``/``null``/``vacuum`` / "
+                "empty → vacuum. See ``ALPB_SOLVENTS``."
+            ),
+        ),
+        ConfigField(
+            name="mode",
+            type="str",
+            default="standard",
+            coercer=normalize_mode,
+            description=(
+                "CREST search mode. ``standard`` (default) = iMTD-GC. "
+                "See ``CREST_MODES`` for the supported tokens."
+            ),
+        ),
+        ConfigField(
+            name="ewin_kcal",
+            type="float",
+            default=10.0,
+            validator=_positive_float,
+            description=(
+                "Energy window (kcal/mol) above the lowest-energy "
+                "conformer that CREST retains. Must be strictly "
+                "positive."
+            ),
+        ),
+        ConfigField(
+            name="max_conformers",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "Cap on the number of conformers retained from "
+                "CREST's ensemble. ``0`` (default) means no cap — "
+                "keep everything inside the energy window."
+            ),
+        ),
+        ConfigField(
+            name="threads",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "Threads passed to CREST (``-T``). ``0`` auto-detects "
+                "from SLURM if available, else 1."
+            ),
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -351,26 +453,7 @@ class CrestConformerSearch(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        # Raise on unknown values up-front so a typo becomes
-        # ``argv_parse_failed`` rather than a silent wrong-mode run.
-        ewin = parse_float(raw.get("ewin_kcal"), 10.0)
-        if ewin <= 0:
-            raise ValueError("ewin_kcal must be > 0")
-
-        max_confs = parse_int(raw.get("max_conformers"), 0)
-        if max_confs < 0:
-            raise ValueError("max_conformers must be >= 0")
-
-        return {
-            "theory": normalize_theory(raw.get("theory", "GFN2-XTB")),
-            "charge": parse_int(raw.get("charge"), 0),
-            "unpaired_electrons": parse_int(raw.get("unpaired_electrons"), 0),
-            "solvent": normalize_solvent(raw.get("solvent")),
-            "mode": normalize_mode(raw.get("mode", "standard")),
-            "ewin_kcal": float(ewin),
-            "max_conformers": int(max_confs),
-            "threads": parse_int(raw.get("threads"), 0),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

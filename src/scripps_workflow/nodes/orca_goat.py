@@ -57,7 +57,7 @@ from typing import Any
 from .. import logging_utils
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
-from ..parsing import parse_float, parse_int
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 
 # Reuse crest's xyz parsing helpers — split_multixyz / write_xyz_block
 # are the canonical multi-xyz primitives in this package.
@@ -425,6 +425,117 @@ def run_orca_goat(
 # --------------------------------------------------------------------
 
 
+def _strict_positive_float(value: float) -> float:
+    if value <= 0:
+        raise ValueError(f"must be > 0, got {value!r}")
+    return value
+
+
+SCHEMA = NodeSchema(
+    step_name="orca_goat",
+    cli_entrypoint="wf-orca-goat",
+    module_path="scripps_workflow.nodes.orca_goat",
+    overview=(
+        "Chain node — runs ORCA GOAT (Global Optimizer Acceleration "
+        "Toolkit) on the first ``.xyz`` artifact from upstream. Emits "
+        "a conformer ensemble plus parsed energies and metadata."
+    ),
+    fields=(
+        ConfigField(
+            name="theory",
+            type="str",
+            default="XTB",
+            coercer=normalize_theory,
+            description=(
+                "ORCA theory string. xTB / common composite aliases "
+                "(case-insensitive) get mapped to canonical "
+                "capitalization; arbitrary DFT functional+basis "
+                "combinations pass through verbatim. Shell-injection "
+                "metacharacters are rejected."
+            ),
+        ),
+        ConfigField(
+            name="charge",
+            type="int",
+            default=0,
+            description="Molecular charge.",
+        ),
+        ConfigField(
+            name="unpaired_electrons",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "Unpaired electrons. Multiplicity is computed as "
+                "``2 * unpaired + 1``."
+            ),
+        ),
+        ConfigField(
+            name="solvent",
+            type="str",
+            default=None,
+            coercer=normalize_solvent,
+            description=(
+                "CPCM solvent name. ``none``/``null``/``vacuum``/"
+                "``gas``/``gas_phase`` / empty → vacuum. See "
+                "``CPCM_SOLVENTS`` for the supported set."
+            ),
+        ),
+        ConfigField(
+            name="mode",
+            type="str",
+            default="regular",
+            coercer=normalize_mode,
+            description=(
+                "GOAT speed knob. ``regular`` (default), ``quick``, "
+                "``loose``, ``tight``, etc. See ``GOAT_MODES`` for "
+                "the canonical set."
+            ),
+        ),
+        ConfigField(
+            name="ewin_kcal",
+            type="float",
+            default=6.0,
+            validator=_strict_positive_float,
+            description=(
+                "Energy window (kcal/mol) above the lowest-energy "
+                "conformer that GOAT retains. Strictly positive."
+            ),
+        ),
+        ConfigField(
+            name="max_conformers",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "Cap on the number of retained conformers. ``0`` "
+                "(default) means no cap."
+            ),
+        ),
+        ConfigField(
+            name="threads",
+            type="int",
+            default=0,
+            min_value=0,
+            description=(
+                "Threads for the orca subprocess. ``0`` auto-detects "
+                "from SLURM, else 1."
+            ),
+        ),
+        ConfigField(
+            name="maxcore_mb",
+            type="int",
+            default=2000,
+            min_value=100,
+            description=(
+                "Per-process memory budget (MB) passed to ORCA via "
+                "``%maxcore``."
+            ),
+        ),
+    ),
+)
+
+
 class OrcaGoat(Node):
     """Chain node: run ORCA GOAT on the first xyz artifact from upstream."""
 
@@ -433,29 +544,7 @@ class OrcaGoat(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        ewin = parse_float(raw.get("ewin_kcal"), 6.0)
-        if ewin <= 0:
-            raise ValueError("ewin_kcal must be > 0")
-
-        max_confs = parse_int(raw.get("max_conformers"), 0)
-        if max_confs < 0:
-            raise ValueError("max_conformers must be >= 0")
-
-        maxcore_mb = parse_int(raw.get("maxcore_mb"), 2000)
-        if maxcore_mb < 100:
-            raise ValueError("maxcore_mb must be >= 100")
-
-        return {
-            "theory": normalize_theory(raw.get("theory", "XTB")),
-            "charge": parse_int(raw.get("charge"), 0),
-            "unpaired_electrons": parse_int(raw.get("unpaired_electrons"), 0),
-            "solvent": normalize_solvent(raw.get("solvent")),
-            "mode": normalize_mode(raw.get("mode", "regular")),
-            "ewin_kcal": float(ewin),
-            "max_conformers": int(max_confs),
-            "threads": parse_int(raw.get("threads"), 0),
-            "maxcore_mb": int(maxcore_mb),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

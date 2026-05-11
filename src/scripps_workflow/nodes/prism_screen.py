@@ -65,7 +65,7 @@ from .. import logging_utils
 from ..contracts.conformer_screen import validate_conformer_screen
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
-from ..parsing import parse_bool, parse_float, parse_int
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 
 # TODO(factor): when a fourth caller appears, lift split_multixyz /
 # write_xyz_block / XyzBlock into ``scripps_workflow.xyz``. For now the
@@ -367,6 +367,109 @@ def run_prism_pruner(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+SCHEMA = NodeSchema(
+    step_name="prism_screen",
+    cli_entrypoint="wf-prism",
+    module_path="scripps_workflow.nodes.prism_screen",
+    overview=(
+        "Chain node — prunes duplicate conformers via prism-pruner. "
+        "Three orthogonal screens (moi, rmsd, rot_corr_rmsd) gated "
+        "by independent toggles; per-conformer energies decide "
+        "which member of a duplicate pair survives."
+    ),
+    fields=(
+        ConfigField(
+            name="min_conformers",
+            type="int",
+            default=3,
+            min_value=1,
+            description=(
+                "Minimum input ensemble size before pruning runs. "
+                "Smaller inputs pass through unchanged."
+            ),
+        ),
+        ConfigField(
+            name="moi_pruning",
+            type="bool",
+            default=True,
+            description="Enable moment-of-inertia pruning.",
+        ),
+        ConfigField(
+            name="rmsd_pruning",
+            type="bool",
+            default=True,
+            description="Enable raw heavy-atom RMSD pruning.",
+        ),
+        ConfigField(
+            name="rot_corr_rmsd_pruning",
+            type="bool",
+            default=True,
+            description=(
+                "Enable rotation-corrected RMSD pruning (catches "
+                "duplicates that differ only by overall rotation)."
+            ),
+        ),
+        ConfigField(
+            name="use_energies",
+            type="str",
+            default="auto",
+            coercer=normalize_use_energies,
+            description=(
+                "Tri-state: ``auto`` (default — use energies if "
+                "available), ``true``, or ``false``."
+            ),
+        ),
+        ConfigField(
+            name="max_dE_kcal",
+            type="float",
+            default=0.5,
+            aliases=("energy_window_kcal",),
+            min_value=0.0,
+            description=(
+                "Energy tolerance (kcal/mol): two conformers that "
+                "are within this ΔE AND match on one of the "
+                "geometric metrics are treated as duplicates. "
+                "Legacy alias: ``energy_window_kcal``."
+            ),
+        ),
+        ConfigField(
+            name="ewin_kcal",
+            type="float",
+            default=5.0,
+            min_value=0.0,
+            description=(
+                "Pre-pruning energy window (kcal/mol). Conformers "
+                "above ``ewin_kcal`` from the lowest are dropped "
+                "before pruning runs."
+            ),
+        ),
+        ConfigField(
+            name="timeout_s",
+            type="int",
+            default=120,
+            min_value=5,
+            description=(
+                "Wall-clock cap for the prism-pruner subprocess."
+            ),
+        ),
+        ConfigField(
+            name="keep_rejected",
+            type="bool",
+            default=True,
+            description=(
+                "Whether rejected conformer xyz files are kept in "
+                "the artifact bucket for inspection."
+            ),
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -379,35 +482,7 @@ class PrismScreen(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        # Normalize-and-validate up front so typos surface as
-        # ``argv_parse_failed`` rather than mid-run errors.
-        min_conformers = parse_int(raw.get("min_conformers"), 3)
-        if min_conformers < 1:
-            raise ValueError("min_conformers must be >= 1")
-
-        max_dE = parse_float(raw.get("max_dE_kcal", raw.get("energy_window_kcal")), 0.5)
-        if max_dE < 0:
-            raise ValueError("max_dE_kcal must be >= 0")
-
-        timeout_s = parse_int(raw.get("timeout_s"), 120)
-        if timeout_s < 5:
-            raise ValueError("timeout_s must be >= 5")
-
-        ewin_kcal = parse_float(raw.get("ewin_kcal"), 5.0)
-        if ewin_kcal < 0:
-            raise ValueError("ewin_kcal must be >= 0")
-
-        return {
-            "min_conformers": min_conformers,
-            "moi_pruning": parse_bool(raw.get("moi_pruning"), True),
-            "rmsd_pruning": parse_bool(raw.get("rmsd_pruning"), True),
-            "rot_corr_rmsd_pruning": parse_bool(raw.get("rot_corr_rmsd_pruning"), True),
-            "use_energies": normalize_use_energies(raw.get("use_energies")),
-            "max_dE_kcal": float(max_dE),
-            "ewin_kcal": float(ewin_kcal),
-            "timeout_s": int(timeout_s),
-            "keep_rejected": parse_bool(raw.get("keep_rejected"), True),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

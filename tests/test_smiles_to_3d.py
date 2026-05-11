@@ -171,11 +171,15 @@ class TestParseConfig:
         assert cfg["seed"] == 42
         assert cfg["max_embed_attempts"] == 10
 
-    def test_garbage_int_uses_default(self):
-        # parse_int is permissive — bad ints fall back to the default rather
-        # than crashing argv parsing.
-        cfg = SmilesTo3D().parse_config({"smiles": "CCO", "seed": "not_a_number"})
-        assert cfg["seed"] == 0
+    def test_garbage_int_now_raises(self):
+        # Post-schema-migration: bad ints fail loudly as
+        # ``argv_parse_failed`` rather than silently defaulting. Legacy
+        # parse_int-style permissive parsing was dropped on the
+        # ``smiles_to_3d`` config surface because a typo'd seed should
+        # surface in the manifest, not silently roll the dice.
+        import pytest
+        with pytest.raises(ValueError, match="seed"):
+            SmilesTo3D().parse_config({"smiles": "CCO", "seed": "not_a_number"})
 
     def test_smiles_whitespace_stripped(self):
         cfg = SmilesTo3D().parse_config({"smiles": "  CCO  "})

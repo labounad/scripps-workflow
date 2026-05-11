@@ -39,9 +39,9 @@ from pathlib import Path
 from typing import Any
 
 from .. import logging_utils
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
-from ..parsing import parse_int, parse_kv_or_json
 
 # Lazy-imported RDKit handles. Populated on first call to ``ensure_rdkit``.
 # Kept module-level so tests can monkeypatch them.
@@ -252,6 +252,104 @@ def mol_to_xyz_block(mol: Any, comment: str = "") -> str:
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+def _name_coercer(value: Any) -> Any:
+    """Strip and treat whitespace-only / empty as None.
+
+    apply_schema already short-circuits raw ``""``/``None`` to the field
+    default, but ``"   "`` (whitespace-only) slips through as "present".
+    Convert that to ``None`` so callers can ``cfg["name"] or "molecule"``.
+    """
+    s = str(value).strip()
+    return s if s else None
+
+
+def _opt_coercer(value: Any) -> str:
+    """Lowercase + validate the ETKDG/MMFF/UFF optimization mode."""
+    s = str(value).strip().lower()
+    if s not in {"none", "uff", "mmff"}:
+        raise ValueError(
+            f"must be one of 'none', 'uff', 'mmff', got {value!r}"
+        )
+    return s
+
+
+SCHEMA = NodeSchema(
+    step_name="smiles_to_3d",
+    cli_entrypoint="wf-embed",
+    module_path="scripps_workflow.nodes.smiles_to_3d",
+    overview=(
+        "Source node — embeds a single SMILES into 3D coordinates via "
+        "RDKit ETKDGv3 with a deterministic seed and (optionally) MMFF "
+        "or UFF cleanup. Emits a single ``.xyz`` file and a "
+        "``wf.result.v1`` manifest."
+    ),
+    fields=(
+        ConfigField(
+            name="smiles",
+            type="str",
+            description=(
+                "SMILES string. Whitespace-stripped; must be non-empty."
+            ),
+        ),
+        ConfigField(
+            name="name",
+            type="str",
+            default=None,
+            coercer=_name_coercer,
+            description=(
+                "Output filename stem. Sanitized to "
+                "``[A-Za-z0-9._-]``; spaces become ``_``. "
+                "Whitespace-only or empty becomes ``None`` and the "
+                "node falls back to ``molecule``."
+            ),
+        ),
+        ConfigField(
+            name="opt",
+            type="str",
+            default="mmff",
+            choices=("none", "uff", "mmff"),
+            coercer=_opt_coercer,
+            description=(
+                "Geometry optimization mode. ``mmff`` (default) falls "
+                "back to UFF automatically if MMFF parameters aren't "
+                "available for the molecule."
+            ),
+        ),
+        ConfigField(
+            name="seed",
+            type="int",
+            default=0,
+            description=(
+                "ETKDGv3 random seed base. Bumped deterministically "
+                "across embed attempts."
+            ),
+        ),
+        ConfigField(
+            name="max_embed_attempts",
+            type="int",
+            default=50,
+            min_value=1,
+            description=(
+                "Number of seeds to try with deterministic coords "
+                "before falling back to random coordinates."
+            ),
+        ),
+        ConfigField(
+            name="max_opt_iters",
+            type="int",
+            default=500,
+            min_value=0,
+            description="Optimizer iteration cap.",
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -264,20 +362,7 @@ class SmilesTo3D(Node):
     requires_upstream = False
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        # Coerce numeric / string config tokens up front so ``run`` only
-        # deals with typed values and bad inputs surface as a clean
-        # ``argv_parse_failed`` rather than blowing up partway through embed.
-        cfg: dict[str, Any] = dict(raw)
-        if "smiles" in cfg:
-            cfg["smiles"] = str(cfg["smiles"]).strip()
-        if "name" in cfg:
-            cfg["name"] = str(cfg["name"]).strip() or None
-        if "opt" in cfg:
-            cfg["opt"] = str(cfg["opt"]).strip().lower()
-        cfg["seed"] = parse_int(cfg.get("seed"), 0)
-        cfg["max_embed_attempts"] = parse_int(cfg.get("max_embed_attempts"), 50)
-        cfg["max_opt_iters"] = parse_int(cfg.get("max_opt_iters"), 500)
-        return cfg
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

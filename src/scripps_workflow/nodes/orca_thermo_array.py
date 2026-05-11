@@ -113,13 +113,8 @@ from ..orca import (
     resolve_functional_alias,
     write_energy_file,
 )
-from ..parsing import (
-    normalize_optional_str,
-    parse_bool,
-    parse_float,
-    parse_int,
-    parse_optional_int,
-)
+from ..config_schema import ConfigField, NodeSchema, apply_schema
+from ..parsing import normalize_optional_str
 from ..slurm import (
     MonitorResult,
     ProgressCounts,
@@ -139,6 +134,8 @@ from ..slurm import (
 # — the conformer source discovery rule + multi-xyz splitting are
 # identical.
 from .orca_dft_array import (
+    _make_slurm_array_fields,
+    _reject_empty_keywords,
     normalize_max_concurrency,
     resolve_multiplicity,
     stage_conformer_inputs,
@@ -437,6 +434,174 @@ def collect_thermo_outputs(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+SCHEMA = NodeSchema(
+    step_name="orca_thermo_array",
+    cli_entrypoint="wf-orca-thermo-array",
+    module_path="scripps_workflow.nodes.orca_thermo_array",
+    overview=(
+        "SLURM-array freq+SP runner with optional NMR shielding / "
+        "J-coupling jobs chained after. Heart of the NMR Predictor "
+        "workflow: defaults follow the cheshire & Bally-Rablen "
+        "calibration recipes so the downstream ``nmr_aggregate`` "
+        "sees the geometry/method combination its lookup tables "
+        "were fit for."
+    ),
+    fields=(
+        *_make_slurm_array_fields(
+            default_keywords=DEFAULT_KEYWORDS,
+            default_nprocs=DEFAULT_NPROCS,
+        ),
+        # ----- Compound-job knob -----
+        ConfigField(
+            name="singlepoint_keywords",
+            type="str",
+            default=DEFAULT_SINGLEPOINT_KEYWORDS,
+            description=(
+                "ORCA simple-input line for the high-level SP appended "
+                "after the freq job via ``$new_job``. Combined with "
+                "``keywords`` (low-level freq), the downstream thermo "
+                "aggregator computes a composite Gibbs energy. "
+                "Explicitly passing this key with an empty / null "
+                "value disables the SP step entirely — i.e. the run "
+                "degrades to pure freq+thermo at ``keywords``."
+            ),
+        ),
+        # ----- NMR section -----
+        ConfigField(
+            name="run_shielding_h",
+            type="bool",
+            default=True,
+            section="nmr",
+            description=(
+                "Whether to append a ¹H GIAO shielding job after the "
+                "freq+SP."
+            ),
+        ),
+        ConfigField(
+            name="run_shielding_c",
+            type="bool",
+            default=True,
+            section="nmr",
+            description=(
+                "Whether to append a ¹³C GIAO shielding job."
+            ),
+        ),
+        ConfigField(
+            name="run_couplings",
+            type="bool",
+            default=True,
+            section="nmr",
+            description=(
+                "Whether to append a J-coupling (SSCC) job. Requires "
+                "``coupling_pairs`` to be non-empty when true; "
+                "otherwise ``parse_config`` raises and the run lands "
+                "as ``argv_parse_failed``."
+            ),
+        ),
+        ConfigField(
+            name="shielding_method_h",
+            type="str",
+            default=DEFAULT_SHIELDING_METHOD_H,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description=(
+                "DFT functional for the ¹H shielding job. ``WP04`` "
+                "matches the cheshire ¹H calibration."
+            ),
+        ),
+        ConfigField(
+            name="shielding_basis_h",
+            type="str",
+            default=DEFAULT_SHIELDING_BASIS_H,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description="Basis set for the ¹H shielding job.",
+        ),
+        ConfigField(
+            name="shielding_method_c",
+            type="str",
+            default=DEFAULT_SHIELDING_METHOD_C,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description=(
+                "DFT functional for the ¹³C shielding job. "
+                "``wB97X-D`` matches the cheshire ¹³C calibration."
+            ),
+        ),
+        ConfigField(
+            name="shielding_basis_c",
+            type="str",
+            default=DEFAULT_SHIELDING_BASIS_C,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description="Basis set for the ¹³C shielding job.",
+        ),
+        ConfigField(
+            name="coupling_method",
+            type="str",
+            default=DEFAULT_COUPLING_METHOD,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description=(
+                "DFT functional for the J-coupling job. "
+                "``mPW1PW91`` matches the Bally-Rablen calibration."
+            ),
+        ),
+        ConfigField(
+            name="coupling_basis",
+            type="str",
+            default=DEFAULT_COUPLING_BASIS,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description="Basis set for the J-coupling job.",
+        ),
+        ConfigField(
+            name="coupling_pairs",
+            type="csv",
+            default=list(DEFAULT_COUPLING_PAIRS),
+            section="nmr",
+            description=(
+                "ORCA nuclei selectors for the J-coupling block. "
+                "Accepts either a list (JSON config) or comma-"
+                "separated string (key=value config). Tokens are "
+                "ORCA-syntax (e.g. ``\"all H\"``, ``\"1, 4, 7\"``, "
+                "``\"all C\"``). Must be non-empty when "
+                "``run_couplings=true``."
+            ),
+            depends_on=("run_couplings",),
+        ),
+        ConfigField(
+            name="coupling_thresh_angstrom",
+            type="float",
+            default=DEFAULT_COUPLING_THRESH_ANGSTROM,
+            section="nmr",
+            min_value=0.0,
+            description=(
+                "``SpinSpinRThresh`` cap (Å) — pairs farther apart "
+                "than this are skipped to keep the O(N²) cost down."
+            ),
+        ),
+        ConfigField(
+            name="nmr_aux_keywords",
+            type="str",
+            default=DEFAULT_NMR_AUX_KEYWORDS,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description=(
+                "Extra simple-input fragment applied to each NMR "
+                "job (alongside ``! NMR``). ``TightSCF`` keeps the "
+                "SCF thresholds uniform with the freq/SP jobs."
+            ),
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -449,144 +614,40 @@ class OrcaThermoArray(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        max_concurrency = normalize_max_concurrency(raw)
+        _reject_empty_keywords(raw)
+        cfg = apply_schema(raw, SCHEMA)
 
-        unpaired = parse_int(raw.get("unpaired_electrons"), 0)
-        mult_override = parse_optional_int(raw.get("multiplicity"))
+        # Two fields share an "absent ≠ explicitly-empty" semantics that
+        # the schema layer can't directly express (its empty-→-default
+        # short-circuit collapses both into "use the default"). Handle
+        # the explicit-empty case here:
 
-        keywords = str(raw.get("keywords", DEFAULT_KEYWORDS)).strip()
-        if not keywords:
-            raise ValueError("keywords must be non-empty")
-
-        # The SP step keywords. Distinguish "user did not set the key at
-        # all" (use the default) from "user explicitly set it to a
-        # null-ish value" (disable the SP step). ``normalize_optional_str``
-        # collapses ``None``/``""``/``"none"``/``"null"`` to ``None``,
-        # which is the disable signal.
+        # singlepoint_keywords="" / "none" → disable the SP step.
         if "singlepoint_keywords" in raw:
-            singlepoint_keywords = normalize_optional_str(
+            cfg["singlepoint_keywords"] = normalize_optional_str(
                 raw.get("singlepoint_keywords")
             )
-        else:
-            singlepoint_keywords = DEFAULT_SINGLEPOINT_KEYWORDS
 
-        maxcore = max(500, parse_int(raw.get("maxcore"), 4000))
-        nprocs = max(1, parse_int(raw.get("nprocs"), DEFAULT_NPROCS))
+        # coupling_pairs="" → []; the cross-field invariant below catches
+        # the "run_couplings=true but explicitly empty" case the legacy
+        # parse_config also rejected.
+        if "coupling_pairs" in raw:
+            raw_cp = raw["coupling_pairs"]
+            if isinstance(raw_cp, list):
+                cfg["coupling_pairs"] = [
+                    str(s).strip() for s in raw_cp if str(s).strip()
+                ]
+            else:
+                cfg["coupling_pairs"] = [
+                    s.strip() for s in str(raw_cp).split(",") if s.strip()
+                ]
 
-        time_limit = str(raw.get("time_limit", "12:00:00")).strip() or "12:00:00"
-        partition = normalize_optional_str(raw.get("partition"))
-
-        orca_module = str(
-            raw.get("orca_module", DEFAULT_ORCA_MODULE)
-        ).strip() or DEFAULT_ORCA_MODULE
-
-        monitor_interval_s = max(5, parse_int(raw.get("monitor_interval_s"), 60))
-        monitor_timeout_min = max(0, parse_int(raw.get("monitor_timeout_min"), 0))
-
-        # ---- NMR section ----
-        # Three booleans gate the optional shielding/coupling jobs
-        # appended after the freq+SP. Defaults are ``True`` because
-        # this node is the heart of the ``NMR Predictor`` workflow —
-        # the downstream ``nmr_aggregate`` aborts with
-        # ``no_shielding_data_in_any_conformer`` whenever none of the
-        # three are run. Method/basis fall back to the cheshire
-        # defaults so an operator who flips one off (e.g.
-        # ``run_couplings=false`` to skip J-couplings on a big system)
-        # gets the same recipe the matching ``nmr_aggregate``
-        # calibration was fit for. Set all three to ``false`` to
-        # degrade gracefully back to a pure freq+SP run.
-        run_shielding_h = parse_bool(raw.get("run_shielding_h"), True)
-        run_shielding_c = parse_bool(raw.get("run_shielding_c"), True)
-        run_couplings = parse_bool(raw.get("run_couplings"), True)
-
-        shielding_method_h = (
-            normalize_optional_str(raw.get("shielding_method_h"))
-            or DEFAULT_SHIELDING_METHOD_H
-        )
-        shielding_basis_h = (
-            normalize_optional_str(raw.get("shielding_basis_h"))
-            or DEFAULT_SHIELDING_BASIS_H
-        )
-        shielding_method_c = (
-            normalize_optional_str(raw.get("shielding_method_c"))
-            or DEFAULT_SHIELDING_METHOD_C
-        )
-        shielding_basis_c = (
-            normalize_optional_str(raw.get("shielding_basis_c"))
-            or DEFAULT_SHIELDING_BASIS_C
-        )
-        coupling_method = (
-            normalize_optional_str(raw.get("coupling_method"))
-            or DEFAULT_COUPLING_METHOD
-        )
-        coupling_basis = (
-            normalize_optional_str(raw.get("coupling_basis"))
-            or DEFAULT_COUPLING_BASIS
-        )
-
-        # ``coupling_pairs`` accepts either a list (from JSON config)
-        # or a comma-separated string (from key=value config). Each
-        # entry is an ORCA nuclei selector (``"all H"``, ``"1, 4, 7"``,
-        # ``"all C"``, ...).
-        raw_cp = raw.get("coupling_pairs")
-        coupling_pairs: list[str]
-        if raw_cp is None:
-            coupling_pairs = list(DEFAULT_COUPLING_PAIRS)
-        elif isinstance(raw_cp, list):
-            coupling_pairs = [str(s).strip() for s in raw_cp if str(s).strip()]
-        else:
-            coupling_pairs = [
-                s.strip() for s in str(raw_cp).split(",") if s.strip()
-            ]
-        if run_couplings and not coupling_pairs:
+        # Cross-field invariant: J-coupling requested ⇒ non-empty pairs.
+        if cfg["run_couplings"] and not cfg["coupling_pairs"]:
             raise ValueError(
                 "run_couplings=true but coupling_pairs is empty"
             )
-
-        coupling_thresh_angstrom = parse_float(
-            raw.get("coupling_thresh_angstrom"),
-            DEFAULT_COUPLING_THRESH_ANGSTROM,
-        )
-
-        nmr_aux_keywords = (
-            normalize_optional_str(raw.get("nmr_aux_keywords"))
-            or DEFAULT_NMR_AUX_KEYWORDS
-        )
-
-        return {
-            "max_concurrency": max_concurrency,
-            "charge": parse_int(raw.get("charge"), 0),
-            "unpaired_electrons": unpaired,
-            "multiplicity": mult_override,
-            "solvent": normalize_optional_str(raw.get("solvent")),
-            "smd_solvent": normalize_optional_str(raw.get("smd_solvent")),
-            "keywords": keywords,
-            "singlepoint_keywords": singlepoint_keywords,
-            "maxcore": maxcore,
-            "nprocs": nprocs,
-            "time_limit": time_limit,
-            "partition": partition,
-            "job_name": normalize_optional_str(raw.get("job_name")),
-            "orca_module": orca_module,
-            "submit": parse_bool(raw.get("submit"), True),
-            "monitor": parse_bool(raw.get("monitor"), True),
-            "monitor_interval_s": monitor_interval_s,
-            "monitor_timeout_min": monitor_timeout_min,
-            "silence_openib": parse_bool(raw.get("silence_openib"), True),
-            # NMR knobs (forwarded to build_nmr_input_files in run()):
-            "run_shielding_h": run_shielding_h,
-            "run_shielding_c": run_shielding_c,
-            "run_couplings": run_couplings,
-            "shielding_method_h": shielding_method_h,
-            "shielding_basis_h": shielding_basis_h,
-            "shielding_method_c": shielding_method_c,
-            "shielding_basis_c": shielding_basis_c,
-            "coupling_method": coupling_method,
-            "coupling_basis": coupling_basis,
-            "coupling_pairs": coupling_pairs,
-            "coupling_thresh_angstrom": coupling_thresh_angstrom,
-            "nmr_aux_keywords": nmr_aux_keywords,
-        }
+        return cfg
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

@@ -67,7 +67,7 @@ from .. import logging_utils
 from ..contracts.conformer_screen import validate_conformer_screen
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
-from ..parsing import parse_bool, parse_float, parse_int
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 
 # Reuse the conformer_screen role helpers that prism_screen factored out.
 # These are pure functions and contract-aware. When a third sibling impl
@@ -332,6 +332,114 @@ def run_marc(
 
 
 # --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+SCHEMA = NodeSchema(
+    step_name="marc_screen",
+    cli_entrypoint="wf-marc-screen",
+    module_path="scripps_workflow.nodes.marc_screen",
+    overview=(
+        "Chain node — clusters a conformer ensemble via navicat-marc "
+        "(rotation-corrected RMSD with optional moment-of-inertia "
+        "augmentation). Pruning typically follows a CREST or "
+        "prism_screen ensemble; representatives feed the downstream "
+        "DFT array."
+    ),
+    fields=(
+        ConfigField(
+            name="min_conformers",
+            type="int",
+            default=3,
+            min_value=1,
+            description=(
+                "Minimum input ensemble size before marc clustering "
+                "is attempted; smaller ensembles are passed through "
+                "unchanged."
+            ),
+        ),
+        ConfigField(
+            name="metric",
+            type="str",
+            default="mix",
+            coercer=normalize_metric,
+            description=(
+                "Distance metric for clustering. Aliases: "
+                "``rmsd``/``rmsd_pruning`` → rmsd; ``moi``/"
+                "``moi_pruning`` → moi; ``rotcorr``/various → "
+                "rotcorr_rmsd; ``mix``/``auto`` → mix (default)."
+            ),
+        ),
+        ConfigField(
+            name="clustering",
+            type="str",
+            default="auto",
+            coercer=normalize_clustering,
+            description=(
+                "Clustering algorithm token. ``auto`` (default) lets "
+                "marc choose; see ``_ALLOWED_CLUSTERINGS`` for the "
+                "explicit set."
+            ),
+        ),
+        ConfigField(
+            name="n_clusters",
+            type="json",
+            default=None,
+            coercer=normalize_n_clusters,
+            description=(
+                "Target number of clusters. ``auto`` / empty / unset "
+                "→ None (marc decides). Otherwise a positive int."
+            ),
+        ),
+        ConfigField(
+            name="use_energies",
+            type="str",
+            default="auto",
+            coercer=normalize_use_energies,
+            description=(
+                "Whether marc weights cluster centroids by relative "
+                "energies. ``true``/``false``/``auto`` (default — "
+                "use energies if available)."
+            ),
+        ),
+        ConfigField(
+            name="ewin_kcal",
+            type="float",
+            default=5.0,
+            min_value=0.0,
+            description=(
+                "Pre-clustering energy window (kcal/mol) above the "
+                "lowest-energy conformer; conformers above the "
+                "window are dropped before marc runs."
+            ),
+        ),
+        ConfigField(
+            name="timeout_s",
+            type="int",
+            default=120,
+            min_value=5,
+            description=(
+                "Wall-clock cap for the marc subprocess. Marc can "
+                "hang on pathological inputs; this is the safety "
+                "valve."
+            ),
+        ),
+        ConfigField(
+            name="keep_rejected",
+            type="bool",
+            default=True,
+            description=(
+                "Whether to keep rejected (non-representative) "
+                "conformer xyz files in the artifact bucket for "
+                "inspection. Disable to save disk."
+            ),
+        ),
+    ),
+)
+
+
+# --------------------------------------------------------------------
 # Node class
 # --------------------------------------------------------------------
 
@@ -344,34 +452,7 @@ class MarcScreen(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        # Normalize-and-validate up front so typos / out-of-range values
-        # surface as ``argv_parse_failed`` rather than mid-run errors.
-        min_conformers = parse_int(raw.get("min_conformers"), 3)
-        if min_conformers < 1:
-            raise ValueError("min_conformers must be >= 1")
-
-        timeout_s = parse_int(raw.get("timeout_s"), 120)
-        if timeout_s < 5:
-            raise ValueError("timeout_s must be >= 5")
-
-        ewin_kcal = parse_float(raw.get("ewin_kcal"), 5.0)
-        if ewin_kcal < 0:
-            raise ValueError("ewin_kcal must be >= 0")
-
-        metric = normalize_metric(raw.get("metric"))
-        clustering = normalize_clustering(raw.get("clustering"))
-        n_clusters = normalize_n_clusters(raw.get("n_clusters"))
-
-        return {
-            "min_conformers": min_conformers,
-            "metric": metric,
-            "clustering": clustering,
-            "n_clusters": n_clusters,  # int or None (auto)
-            "use_energies": normalize_use_energies(raw.get("use_energies")),
-            "ewin_kcal": float(ewin_kcal),
-            "timeout_s": int(timeout_s),
-            "keep_rejected": parse_bool(raw.get("keep_rejected"), True),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config

@@ -47,10 +47,17 @@ def _discover_schemas() -> tuple[list[NodeSchema], list[str]]:
 
     Returns:
         schemas: ordered by step_name for stable output.
-        unported_modules: short module names that imported successfully
-            but didn't expose a SCHEMA attribute. Listed in the docs
-            as a migration TODO.
+        unported_modules: short module names that imported successfully,
+            host a :class:`Node` subclass, but didn't expose a SCHEMA
+            attribute. Listed in the docs as a migration TODO.
+
+    Modules that DON'T contain a Node subclass (e.g. ``tag_input``,
+    a console-script shim around :mod:`scripps_workflow.tag`) are
+    skipped entirely — they never had a ``parse_config`` and aren't
+    migration candidates.
     """
+    from scripps_workflow.node import Node  # local: avoid import cycle
+
     import scripps_workflow.nodes as nodes_pkg
 
     schemas: list[NodeSchema] = []
@@ -65,7 +72,19 @@ def _discover_schemas() -> tuple[list[NodeSchema], list[str]]:
         schema = getattr(mod, "SCHEMA", None)
         if isinstance(schema, NodeSchema):
             schemas.append(schema)
-        else:
+            continue
+        # No SCHEMA: only flag as "unported" if the module actually
+        # hosts a Node subclass. Shim modules (e.g. tag_input.py) get
+        # silently skipped — they're not nodes in the framework sense
+        # and never had a parse_config to migrate.
+        has_node = any(
+            isinstance(obj, type)
+            and issubclass(obj, Node)
+            and obj is not Node
+            and obj.__module__ == modname
+            for obj in vars(mod).values()
+        )
+        if has_node:
             unported.append(info.name)
 
     schemas.sort(key=lambda s: s.step_name)
