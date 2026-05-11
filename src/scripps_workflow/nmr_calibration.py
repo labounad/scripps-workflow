@@ -68,6 +68,12 @@ NMR_CALIBRATION: dict[tuple[str, str, str, str], dict[str, Any]] = {
         "source": "cheshire (Wiitala/Hoye/Cramer 2006)",
         "valid_range_ppm": (0.0, 12.0),
     },
+    ("WP04", "6-311++G(2d,p)", "PCM_CHCl3_DELTA50", "1H"): {
+        "slope": -1.0311,
+        "intercept": 32.2654,
+        "source": "DELTA50 high-accuracy: GIAO-PCM-WP04/6-311++G(2d,p)//PCM-B3LYP-D3/6-311G(d,p)",
+        "valid_range_ppm": (0.0, 12.0),
+    },
     ("wB97X-D", "6-31G(d,p)", "CHCl3", "13C"): {
         "slope": -1.0501,
         "intercept": 187.25,
