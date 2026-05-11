@@ -132,6 +132,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .. import logging_utils
+from ..config_schema import ConfigField, NodeSchema, apply_schema
 from ..equivalence import (
     EquivalenceGroup,
     compute_equivalence_groups,
@@ -761,8 +762,11 @@ def _parse_partner_list(raw: Any) -> list[str]:
         if not item:
             continue
         if item not in valid:
+            # No field-name prefix here — apply_schema (and the legacy
+            # caller) wrap with the field name, so a self-prefix would
+            # double up to ``foo: foo: unknown element...``.
             raise ValueError(
-                f"mnova_heteronuclear_partners: unknown element {item!r}; "
+                f"unknown element {item!r}; "
                 f"expected one of {sorted(valid)}"
             )
         if item not in out:
@@ -1061,6 +1065,362 @@ def _spectrum_config_for(
 # --------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------
+# Schema (source of truth for parse_config + auto-generated docs)
+# --------------------------------------------------------------------
+
+
+def _basename_validator(value: str) -> str:
+    """Reject path-like strings (with ``/`` or leading ``.``).
+
+    Output filenames must be basenames — the aggregator joins them with
+    its own outputs_dir; allowing path components would let a workflow
+    write artifacts outside the engine's expected location.
+    """
+    if "/" in value or value.startswith("."):
+        raise ValueError(f"must be a basename, got {value!r}")
+    return value
+
+
+def _mnova_nuclei_coercer(raw: Any) -> str:
+    """Parse + validate the mnova_nuclei CSV, returning a canonical
+    comma-joined string (e.g., ``"1H,13C"``)."""
+    if isinstance(raw, (list, tuple)):
+        tokens = [str(s).strip() for s in raw]
+    else:
+        tokens = [s.strip() for s in str(raw).split(",")]
+    tokens = [t for t in tokens if t]
+    for tok in tokens:
+        if tok not in ("1H", "13C"):
+            raise ValueError(
+                f"unsupported token {tok!r}; expected one of '1H', '13C'"
+            )
+    return ",".join(tokens)
+
+
+SCHEMA = NodeSchema(
+    step_name="nmr_aggregate",
+    cli_entrypoint="wf-nmr-aggregate",
+    module_path="scripps_workflow.nodes.nmr_aggregate",
+    overview=(
+        "Boltzmann-averaged ¹H/¹³C chemical shifts and ¹H-¹H coupling "
+        "predictions over a conformer ensemble. Consumes a "
+        "``thermo_aggregate`` upstream and emits CSVs, mnova-spinsim "
+        "XMLs (pre-averaged + per-conformer), and 2D/3D molecule "
+        "diagrams annotated with predicted shifts."
+    ),
+    fields=(
+        # ----- General -----
+        ConfigField(
+            name="solvent",
+            type="str",
+            default=DEFAULT_SOLVENT,
+            section="general",
+            description=(
+                "Solvent name (used for calibration table lookup and "
+                "embedded in artifact metadata). SMD aliases are "
+                "resolved per ``orca.solvent_to_orca_smd``."
+            ),
+        ),
+        # ----- Shielding methods -----
+        ConfigField(
+            name="shielding_method_h",
+            type="str",
+            default=DEFAULT_SHIELDING_METHOD_H,
+            section="shielding",
+            description=(
+                "DFT functional label for ¹H shielding calibration "
+                "lookup. ``WP04`` is cheshire's recommended choice "
+                "(Wiitala/Hoye/Cramer 2006)."
+            ),
+        ),
+        ConfigField(
+            name="shielding_basis_h",
+            type="str",
+            default=DEFAULT_SHIELDING_BASIS_H,
+            section="shielding",
+            description="Basis set for ¹H shielding calibration lookup.",
+        ),
+        ConfigField(
+            name="shielding_method_c",
+            type="str",
+            default=DEFAULT_SHIELDING_METHOD_C,
+            section="shielding",
+            description=(
+                "DFT functional for ¹³C shielding calibration lookup. "
+                "``wB97X-D`` is cheshire's default."
+            ),
+        ),
+        ConfigField(
+            name="shielding_basis_c",
+            type="str",
+            default=DEFAULT_SHIELDING_BASIS_C,
+            section="shielding",
+            description="Basis set for ¹³C shielding calibration lookup.",
+        ),
+        # ----- Coupling -----
+        ConfigField(
+            name="coupling_method",
+            type="str",
+            default=DEFAULT_COUPLING_METHOD,
+            section="coupling",
+            description=(
+                "DFT functional for J-coupling calibration lookup. "
+                "``mPW1PW91`` is the cheshire / Bally-Rablen default."
+            ),
+        ),
+        ConfigField(
+            name="coupling_basis",
+            type="str",
+            default=DEFAULT_COUPLING_BASIS,
+            section="coupling",
+            description="Basis set for J-coupling calibration lookup.",
+        ),
+        ConfigField(
+            name="skip_couplings",
+            type="bool",
+            default=False,
+            section="coupling",
+            description=(
+                "If true, skip parsing the ``orca_nmr_j.out`` files "
+                "and emit only chemical-shift CSVs / XMLs. Useful when "
+                "the upstream didn't run coupling jobs."
+            ),
+        ),
+        # ----- CSV outputs -----
+        ConfigField(
+            name="output_shifts_csv",
+            type="str",
+            default=DEFAULT_OUTPUT_SHIFTS_CSV,
+            section="outputs",
+            validator=_basename_validator,
+            description="Basename for the predicted-shifts CSV.",
+        ),
+        ConfigField(
+            name="output_couplings_csv",
+            type="str",
+            default=DEFAULT_OUTPUT_COUPLINGS_CSV,
+            section="outputs",
+            validator=_basename_validator,
+            description="Basename for the predicted-couplings CSV.",
+        ),
+        # ----- mnova XML emission -----
+        ConfigField(
+            name="smiles",
+            type="str",
+            default=None,
+            section="mnova",
+            depends_on=("mnova_enabled", "diagrams_enabled"),
+            description=(
+                "Canonical SMILES. Drives the equivalence detector "
+                "for both mnova XML and diagram emission. When absent, "
+                "the aggregator falls back to xyz perception of any "
+                "conformer's geometry; if that also fails, XML and "
+                "diagrams are skipped with "
+                "``mnova_xml_skipped:topology_unavailable``."
+            ),
+        ),
+        ConfigField(
+            name="mnova_enabled",
+            type="bool",
+            default=True,
+            section="mnova",
+            description="Master toggle for mnova-spinsim XML emission.",
+        ),
+        ConfigField(
+            name="mnova_per_conformer",
+            type="bool",
+            default=True,
+            section="mnova",
+            description=(
+                "Also emit ``predicted_mnova_<nuc>_per_conformer.xml`` "
+                "files (one ``<spin-system>`` per conformer with the "
+                "Boltzmann weight as ``<population>``)."
+            ),
+        ),
+        ConfigField(
+            name="mnova_nuclei",
+            type="str",
+            default=DEFAULT_MNOVA_NUCLEI,
+            section="mnova",
+            coercer=_mnova_nuclei_coercer,
+            choices=("1H", "13C", "1H,13C", "13C,1H"),
+            description=(
+                "Comma-separated list of nuclei to emit XML files for. "
+                "Tokens: ``1H``, ``13C``."
+            ),
+        ),
+        ConfigField(
+            name="mnova_field_mhz_h",
+            type="float",
+            default=DEFAULT_MNOVA_FIELD_MHZ_H,
+            section="mnova",
+            description="¹H Larmor frequency (MHz). Default targets a 600 MHz spectrometer.",
+        ),
+        ConfigField(
+            name="mnova_field_mhz_c",
+            type="float",
+            default=DEFAULT_MNOVA_FIELD_MHZ_C,
+            section="mnova",
+            description="¹³C Larmor frequency (MHz).",
+        ),
+        ConfigField(
+            name="mnova_line_width_hz_h",
+            type="float",
+            default=DEFAULT_MNOVA_LINE_WIDTH_HZ_H,
+            section="mnova",
+            min_value=0.0,
+            description="Simulated peak linewidth (Hz) in ¹H spectra.",
+        ),
+        ConfigField(
+            name="mnova_line_width_hz_c",
+            type="float",
+            default=DEFAULT_MNOVA_LINE_WIDTH_HZ_C,
+            section="mnova",
+            min_value=0.0,
+            description=(
+                "Simulated peak linewidth (Hz) in ¹³C spectra. "
+                "Broader by default to reflect broadband-decoupled "
+                "¹³C peak appearance."
+            ),
+        ),
+        ConfigField(
+            name="mnova_from_ppm_h",
+            type="float",
+            default=DEFAULT_MNOVA_FROM_PPM_H,
+            section="mnova",
+            description="Lower edge of the simulated ¹H spectrum (ppm).",
+        ),
+        ConfigField(
+            name="mnova_to_ppm_h",
+            type="float",
+            default=DEFAULT_MNOVA_TO_PPM_H,
+            section="mnova",
+            description="Upper edge of the simulated ¹H spectrum (ppm).",
+        ),
+        ConfigField(
+            name="mnova_from_ppm_c",
+            type="float",
+            default=DEFAULT_MNOVA_FROM_PPM_C,
+            section="mnova",
+            description="Lower edge of the simulated ¹³C spectrum (ppm).",
+        ),
+        ConfigField(
+            name="mnova_to_ppm_c",
+            type="float",
+            default=DEFAULT_MNOVA_TO_PPM_C,
+            section="mnova",
+            description="Upper edge of the simulated ¹³C spectrum (ppm).",
+        ),
+        ConfigField(
+            name="mnova_points",
+            type="int",
+            default=DEFAULT_MNOVA_POINTS,
+            section="mnova",
+            min_value=64,
+            description=(
+                "FID points in the simulated spectrum. Higher = finer "
+                "resolution but slower mnova render."
+            ),
+        ),
+        ConfigField(
+            name="mnova_tol_jcoupling_hz",
+            type="float",
+            default=DEFAULT_MNOVA_TOL_JCOUPLING_HZ,
+            section="mnova",
+            min_value=0.0,
+            description=(
+                "Magnetic-equivalence J-vector tolerance (Hz). "
+                "Topological classes whose member J-vectors agree to "
+                "within this are classified HARD; mismatches → SOFT "
+                "(AA'BB' patterns)."
+            ),
+        ),
+        ConfigField(
+            name="mnova_tol_shift_ppm",
+            type="float",
+            default=DEFAULT_MNOVA_TOL_SHIFT_PPM,
+            section="mnova",
+            min_value=0.0,
+            description=(
+                "Data-aware refinement tolerance (ppm). Within a "
+                "topological class in a chiral molecule, members whose "
+                "DFT shifts spread above this get split into NONE "
+                "singletons (catches diastereotopic CH₂)."
+            ),
+        ),
+        ConfigField(
+            name="mnova_j_round_threshold_hz",
+            type="float",
+            default=DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ,
+            section="mnova",
+            min_value=0.0,
+            description=(
+                "Predicted |J| at or below this threshold gets "
+                "rounded to 0 before emission. Removes near-zero "
+                "long-range coupling noise. Set to 0 to disable."
+            ),
+        ),
+        ConfigField(
+            name="mnova_heteronuclear_partners",
+            type="csv",
+            default=[],
+            section="mnova",
+            coercer=_parse_partner_list,
+            depends_on=("smiles",),
+            description=(
+                "Additional elements (e.g., ``F``, ``P``) to include "
+                "as groups in EVERY primary-nucleus spin-system XML. "
+                "Required for ¹H-¹⁹F coupling to render in the ¹H "
+                "spectrum. Must coordinate with "
+                "``orca_thermo_array.coupling_pairs`` so ORCA actually "
+                "computes the cross-element J's."
+            ),
+        ),
+        ConfigField(
+            name="mnova_partner_shift_stub_ppm",
+            type="float",
+            default=100.0,
+            section="mnova",
+            description=(
+                "Placeholder shift (ppm) for partner-element atoms "
+                "whose σ wasn't parsed. Lands them outside typical "
+                "primary-nucleus windows so the J-driven splitting on "
+                "the primary spectrum is what shows."
+            ),
+        ),
+        # ----- Molecule diagrams -----
+        ConfigField(
+            name="diagrams_enabled",
+            type="bool",
+            default=True,
+            section="diagrams",
+            description=(
+                "Toggle for ``predicted_structure_<nuc>.svg`` and "
+                "``.html`` diagram artifacts. Reuses ``mnova_nuclei`` "
+                "to pick which nuclei to depict."
+            ),
+        ),
+        ConfigField(
+            name="diagrams_width",
+            type="int",
+            default=DEFAULT_DIAGRAM_WIDTH,
+            section="diagrams",
+            min_value=100,
+            description="Diagram canvas width (px).",
+        ),
+        ConfigField(
+            name="diagrams_height",
+            type="int",
+            default=DEFAULT_DIAGRAM_HEIGHT,
+            section="diagrams",
+            min_value=100,
+            description="Diagram canvas height (px).",
+        ),
+    ),
+)
+
+
 class NmrAggregate(Node):
     """Boltzmann-average NMR observables over a thermo-aggregated ensemble."""
 
@@ -1069,150 +1429,7 @@ class NmrAggregate(Node):
     requires_upstream = True
 
     def parse_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        solvent = (
-            normalize_optional_str(raw.get("solvent")) or DEFAULT_SOLVENT
-        )
-
-        shielding_method_h = (
-            normalize_optional_str(raw.get("shielding_method_h"))
-            or DEFAULT_SHIELDING_METHOD_H
-        )
-        shielding_basis_h = (
-            normalize_optional_str(raw.get("shielding_basis_h"))
-            or DEFAULT_SHIELDING_BASIS_H
-        )
-        shielding_method_c = (
-            normalize_optional_str(raw.get("shielding_method_c"))
-            or DEFAULT_SHIELDING_METHOD_C
-        )
-        shielding_basis_c = (
-            normalize_optional_str(raw.get("shielding_basis_c"))
-            or DEFAULT_SHIELDING_BASIS_C
-        )
-        coupling_method = (
-            normalize_optional_str(raw.get("coupling_method"))
-            or DEFAULT_COUPLING_METHOD
-        )
-        coupling_basis = (
-            normalize_optional_str(raw.get("coupling_basis"))
-            or DEFAULT_COUPLING_BASIS
-        )
-
-        output_shifts_csv = (
-            normalize_optional_str(raw.get("output_shifts_csv"))
-            or DEFAULT_OUTPUT_SHIFTS_CSV
-        )
-        output_couplings_csv = (
-            normalize_optional_str(raw.get("output_couplings_csv"))
-            or DEFAULT_OUTPUT_COUPLINGS_CSV
-        )
-        for name, val in (
-            ("output_shifts_csv", output_shifts_csv),
-            ("output_couplings_csv", output_couplings_csv),
-        ):
-            if "/" in val or val.startswith("."):
-                raise ValueError(f"{name} must be a basename, got {val!r}")
-
-        # mnova-spinsim XML emission knobs. SMILES is the topology
-        # source the equivalence detector needs; if absent, the
-        # emitter falls back to xyz perception (charge=0 assumed)
-        # and skips XML emission only if both routes fail.
-        smiles = normalize_optional_str(raw.get("smiles"))
-        mnova_enabled = parse_bool(raw.get("mnova_enabled"), True)
-        mnova_per_conformer = parse_bool(raw.get("mnova_per_conformer"), True)
-        mnova_nuclei = (
-            normalize_optional_str(raw.get("mnova_nuclei"))
-            or DEFAULT_MNOVA_NUCLEI
-        )
-        # Validate: each token must be one of the supported nuclei.
-        nuclei_tokens = [t.strip() for t in mnova_nuclei.split(",") if t.strip()]
-        for tok in nuclei_tokens:
-            if tok not in ("1H", "13C"):
-                raise ValueError(
-                    f"mnova_nuclei: unsupported token {tok!r}; "
-                    f"expected one of '1H', '13C' (comma-separated)"
-                )
-
-        return {
-            "solvent": solvent,
-            "shielding_method_h": shielding_method_h,
-            "shielding_basis_h": shielding_basis_h,
-            "shielding_method_c": shielding_method_c,
-            "shielding_basis_c": shielding_basis_c,
-            "coupling_method": coupling_method,
-            "coupling_basis": coupling_basis,
-            "output_shifts_csv": output_shifts_csv,
-            "output_couplings_csv": output_couplings_csv,
-            "skip_couplings": parse_bool(raw.get("skip_couplings"), False),
-            # mnova XML emission
-            "smiles": smiles,
-            "mnova_enabled": mnova_enabled,
-            "mnova_per_conformer": mnova_per_conformer,
-            "mnova_nuclei": ",".join(nuclei_tokens),
-            "mnova_field_mhz_h": parse_float(
-                raw.get("mnova_field_mhz_h"), DEFAULT_MNOVA_FIELD_MHZ_H
-            ),
-            "mnova_field_mhz_c": parse_float(
-                raw.get("mnova_field_mhz_c"), DEFAULT_MNOVA_FIELD_MHZ_C
-            ),
-            "mnova_line_width_hz_h": parse_float(
-                raw.get("mnova_line_width_hz_h"), DEFAULT_MNOVA_LINE_WIDTH_HZ_H
-            ),
-            "mnova_line_width_hz_c": parse_float(
-                raw.get("mnova_line_width_hz_c"), DEFAULT_MNOVA_LINE_WIDTH_HZ_C
-            ),
-            "mnova_from_ppm_h": parse_float(
-                raw.get("mnova_from_ppm_h"), DEFAULT_MNOVA_FROM_PPM_H
-            ),
-            "mnova_to_ppm_h": parse_float(
-                raw.get("mnova_to_ppm_h"), DEFAULT_MNOVA_TO_PPM_H
-            ),
-            "mnova_from_ppm_c": parse_float(
-                raw.get("mnova_from_ppm_c"), DEFAULT_MNOVA_FROM_PPM_C
-            ),
-            "mnova_to_ppm_c": parse_float(
-                raw.get("mnova_to_ppm_c"), DEFAULT_MNOVA_TO_PPM_C
-            ),
-            "mnova_points": parse_int(
-                raw.get("mnova_points"), DEFAULT_MNOVA_POINTS
-            ),
-            "mnova_tol_jcoupling_hz": parse_float(
-                raw.get("mnova_tol_jcoupling_hz"),
-                DEFAULT_MNOVA_TOL_JCOUPLING_HZ,
-            ),
-            "mnova_tol_shift_ppm": parse_float(
-                raw.get("mnova_tol_shift_ppm"),
-                DEFAULT_MNOVA_TOL_SHIFT_PPM,
-            ),
-            "mnova_j_round_threshold_hz": parse_float(
-                raw.get("mnova_j_round_threshold_hz"),
-                DEFAULT_MNOVA_J_ROUND_THRESHOLD_HZ,
-            ),
-            # Molecule-diagram artifacts (2D SVG + 3D HTML viewer).
-            # Reuses ``mnova_nuclei`` to decide which nuclei to depict.
-            "diagrams_enabled": parse_bool(raw.get("diagrams_enabled"), True),
-            "diagrams_width": parse_int(
-                raw.get("diagrams_width"), DEFAULT_DIAGRAM_WIDTH
-            ),
-            "diagrams_height": parse_int(
-                raw.get("diagrams_height"), DEFAULT_DIAGRAM_HEIGHT
-            ),
-            # Heteronuclear partners — comma-separated element symbols
-            # (e.g., "F,P") to include in EVERY primary nucleus's
-            # spin-system XML so cross-element J's (¹H-¹⁹F, ¹³C-¹⁹F,
-            # etc.) are captured. The partner atoms appear as
-            # additional <group>s in the same <spin-system>; their
-            # shifts are taken from parsed shielding data when
-            # available, else fall back to a stub placeholder so they
-            # land far outside the primary nucleus's spectrum window.
-            # Empty (default) → homonuclear-only.
-            "mnova_heteronuclear_partners": _parse_partner_list(
-                raw.get("mnova_heteronuclear_partners")
-            ),
-            "mnova_partner_shift_stub_ppm": parse_float(
-                raw.get("mnova_partner_shift_stub_ppm"), 100.0
-            ),
-        }
+        return apply_schema(raw, SCHEMA)
 
     def run(self, ctx: NodeContext) -> None:
         cfg = ctx.config
