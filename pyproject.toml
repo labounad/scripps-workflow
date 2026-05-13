@@ -52,6 +52,12 @@ chem = [
 prism = [
     "prism-pruner",
 ]
+# DB ingest node (wf-db-ingest) — pulls in nmr-data + its PostgreSQL stack.
+# nmr-data is a PRIVATE Scripps repo, so this install requires GitHub
+# auth (gh-auth credential helper or SSH). Lab-internal only.
+db = [
+    "nmr-data @ git+https://github.com/labounad/nmr-data.git",
+]
 # Test suite.
 test = [
     "pytest>=7.4",
@@ -59,7 +65,7 @@ test = [
 ]
 # Everything (for development).
 all = [
-    "scripps-workflow[gui,chem,prism,test]",
+    "scripps-workflow[gui,chem,prism,db,test]",
 ]
 
 [project.scripts]
@@ -75,6 +81,7 @@ wf-orca-dft-array    = "scripps_workflow.nodes.orca_dft_array:main"
 wf-orca-thermo-array = "scripps_workflow.nodes.orca_thermo_array:main"
 wf-thermo-aggregate  = "scripps_workflow.nodes.thermo_aggregate:main"
 wf-nmr-aggregate     = "scripps_workflow.nodes.nmr_aggregate:main"
+wf-db-ingest         = "scripps_workflow.nodes.db_ingest:main"
 wf-tag-input         = "scripps_workflow.nodes.tag_input:main"
 
 # GUI round-trip tooling.
