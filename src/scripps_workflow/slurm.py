@@ -519,15 +519,31 @@ def standard_orca_per_task_body(
     Both DFT-array and thermo-array share the same shape; only the
     filenames differ. Captures the ORCA exit code via the bare-call
     pattern (``orca ...; rc=$?``) rather than ``if ! orca ...`` so
-    that ``$?`` inside an ``else`` branch reflects the real rc rather
-    than the inverted pipeline status. Also requires the ``.out`` file
-    to end in ``ORCA TERMINATED NORMALLY`` — catches the case where
-    ORCA exits 0 after a recoverable input warning but didn't actually
+    that ``$?`` reflects the real rc rather than the inverted
+    pipeline status. Also requires the ``.out`` file to end in
+    ``ORCA TERMINATED NORMALLY`` — catches the case where ORCA
+    exits 0 after a recoverable input warning but didn't actually
     finish the requested calculation.
+
+    ``set -e`` is suspended across the ORCA call so a non-zero exit
+    lands in ``rc`` instead of killing the shell before ``mark_failure``
+    runs. Re-enabled immediately afterwards so the rest of the body
+    keeps the fail-fast behaviour.
     """
+    # NOTE: tests in test_slurm.py do substring ``body.index(...)``
+    # on the rendered body to verify directive ordering across the
+    # ORCA call. Keep these literal tokens OUT of the comments below
+    # so a comment hit doesn't shadow the real directive position:
+    #   ``set +e``, ``set -e``, ``rc=$?``, ``mark_failure``, ``${ORCA_BIN}``
+    # Phrasing has been chosen to avoid all of the above.
     return (
+        f"# Briefly relax fail-fast across the calculation invocation\n"
+        f"# below; the exit status is captured into a local variable\n"
+        f"# so the failure path can run cleanly.\n"
+        f"set +e\n"
         f'"${{ORCA_BIN}}" "{inp_filename}" > "{out_filename}"\n'
         f"rc=$?\n"
+        f"set -e\n"
         f'if [[ "${{rc}}" -ne 0 ]]; then\n'
         f'  echo "[wf-array] task=${{TASK_ID}} ORCA failed rc=${{rc}}" >&2\n'
         f'  mark_failure "${{rc}}"\n'
@@ -562,11 +578,17 @@ def multi_orca_per_task_body(
     this helper produces a body equivalent to
     :func:`standard_orca_per_task_body`.
 
-    Exit-code capture: the body uses a ``run_orca_job`` helper rather
-    than an ``if ! orca ...; then rc=$?`` shape, because the leading
-    ``!`` inverts the pipeline status to 0 inside the ``then`` block,
-    masking the real rc. Capturing rc immediately after the bare
-    invocation (``orca ...; rc=$?``) preserves it.
+    Exit-code capture: the script body runs under ``set -euo
+    pipefail`` (inherited from the array wrapper). With ``set -e``
+    active, a non-zero ORCA exit aborts the shell BEFORE the next
+    line (``local rc=$?``) executes — so a naïve ``orca ...; rc=$?``
+    misses the failure entirely and ``mark_failure`` never fires.
+    The fix below temporarily disables ``set -e`` around the ORCA
+    call, captures rc, then re-enables ``-e`` so the rest of the
+    function still benefits from fail-fast. The earlier alternative
+    of ``if ! orca ...; then`` also fails — the ``!`` inverts the
+    pipeline status to 0 inside the ``then`` block, masking the
+    real rc.
 
     :param jobs: Ordered list of ``(inp, out)`` filename pairs
         (relative to the task dir). Must contain at least one entry.
@@ -574,12 +596,22 @@ def multi_orca_per_task_body(
     if not jobs:
         raise ValueError("multi_orca_per_task_body: jobs must be non-empty")
 
+    # NOTE: tests use substring index() on the rendered body to check
+    # directive ordering. Keep these literal tokens OUT of any inner
+    # comment emitted by this helper so a comment hit doesn't shadow
+    # the real directive position:
+    #   ``set +e``, ``set -e``, ``rc=$?``, ``mark_failure``, ``${ORCA_BIN}``
     helper = (
         'run_orca_job() {\n'
         '  local idx="$1"; local total="$2"; local inp="$3"; local out="$4"\n'
         '  echo "[wf-array] task=${TASK_ID} job ${idx}/${total}: ${inp} -> ${out}"\n'
+        '  # Briefly relax fail-fast across the calculation invocation\n'
+        '  # below; the exit status is captured into a local variable\n'
+        '  # so the failure path can run cleanly.\n'
+        '  set +e\n'
         '  "${ORCA_BIN}" "${inp}" > "${out}"\n'
         '  local rc=$?\n'
+        '  set -e\n'
         '  if [[ "${rc}" -ne 0 ]]; then\n'
         '    echo "[wf-array] task=${TASK_ID} ORCA job ${idx}/${total} (${inp}) failed rc=${rc}" >&2\n'
         '    mark_failure "${rc}"\n'

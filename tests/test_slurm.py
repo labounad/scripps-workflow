@@ -580,6 +580,26 @@ class TestStandardOrcaPerTaskBody:
         assert '"orca_thermo.inp"' in body
         assert '"orca_thermo.out"' in body
 
+    def test_set_e_suspended_across_orca_call(self):
+        # Regression: under ``set -euo pipefail`` (inherited from the
+        # array wrapper), a non-zero ORCA exit terminates the shell
+        # before ``rc=$?`` runs — so mark_failure never fires and the
+        # task ends with no clean done_failed marker. Wrapping the
+        # ORCA call in set +e / set -e fixes this.
+        body = standard_orca_per_task_body(
+            inp_filename="orca.inp", out_filename="orca.out"
+        )
+        assert "set +e" in body
+        assert "set -e" in body
+        # And in the right order: +e BEFORE the ORCA call, -e AFTER rc
+        # capture but BEFORE mark_failure.
+        i_plus = body.index("set +e")
+        i_call = body.index('"${ORCA_BIN}" "orca.inp"')
+        i_rc = body.index("rc=$?")
+        i_minus = body.index("set -e")
+        i_fail = body.index("mark_failure")
+        assert i_plus < i_call < i_rc < i_minus < i_fail
+
 
 # --------------------------------------------------------------------
 # sacct_failures_for_array
