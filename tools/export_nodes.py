@@ -245,6 +245,11 @@ NODES: dict[str, NodeSpec] = {
                 "coupling_method", "coupling_basis",
                 "skip_couplings",
                 "output_shifts_csv", "output_couplings_csv",
+                # Larmor frequencies — surfaced so the GUI can drive
+                # different spectrometer fields (400 / 600 / 800 MHz)
+                # from the production workflow without editing the
+                # node module's defaults.
+                "mnova_field_mhz_h", "mnova_field_mhz_c",
             ],
         ),
     ]
