@@ -806,7 +806,7 @@ Set ``OMPI_MCA_btl=^openib`` to silence the verbose Infiniband warnings on the S
 #### `singlepoint_keywords`
 
 - **Type:** `str`
-- **Default:** `"wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3"`
+- **Default:** `"wB97M-V def2-TZVPP TightSCF DEFGRID3"`
 
 ORCA simple-input line for the high-level SP appended after the freq job via ``$new_job``. Combined with ``keywords`` (low-level freq), the downstream thermo aggregator computes a composite Gibbs energy. Explicitly passing this key with an empty / null value disables the SP step entirely — i.e. the run degrades to pure freq+thermo at ``keywords``.
 

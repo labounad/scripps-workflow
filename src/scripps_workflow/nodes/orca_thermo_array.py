@@ -47,7 +47,7 @@ Config keys (``key=value`` tokens or one JSON object) — same shape as
     smd_solvent            verbatim SMDsolvent override                 [None]
     keywords               First-job ``!`` line (the freq calc)         ["r2scan-3c TightSCF Freq"]
     singlepoint_keywords   Second-job ``!`` line, or null/none/"" to
-                           skip the SP step entirely.                   ["wB97M-V def2-TZVPP TightSCF"]
+                           skip the SP step entirely.                   ["wB97M-V def2-TZVPP TightSCF DEFGRID3"]
     maxcore                MB per ORCA process (clamped to >= 500)      [4000]
     nprocs                 ``%pal nprocs`` and ``--ntasks``              [8]
     time_limit             SBATCH ``-t``                                ["12:00:00"]
@@ -158,7 +158,14 @@ DEFAULT_KEYWORDS: str = "r2scan-3c TightSCF Freq"
 #: ``G_composite = E_SP_high + (G - E_el)_low``. Set
 #: ``singlepoint_keywords=none`` (or ``""``) at config time to disable
 #: the SP step entirely and run a plain single-job freq calculation.
-DEFAULT_SINGLEPOINT_KEYWORDS: str = "wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3"
+#:
+#: Note: ``RIJCOSX`` is intentionally absent. Under ORCA 6.0.0 the
+#: conventional-integral default rejects RIJCOSX with "Conventional
+#: integral handling with RIJCOSX approximation does not yet work."
+#: If you need the RIJCOSX speedup, add ``DIRECT`` (forces direct-mode
+#: SCF) to the keywords explicitly — e.g.
+#: ``wB97M-V def2-TZVPP TightSCF RIJCOSX DEFGRID3 DIRECT``.
+DEFAULT_SINGLEPOINT_KEYWORDS: str = "wB97M-V def2-TZVPP TightSCF DEFGRID3"
 
 #: Default ORCA ``%pal nprocs`` (and SLURM ``--ntasks``). Matches the
 #: rest of the array nodes' default of 8 — Frequency calculations
