@@ -60,7 +60,7 @@ Config keys (``key=value`` tokens or one JSON object):
 
     temperature_k    K used for ΔG / weight columns               [298.15]
     standard_state   "1atm" or "1M" — only "1M" applies the
-                     RT·ln(24.46) correction to ``deltaG_kcal``.   ["1atm"]
+                     RT·ln(24.46) correction to ``deltaG_kcal``.    ["1m"]
     output_csv       basename of the per-conformer CSV in
                      ``outputs/``                          ["conformer_thermo.csv"]
     fail_policy      "soft" or "hard" — soft (default) keeps
@@ -95,10 +95,12 @@ from ..thermo import (
 #: legacy ``orca_thermo_aggregator`` script.
 DEFAULT_TEMPERATURE_K: float = 298.15
 
-#: Default standard-state token. ``1atm`` keeps ΔG values referenced to
-#: the gas-phase 1 atm convention (no correction); ``1M`` applies the
-#: Ben-Naim RT·ln(24.46) shift to the relative ΔG column.
-DEFAULT_STANDARD_STATE: str = "1atm"
+#: Default standard-state token. ``1m`` applies the Ben-Naim
+#: RT·ln(24.46) shift to the relative ΔG column — the convention the
+#: Scripps lab uses for solution-phase comparisons. Pass ``1atm``
+#: explicitly to suppress the correction and keep the gas-phase
+#: reference instead.
+DEFAULT_STANDARD_STATE: str = "1m"
 
 #: Default basename of the per-conformer thermo CSV. Lives at
 #: ``outputs/<this>`` in the call's directory.

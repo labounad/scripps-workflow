@@ -589,7 +589,9 @@ class TestParseConfig:
     def test_defaults(self):
         cfg = ThermoAggregate().parse_config({})
         assert cfg["temperature_k"] == 298.15
-        assert cfg["standard_state"] == "1atm"
+        # 1m is the Scripps lab convention for solution-phase ΔG —
+        # see DEFAULT_STANDARD_STATE in thermo_aggregate.py.
+        assert cfg["standard_state"] == "1m"
         assert cfg["output_csv"] == "conformer_thermo.csv"
 
     def test_explicit_temperature(self):
@@ -642,8 +644,11 @@ class TestHappyPath:
         assert s["n_conformers"] == 3
         assert s["n_with_G"] == 3
         assert s["temperature_k"] == 298.15
-        assert s["standard_state"] == "1atm"
-        assert s["std_state_corr_kcal"] == 0.0
+        # 1m is the default standard state now (solution-phase
+        # convention). Std-state correction is RT·ln(24.46), ≈ 1.894
+        # kcal/mol at 298.15 K.
+        assert s["standard_state"] == "1m"
+        assert s["std_state_corr_kcal"] == pytest.approx(1.894, abs=1e-3)
         assert s["Gmin_eh"] is not None
 
     def test_conformers_bucket_populated(self, tmp_path):
@@ -839,7 +844,7 @@ class TestNodeWiring:
 
     def test_constants(self):
         assert ta.DEFAULT_TEMPERATURE_K == 298.15
-        assert ta.DEFAULT_STANDARD_STATE == "1atm"
+        assert ta.DEFAULT_STANDARD_STATE == "1m"
         assert ta.DEFAULT_OUTPUT_CSV == "conformer_thermo.csv"
 
     def test_csv_columns_locked(self):
