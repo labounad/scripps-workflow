@@ -660,7 +660,10 @@ class TestHappyPath:
         # at task 3), so deltaG is highest for task 1.
         dGs = [c["deltaG_kcal"] for c in confs]
         assert dGs[0] > dGs[1] > dGs[2]
-        assert dGs[2] == pytest.approx(0.0)
+        # Under the default 1m standard state, the lowest deltaG ends
+        # up at the constant RT·ln(24.46) shift (~1.894 kcal/mol at
+        # 298.15K). Was 0.0 back when 1atm was the default.
+        assert dGs[2] == pytest.approx(1.894, abs=1e-3)
         # Boltzmann weights sum to 1.
         ws = [c["boltzmann_weight"] for c in confs]
         assert sum(ws) == pytest.approx(1.0)
@@ -677,9 +680,13 @@ class TestHappyPath:
     def test_1m_shifts_csv_dg_by_constant(self, tmp_path):
         # Run twice — same fake upstream — once with 1atm, once with 1M.
         # The CSV dG values should differ by exactly RT*ln(24.46).
+        # Both standard_state values are passed explicitly because the
+        # node default is now 1m, and we want this test to keep
+        # asserting the 1atm-vs-1m delta even if the default flips
+        # again later.
         from scripps_workflow.thermo import rt_ln_24_46_kcal
 
-        m1 = _run_node(tmp_path / "a")
+        m1 = _run_node(tmp_path / "a", "standard_state=1atm")
         m2 = _run_node(tmp_path / "b", "standard_state=1M")
         files_a = {f["label"]: f for f in m1["artifacts"]["files"]}
         files_b = {f["label"]: f for f in m2["artifacts"]["files"]}
