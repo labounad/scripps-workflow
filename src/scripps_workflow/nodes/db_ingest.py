@@ -173,6 +173,26 @@ def _load_thermo_manifest(nmr_manifest_dict: dict[str, Any]) -> dict[str, Any] |
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def _thermo_manifest_path(nmr_manifest_dict: dict[str, Any]) -> Path | None:
+    """Return the on-disk path of the upstream thermo_aggregate manifest,
+    or None if it isn't reachable."""
+    upstream = nmr_manifest_dict.get("upstream") or {}
+    manifest_path = upstream.get("manifest_path")
+    if not manifest_path:
+        return None
+    p = Path(manifest_path)
+    return p if p.exists() else None
+
+
+def _node_script_path(manifest_path: Path) -> Path | None:
+    """Locate the engine-rendered ``script.sh`` for the call that produced
+    ``manifest_path``. Engine layout: ``<call_dir>/script.sh`` and
+    ``<call_dir>/outputs/manifest.json`` — so the script sits one level
+    up from outputs/. Returns None if it isn't there."""
+    candidate = manifest_path.parent.parent / "script.sh"
+    return candidate if candidate.exists() else None
+
+
 def _collect_conformer_records(thermo_dict: dict[str, Any]) -> list[dict[str, Any]]:
     """Pull the conformers bucket out of the thermo_aggregate manifest dict."""
     arts = thermo_dict.get("artifacts") or {}
@@ -270,6 +290,7 @@ class DbIngest(Node):
 
         # ---- 4) Load thermo_aggregate manifest for conformer records ----
         thermo_dict = _load_thermo_manifest(nmr_dict)
+        thermo_manifest_path: Path | None = _thermo_manifest_path(nmr_dict)
         if thermo_dict is None:
             # Non-fatal: proceed without conformer energy data
             ctx.manifest.add_failure(
@@ -279,6 +300,26 @@ class DbIngest(Node):
             conformer_records: list[dict[str, Any]] = []
         else:
             conformer_records = _collect_conformer_records(thermo_dict)
+
+        # ---- 4a) Paths for the central-tree copy step ----
+        # nmr_aggregate's manifest itself is the upstream pointer's
+        # manifest_path. The outputs/ dir is its parent — that's where
+        # the mnova XMLs, structure diagrams, and nmr_summary.json live.
+        nmr_manifest_path: Path | None = None
+        nmr_outputs_dir: Path | None = None
+        nmr_script_path: Path | None = None
+        if ctx.upstream_pointer is not None:
+            upm = Path(ctx.upstream_pointer.manifest_path)
+            if upm.exists():
+                nmr_manifest_path = upm
+                nmr_outputs_dir = upm.parent
+                nmr_script_path = _node_script_path(upm)
+
+        # thermo_aggregate's outputs/ dir similarly sits next to its
+        # manifest — that's where conformer_thermo.csv lives.
+        thermo_outputs_dir: Path | None = (
+            thermo_manifest_path.parent if thermo_manifest_path else None
+        )
 
         # ---- 5) Optional config values ----
         # cas_number is auto-resolved from the SMILES inside
@@ -334,6 +375,11 @@ class DbIngest(Node):
                     source=cfg["source"],
                     external_id=external_id,
                     hpc_data_root=hpc_data_root,
+                    nmr_manifest_path=nmr_manifest_path,
+                    thermo_manifest_path=thermo_manifest_path,
+                    nmr_outputs_dir=nmr_outputs_dir,
+                    thermo_outputs_dir=thermo_outputs_dir,
+                    nmr_script_path=nmr_script_path,
                 )
         finally:
             # Restore original env var
