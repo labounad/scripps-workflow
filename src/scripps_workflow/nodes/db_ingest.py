@@ -52,13 +52,40 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from ..config_schema import ConfigField, NodeSchema, apply_schema
+from ..logging_utils import log_info, log_warn
 from ..node import Node, NodeContext
 from ..parsing import normalize_optional_str, parse_bool
 from ..schema import Manifest
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+
+_PWD_RE = re.compile(r"(://[^:@/]+:)[^@]+(@)")
+
+
+def _mask_db_url(url: str) -> str:
+    """Replace the password component of a postgresql:// URL with ``***``.
+
+    Logs are stderr-only, but they still end up in the engine's per-call
+    stderr file under cwd/, which is world-readable on shared filesystems
+    by default. Masking keeps any literal password baked into the URL out
+    of those logs."""
+    if not url:
+        return ""
+    return _PWD_RE.sub(r"\1***\2", url)
+
+
+def _short_path(p: Any) -> str:
+    """Render a Path-ish thing concisely for log lines (str + None-safe)."""
+    return "<none>" if p is None else str(p)
 
 # ---------------------------------------------------------------------------
 # Optional nmr_data import — node fails gracefully if not installed
@@ -218,6 +245,8 @@ class DbIngest(Node):
     def run(self, ctx: NodeContext) -> None:  # noqa: C901
         cfg = ctx.config
 
+        log_info("db_ingest starting")
+
         # ---- 0) Dependency check ----
         if not _HAS_NMR_DATA:
             ctx.fail(
@@ -228,6 +257,7 @@ class DbIngest(Node):
                 ),
             )
             return
+        log_info("[0/8] nmr_data package available")
 
         # ---- 1) Resolve DB URL (not required for dry_run) ----
         dry_run = bool(cfg.get("dry_run", False))
@@ -244,6 +274,17 @@ class DbIngest(Node):
                 ),
             )
             return
+        if dry_run:
+            log_info("[1/8] dry_run=True — DB write will be skipped")
+        else:
+            db_source = (
+                "config.database_url"
+                if cfg.get("database_url")
+                else "NMR_DATABASE_URL env"
+            )
+            log_info(
+                f"[1/8] database_url={_mask_db_url(database_url)} (from {db_source})"
+            )
 
         # ---- 2) Read nmr_aggregate manifest ----
         if ctx.upstream_manifest is None:
@@ -266,6 +307,17 @@ class DbIngest(Node):
 
         # NMR method params (used to populate the predicted_runs row)
         nmr_inputs = nmr_dict.get("inputs", {})
+        log_info(
+            f"[2/8] upstream manifest read: smiles={smiles!r}, "
+            f"solvent={nmr_inputs.get('solvent')!r}, "
+            f"T={nmr_inputs.get('temperature_k')}, "
+            f"shielding_h={nmr_inputs.get('shielding_method_h')}/"
+            f"{nmr_inputs.get('shielding_basis_h')}, "
+            f"shielding_c={nmr_inputs.get('shielding_method_c')}/"
+            f"{nmr_inputs.get('shielding_basis_c')}, "
+            f"coupling={nmr_inputs.get('coupling_method')}/"
+            f"{nmr_inputs.get('coupling_basis')}"
+        )
 
         # ---- 3) Locate CSV files ----
         shifts_path_str = _find_artifact_by_label(nmr_dict, "files", "predicted_shifts_csv")
@@ -287,6 +339,12 @@ class DbIngest(Node):
         if not couplings_path.exists():
             ctx.fail("couplings_csv_missing_on_disk", path=couplings_path_str)
             return
+        log_info(
+            f"[3/8] located CSVs: shifts={shifts_path.name} "
+            f"({_count_csv_rows(shifts_path)} rows), "
+            f"couplings={couplings_path.name} "
+            f"({_count_csv_rows(couplings_path)} rows)"
+        )
 
         # ---- 4) Load thermo_aggregate manifest for conformer records ----
         thermo_dict = _load_thermo_manifest(nmr_dict)
@@ -297,9 +355,17 @@ class DbIngest(Node):
                 "thermo_manifest_unavailable",
                 detail="Conformers will be ingested without energy data.",
             )
+            log_warn(
+                "[4/8] thermo_aggregate manifest unavailable — "
+                "conformers will land without energy data"
+            )
             conformer_records: list[dict[str, Any]] = []
         else:
             conformer_records = _collect_conformer_records(thermo_dict)
+            log_info(
+                f"[4/8] thermo manifest loaded "
+                f"({len(conformer_records)} conformer record(s))"
+            )
 
         # ---- 4a) Paths for the central-tree copy step ----
         # nmr_aggregate's manifest itself is the upstream pointer's
@@ -331,6 +397,23 @@ class DbIngest(Node):
             or None
         )
         dry_run = bool(cfg.get("dry_run", False))
+        log_info(
+            f"[5/8] central tree: hpc_data_root={_short_path(hpc_data_root)}"
+        )
+        log_info(
+            f"      nmr_outputs_dir={_short_path(nmr_outputs_dir)}, "
+            f"thermo_outputs_dir={_short_path(thermo_outputs_dir)}"
+        )
+        log_info(
+            f"      script={_short_path(nmr_script_path)}, "
+            f"nmr_manifest={_short_path(nmr_manifest_path)}, "
+            f"thermo_manifest={_short_path(thermo_manifest_path)}"
+        )
+        if hpc_data_root is None:
+            log_warn(
+                "      no hpc_data_root resolved — artifacts will NOT be "
+                "copied to the central tree, only DB rows will be written"
+            )
 
         ctx.set_inputs(
             smiles=smiles,
@@ -347,21 +430,31 @@ class DbIngest(Node):
                 _resolve_cas_from_smiles,
             )
             inchikey = _compute_inchikey(smiles)
+            log_info(f"[6/8] dry-run: derived InChIKey={inchikey}")
             # Fire the CAS resolver here too so the dry-run manifest
             # shows whatever the real ingest path would have stored.
             # Returns None on network failure / timeout / no match —
             # safe to surface either way.
             cas_number = _resolve_cas_from_smiles(smiles)
+            log_info(
+                f"      CAS lookup: {cas_number!r}"
+                + ("" if cas_number else " (none returned)")
+            )
             ctx.set_input("dry_run_inchikey", inchikey)
             ctx.set_input("dry_run_cas_number", cas_number)
             ctx.set_input("dry_run_shifts_rows", _count_csv_rows(shifts_path))
             ctx.set_input("dry_run_couplings_rows", _count_csv_rows(couplings_path))
+            log_info(
+                "[7/8] dry_run=True — NOT writing to DB, NOT copying to central tree"
+            )
+            log_info("[8/8] db_ingest finished (dry run)")
             return  # success, nothing written
 
         # ---- 7) Write to DB ----
         # Temporarily override the NMR_DATABASE_URL so nmr_data.config picks it up
         _orig_url = os.environ.get("NMR_DATABASE_URL")
         os.environ["NMR_DATABASE_URL"] = database_url
+        log_info("[6/8] opening DB session and running ingest...")
 
         try:
             with get_session() as session:
@@ -389,6 +482,33 @@ class DbIngest(Node):
                 os.environ["NMR_DATABASE_URL"] = _orig_url
 
         # ---- 8) Record summary ----
+        # is_new_* tell us which rows were created vs reused (idempotency).
+        mol_state = "NEW" if summary.get("is_new_molecule") else "existing"
+        run_state = "NEW" if summary.get("is_new_predicted_run") else "existing"
+        log_info(
+            f"[7/8] DB write OK: molecule={summary.get('inchikey')} [{mol_state}], "
+            f"run={summary.get('run_id')} [{run_state}]"
+        )
+        log_info(
+            f"      rows: n_conformers={summary.get('n_conformers')}, "
+            f"n_shifts={summary.get('n_shifts')}, "
+            f"n_couplings={summary.get('n_couplings')}"
+        )
+        if "run_root_path" in summary:
+            if summary.get("artifacts_already_existed"):
+                log_info(
+                    f"      central tree: {summary['run_root_path']} "
+                    f"(already existed — idempotent skip, 0 files copied)"
+                )
+            else:
+                log_info(
+                    f"      central tree: {summary['run_root_path']} "
+                    f"({summary.get('n_files_copied', 0)} files copied)"
+                )
+        else:
+            log_info("      central tree: not copied (no hpc_data_root)")
+        log_info("[8/8] db_ingest finished")
+
         ctx.set_inputs(**summary)
 
 
