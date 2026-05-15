@@ -70,24 +70,37 @@ from .xtb_calc import (
 # --------------------------------------------------------------------
 # Optional nmr_data import — cache check is best-effort. If the package
 # isn't installed (dev sandbox, light CI), CREST runs normally.
+#
+# We capture the actual import-error string so the cache-miss log can
+# surface it. Silent "nmr_data not importable" is undebuggable; an
+# attached reason tells the operator whether to pip install, git pull,
+# fix an env, or chase a real bug.
 # --------------------------------------------------------------------
 
+_NMR_DATA_IMPORT_ERROR: str | None = None
+_RDKIT_IMPORT_ERROR: str | None = None
+
 try:
-    from nmr_data.cache import EnsembleKey, find_ensemble, fingerprint as _cache_fingerprint
+    from nmr_data.cache import (  # noqa: F401
+        EnsembleKey,
+        find_ensemble,
+        fingerprint as _cache_fingerprint,
+    )
     from nmr_data.db import get_session
     from nmr_data.models import Molecule
 
-    try:
-        from rdkit.Chem.inchi import MolToInchiKey  # type: ignore[attr-defined]
-        from rdkit import Chem
-        _HAS_RDKIT = True
-    except ImportError:
-        _HAS_RDKIT = False
-
     _HAS_NMR_DATA = True
-except ImportError:
+except Exception as _e:  # broad catch: pydantic_core / sqlalchemy / etc. surface here too
     _HAS_NMR_DATA = False
+    _NMR_DATA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    from rdkit.Chem.inchi import MolToInchiKey  # type: ignore[attr-defined]
+    from rdkit import Chem
+    _HAS_RDKIT = True
+except Exception as _e:
     _HAS_RDKIT = False
+    _RDKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 # --------------------------------------------------------------------
@@ -790,7 +803,14 @@ class CrestConformerSearch(Node):
             return False
         if not _HAS_NMR_DATA:
             logging_utils.log_info(
-                "crest cache: nmr_data not importable, skipping check"
+                f"crest cache: nmr_data not importable ({_NMR_DATA_IMPORT_ERROR}), "
+                f"skipping check"
+            )
+            return False
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"crest cache: rdkit not importable ({_RDKIT_IMPORT_ERROR}), "
+                f"skipping check (need it to compute InChIKey from SMILES)"
             )
             return False
 
