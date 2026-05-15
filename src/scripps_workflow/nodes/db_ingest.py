@@ -13,22 +13,40 @@ going through the pipeline.
 Config keys (``key=value`` tokens or one JSON object)::
 
     database_url     PostgreSQL connection string. Falls back to
-                     NMR_DATABASE_URL env var if omitted.          [None]
+                     NMR_DATABASE_URL env var if omitted. Required
+                     unless ``dry_run`` is set.                     [""]
     source           Molecule provenance tag:
-                     "virtual_library" | "lab_internal"            ["virtual_library"]
-    cas_number       CAS registry number for the molecule.         [None]
-    external_id      Any external identifier (compound ID, etc).   [None]
+                     "virtual_library" | "lab_internal".            ["virtual_library"]
+    cas_number       CAS registry number for the molecule.          [""]
+    external_id      Any external identifier (virtual-library ID,
+                     internal compound number, etc.).               [""]
     hpc_data_root    Absolute HPC path under which .xyz and HDF5
-                     files live. Falls back to NMR_HPC_DATA_ROOT
-                     env var. Used to store relative file paths.   [None]
-    dry_run          Parse everything, log what would be written,
-                     but do NOT commit to the DB.                   [false]
-    fail_policy      "soft" or "hard".                             ["soft"]
+                     files live; .xyz and HDF5 paths stored in the
+                     DB are made relative to this root. Falls back
+                     to NMR_HPC_DATA_ROOT env var.                  [""]
+    dry_run          Parse the upstream manifest + locate CSVs,
+                     log what would be written, but do NOT commit
+                     any rows to the database.                      [false]
+
+Upstream contract — wf-nmr-aggregate MUST carry a ``smiles`` field in
+its parsed inputs, otherwise this node fails with
+``smiles_missing_from_upstream``. The NMR Predictor recipe binds the
+SMILES widget into both ``wf-embed.smiles`` and ``wf-nmr-aggregate.smiles``
+for exactly this reason. If you wire the workflow by hand in the GUI,
+remember to add the second binding.
 
 Requires:
-    * ``nmr-data`` package installed in the same Python environment
-      (``pip install nmr-data[ingest]``).
-    * NMR_DATABASE_URL environment variable (or ``database_url`` config key).
+    * ``nmr-data`` Python package importable from the same env as
+      this node. Pulled in via the ``db`` optional-deps group of
+      ``scripps-workflow`` itself::
+
+          pip install -e ".[db]"
+
+      (which resolves ``nmr-data @ git+https://github.com/labounad/nmr-data.git``).
+    * ``NMR_DATABASE_URL`` env var (or ``database_url`` config key)
+      pointing at a PostgreSQL instance with the ``nmr-data`` schema
+      already migrated. ``NMR_HPC_DATA_ROOT`` (or ``hpc_data_root``)
+      controls path-relativization for stored file references.
 """
 
 from __future__ import annotations

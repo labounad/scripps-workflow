@@ -128,6 +128,14 @@ def build() -> Workflow:
     # calibration-table lookup — same key, same value.
     wf.bind(solvent, to=[xtb, crest, dftopt, thermo, aggNmr], key="solvent")
 
+    # SMILES is bound to both the source-process embed step (via the
+    # pointer above) AND to nmr-aggregate, so the molecule identity
+    # survives into the nmr_aggregate manifest. wf-db-ingest reads
+    # ``inputs.smiles`` off that manifest to look up / insert the
+    # molecules row — without this bind it fails with
+    # ``smiles_missing_from_upstream``.
+    wf.bind(smiles, to=aggNmr, key="smiles")
+
     # xTB / CREST knobs.
     wf.bind(xtb_theory, to=[xtb, crest], key="theory")
     wf.bind(crest_mode, to=crest,        key="mode")

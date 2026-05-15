@@ -239,6 +239,11 @@ NODES: dict[str, NodeSpec] = {
             module="nmr_aggregate",
             description="Boltzmann-averaged DFT NMR shifts + couplings with cheshire / Bally-Rablen calibration.",
             inputs=[
+                # ``smiles`` is plumbed through so wf-db-ingest can read
+                # the molecule identity off the nmr_aggregate manifest
+                # (its ``inputs.smiles`` key). Without this, db_ingest
+                # aborts with ``smiles_missing_from_upstream``.
+                "smiles",
                 "solvent",
                 "shielding_method_h", "shielding_basis_h",
                 "shielding_method_c", "shielding_basis_c",
