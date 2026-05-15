@@ -305,11 +305,23 @@ SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 # so without this loop those hooks would never fire and any node
 # that relies on env-var config (wf_db_ingest is the obvious one)
 # would die with "no_database_url" or similar.
+#
+# Two prerequisites for the source-only path:
+#   1. CONDA_PREFIX / CONDA_DEFAULT_ENV: conda's bundled hooks (libglib,
+#      etc.) reference these. We synthesize them from ENV_PY so the
+#      hooks see what `conda activate` would normally have set.
+#   2. set +u: many third-party activation hooks aren't written
+#      defensively and dereference other unset variables. Suspend
+#      ``set -u`` for the source loop, then restore it.
 ACT_DIR="$(dirname "$ENV_PY")/../etc/conda/activate.d"
 if [ -d "$ACT_DIR" ]; then
+    export CONDA_PREFIX="$(cd "$(dirname "$ENV_PY")/.." && pwd)"
+    export CONDA_DEFAULT_ENV="$(basename "$CONDA_PREFIX")"
+    set +u
     for hook in "$ACT_DIR"/*.sh; do
         [ -r "$hook" ] && . "$hook"
     done
+    set -u
 fi
 
 # Prevent Franken-Python via inherited env vars
