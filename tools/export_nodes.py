@@ -252,6 +252,28 @@ NODES: dict[str, NodeSpec] = {
                 "mnova_field_mhz_h", "mnova_field_mhz_c",
             ],
         ),
+        # --- persistence ---
+        NodeSpec(
+            name="wf-db-ingest",
+            module="db_ingest",
+            description=(
+                "Persist wf-nmr-aggregate outputs (shifts, couplings, "
+                "conformer thermochemistry) into the nmr-data PostgreSQL "
+                "database. Molecule rows dedupe by InChIKey, so re-runs "
+                "for the same compound are safe."
+            ),
+            inputs=[
+                "database_url",
+                "source",
+                "cas_number", "external_id",
+                "hpc_data_root",
+                "dry_run",
+            ],
+            # nmr-data ships against the Python 3.12 stack on the
+            # cluster (modern SQLAlchemy / psycopg). If the lab ever
+            # standardizes on 3.11 for ingest, drop this override.
+            env_py=ENV_PY_312,
+        ),
     ]
 }
 
@@ -359,6 +381,27 @@ def derive_output_id(node_name: str, output_name: str) -> int:
     return int(h[:7], 16)
 
 
+def bundle_name(spec: NodeSpec) -> str:
+    """Surface-facing node name used in bundle filenames and the GUI's
+    ``name`` field.
+
+    The registry keys (``spec.name``) use ``wf-foo-bar`` with hyphens
+    because that matches the entrypoint script name in
+    ``pyproject.toml``. The GUI side, however, normalizes hyphens to
+    underscores when it imports a bundle (you can see this in the
+    user's deployed ``wf_prism_imported`` etc.). To keep the
+    pre-import and post-import names consistent — so a re-export
+    overwrites the right bundle and so workflow zips and standalone
+    bundles agree — we substitute the hyphens at the render boundary.
+    Identity for already-snake-case names like ``wf_db_ingest``.
+
+    Note: ``derive_node_id`` / ``derive_input_id`` / ``derive_output_id``
+    still hash off ``spec.name`` so the synthetic IDs are stable across
+    this rename — workflow connection graphs continue to resolve.
+    """
+    return spec.name.replace("-", "_")
+
+
 def build_metadata(
     spec: NodeSpec,
     *,
@@ -388,7 +431,7 @@ def build_metadata(
 
     return {
         "node_id": node_id,
-        "name": spec.name,
+        "name": bundle_name(spec),
         "node_type": "Process",
         "description": spec.description,
         "category": spec.category,
@@ -456,13 +499,18 @@ def write_node_bundle(
     version: str,
     make_zip: bool,
 ) -> tuple[Path, Path | None]:
-    bundle_dir = out_dir / spec.name
+    # Surface name (filenames + JSON ``name`` field) uses underscores
+    # to match the post-import shape of nodes already deployed in the
+    # GUI (``wf_prism_imported``, ``wf_xtb_imported``, etc.). See
+    # :func:`bundle_name`.
+    surface = bundle_name(spec)
+    bundle_dir = out_dir / surface
     sub_dir = bundle_dir / "0"  # node_id placeholder; matches files_info paths
     sub_dir.mkdir(parents=True, exist_ok=True)
 
     env_py = resolve_env_py(spec, env_py)
     metadata = build_metadata(spec, env_py=env_py, host=host, version=version)
-    json_path = bundle_dir / f"{spec.module}.json"
+    json_path = bundle_dir / f"{surface}.json"
     json_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
     sh_path = sub_dir / "script.sh"
@@ -476,7 +524,7 @@ def write_node_bundle(
     zip_path: Path | None = None
     if make_zip:
         suffix = secrets.token_hex(7)  # 14 chars (example used 13 — close enough)
-        zip_path = out_dir / f"NODE_{spec.module}_{suffix}.zip"
+        zip_path = out_dir / f"NODE_{surface}_{suffix}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(json_path, arcname=json_path.name)
             zf.write(sh_path, arcname=f"0/{sh_path.name}")

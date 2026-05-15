@@ -472,9 +472,12 @@ SCHEMA = NodeSchema(
                 "after the freq job via ``$new_job``. Combined with "
                 "``keywords`` (low-level freq), the downstream thermo "
                 "aggregator computes a composite Gibbs energy. "
-                "Explicitly passing this key with an empty / null "
-                "value disables the SP step entirely — i.e. the run "
-                "degrades to pure freq+thermo at ``keywords``."
+                "Set to ``none`` (or any of ``null``, ``auto``, ``\"\"``) "
+                "to disable the SP step entirely — the run degrades to "
+                "pure freq+thermo at ``keywords``. For combobox widgets "
+                "in the GUI use the literal string ``none`` rather than "
+                "an empty option, since the engine drops empty tag "
+                "tokens before they reach this node."
             ),
         ),
         # ----- NMR section -----

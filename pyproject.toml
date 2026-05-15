@@ -93,6 +93,13 @@ wf-validate   = "scripps_workflow.gui.cli:validate_main"
 Homepage = "https://github.com/labounad/scripps-workflow"
 Repository = "https://github.com/labounad/scripps-workflow"
 
+[tool.hatch.metadata]
+# Required so the ``db`` optional-deps group can pin
+# ``nmr-data @ git+https://...`` directly. Hatchling rejects URL
+# direct-references by default (PyPI-publishability guardrail); flip
+# this on because we deliberately publish only as a private git source.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/scripps_workflow"]
 

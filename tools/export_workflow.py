@@ -662,9 +662,14 @@ class Workflow:
         assert spec is not None
         node_id = proc.placement.node_id
 
+        # Surface name uses underscores to match the GUI's post-import
+        # convention. Tag-node placements (``tag_charge`` etc.) are
+        # already snake_case, so this is identity for them.
+        surface = proc.placement.name.replace("-", "_")
+
         with tempfile.TemporaryDirectory(dir=stage) as tmp:
             tmp_path = Path(tmp)
-            json_path = tmp_path / f"{proc.placement.name}.json"
+            json_path = tmp_path / f"{surface}.json"
             sub_dir = tmp_path / str(node_id)
             sub_dir.mkdir()
 
@@ -679,7 +684,7 @@ class Workflow:
             )
             # Override name + description for tag instances so the GUI
             # shows ``tag_<key>`` instead of the bare ``tag_input`` name.
-            metadata["name"] = proc.placement.name
+            metadata["name"] = surface
             metadata["description"] = spec.description
 
             if proc.is_tag:
@@ -711,7 +716,7 @@ class Workflow:
 
             json_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
-            zip_name = f"NODE_{proc.placement.name}_{secrets.token_hex(7)}.zip"
+            zip_name = f"NODE_{surface}_{secrets.token_hex(7)}.zip"
             zip_path = stage / zip_name
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.write(json_path, arcname=json_path.name)
@@ -720,9 +725,14 @@ class Workflow:
 
     def _write_widget_bundle(self, widget: _Widget, stage: Path) -> None:
         node_id = widget.placement.node_id
+        # Widget placement names already pass through _slugify so the
+        # hyphen substitution here is mostly identity — but apply it
+        # uniformly so future renames of the slugifier don't drift
+        # widget names away from process-node names.
+        surface = widget.placement.name.replace("-", "_")
         metadata = {
             "node_id": node_id,
-            "name": widget.placement.name,
+            "name": surface,
             "node_type": "Input",
             "description": widget.placement.help_value or "",
             "category": widget.placement.category,
@@ -753,9 +763,9 @@ class Workflow:
         }
         with tempfile.TemporaryDirectory(dir=stage) as tmp:
             tmp_path = Path(tmp)
-            json_path = tmp_path / f"{widget.placement.name}.json"
+            json_path = tmp_path / f"{surface}.json"
             json_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-            zip_name = f"NODE_{widget.placement.name}_{secrets.token_hex(7)}.zip"
+            zip_name = f"NODE_{surface}_{secrets.token_hex(7)}.zip"
             with zipfile.ZipFile(stage / zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.write(json_path, arcname=json_path.name)
 

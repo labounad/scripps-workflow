@@ -1,0 +1,105 @@
+ NUCLEUS A = F    2 NUCLEUS B = H    3
+ J[2,3](Total)            iso=    22.000
+ J[2,3](FC)               iso=    22.000
+ J[2,3](SD)               iso=      0.000
+ J[2,3](PSO)              iso=      0.000
+ J[2,3](DSO)              iso=      0.000
+
+ NUCLEUS A = F    2 NUCLEUS B = H    4
+ J[2,4](Total)            iso=    22.000
+ J[2,4](FC)               iso=    22.000
+ J[2,4](SD)               iso=      0.000
+ J[2,4](PSO)              iso=      0.000
+ J[2,4](DSO)              iso=      0.000
+
+ NUCLEUS A = F    2 NUCLEUS B = H    5
+ J[2,5](Total)            iso=    22.000
+ J[2,5](FC)               iso=    22.000
+ J[2,5](SD)               iso=      0.000
+ J[2,5](PSO)              iso=      0.000
+ J[2,5](DSO)              iso=      0.000
+
+ NUCLEUS A = F    2 NUCLEUS B = H    6
+ J[2,6](Total)            iso=    46.000
+ J[2,6](FC)               iso=    46.000
+ J[2,6](SD)               iso=      0.000
+ J[2,6](PSO)              iso=      0.000
+ J[2,6](DSO)              iso=      0.000
+
+ NUCLEUS A = F    2 NUCLEUS B = H    7
+ J[2,7](Total)            iso=    46.000
+ J[2,7](FC)               iso=    46.000
+ J[2,7](SD)               iso=      0.000
+ J[2,7](PSO)              iso=      0.000
+ J[2,7](DSO)              iso=      0.000
+
+ NUCLEUS A = H    3 NUCLEUS B = H    4
+ J[3,4](Total)            iso=    -12.000
+ J[3,4](FC)               iso=    -12.000
+ J[3,4](SD)               iso=      0.000
+ J[3,4](PSO)              iso=      0.000
+ J[3,4](DSO)              iso=      0.000
+
+ NUCLEUS A = H    3 NUCLEUS B = H    5
+ J[3,5](Total)            iso=    -12.000
+ J[3,5](FC)               iso=    -12.000
+ J[3,5](SD)               iso=      0.000
+ J[3,5](PSO)              iso=      0.000
+ J[3,5](DSO)              iso=      0.000
+
+ NUCLEUS A = H    3 NUCLEUS B = H    6
+ J[3,6](Total)            iso=    7.000
+ J[3,6](FC)               iso=    7.000
+ J[3,6](SD)               iso=      0.000
+ J[3,6](PSO)              iso=      0.000
+ J[3,6](DSO)              iso=      0.000
+
+ NUCLEUS A = H    3 NUCLEUS B = H    7
+ J[3,7](Total)            iso=    7.000
+ J[3,7](FC)               iso=    7.000
+ J[3,7](SD)               iso=      0.000
+ J[3,7](PSO)              iso=      0.000
+ J[3,7](DSO)              iso=      0.000
+
+ NUCLEUS A = H    4 NUCLEUS B = H    5
+ J[4,5](Total)            iso=    -12.000
+ J[4,5](FC)               iso=    -12.000
+ J[4,5](SD)               iso=      0.000
+ J[4,5](PSO)              iso=      0.000
+ J[4,5](DSO)              iso=      0.000
+
+ NUCLEUS A = H    4 NUCLEUS B = H    6
+ J[4,6](Total)            iso=    7.000
+ J[4,6](FC)               iso=    7.000
+ J[4,6](SD)               iso=      0.000
+ J[4,6](PSO)              iso=      0.000
+ J[4,6](DSO)              iso=      0.000
+
+ NUCLEUS A = H    4 NUCLEUS B = H    7
+ J[4,7](Total)            iso=    7.000
+ J[4,7](FC)               iso=    7.000
+ J[4,7](SD)               iso=      0.000
+ J[4,7](PSO)              iso=      0.000
+ J[4,7](DSO)              iso=      0.000
+
+ NUCLEUS A = H    5 NUCLEUS B = H    6
+ J[5,6](Total)            iso=    7.000
+ J[5,6](FC)               iso=    7.000
+ J[5,6](SD)               iso=      0.000
+ J[5,6](PSO)              iso=      0.000
+ J[5,6](DSO)              iso=      0.000
+
+ NUCLEUS A = H    5 NUCLEUS B = H    7
+ J[5,7](Total)            iso=    7.000
+ J[5,7](FC)               iso=    7.000
+ J[5,7](SD)               iso=      0.000
+ J[5,7](PSO)              iso=      0.000
+ J[5,7](DSO)              iso=      0.000
+
+ NUCLEUS A = H    6 NUCLEUS B = H    7
+ J[6,7](Total)            iso=    -12.000
+ J[6,7](FC)               iso=    -12.000
+ J[6,7](SD)               iso=      0.000
+ J[6,7](PSO)              iso=      0.000
+ J[6,7](DSO)              iso=      0.000
+
