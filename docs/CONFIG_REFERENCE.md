@@ -108,13 +108,6 @@ PostgreSQL connection string, e.g. postgresql://user:pass@host:5432/nmrdata. Fal
 
 Molecule provenance tag stored in the molecules table.
 
-#### `cas_number`
-
-- **Type:** `str`
-- **Default:** `''`
-
-CAS registry number for the molecule (optional).
-
 #### `external_id`
 
 - **Type:** `str`
@@ -808,7 +801,7 @@ Set ``OMPI_MCA_btl=^openib`` to silence the verbose Infiniband warnings on the S
 - **Type:** `str`
 - **Default:** `"wB97M-V def2-TZVPP TightSCF DEFGRID3"`
 
-ORCA simple-input line for the high-level SP appended after the freq job via ``$new_job``. Combined with ``keywords`` (low-level freq), the downstream thermo aggregator computes a composite Gibbs energy. Explicitly passing this key with an empty / null value disables the SP step entirely — i.e. the run degrades to pure freq+thermo at ``keywords``.
+ORCA simple-input line for the high-level SP appended after the freq job via ``$new_job``. Combined with ``keywords`` (low-level freq), the downstream thermo aggregator computes a composite Gibbs energy. Set to ``none`` (or any of ``null``, ``auto``, ``""``) to disable the SP step entirely — the run degrades to pure freq+thermo at ``keywords``. For combobox widgets in the GUI use the literal string ``none`` rather than an empty option, since the engine drops empty tag tokens before they reach this node.
 
 #### Section: nmr
 

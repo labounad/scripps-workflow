@@ -17,7 +17,6 @@ Config keys (``key=value`` tokens or one JSON object)::
                      unless ``dry_run`` is set.                     [""]
     source           Molecule provenance tag:
                      "virtual_library" | "lab_internal".            ["virtual_library"]
-    cas_number       CAS registry number for the molecule.          [""]
     external_id      Any external identifier (virtual-library ID,
                      internal compound number, etc.).               [""]
     hpc_data_root    Absolute HPC path under which .xyz and HDF5
@@ -107,12 +106,10 @@ SCHEMA = NodeSchema(
                 "Molecule provenance tag stored in the molecules table."
             ),
         ),
-        ConfigField(
-            name="cas_number",
-            type="str",
-            default="",
-            description="CAS registry number for the molecule (optional).",
-        ),
+        # cas_number is intentionally NOT a config port. It's resolved
+        # automatically from the SMILES at ingest time via NCI's
+        # Chemical Identifier Resolver (best-effort, 3-second timeout,
+        # NULL on failure). See nmr_data.ingest._resolve_cas_from_smiles.
         ConfigField(
             name="external_id",
             type="str",
@@ -284,7 +281,8 @@ class DbIngest(Node):
             conformer_records = _collect_conformer_records(thermo_dict)
 
         # ---- 5) Optional config values ----
-        cas_number = normalize_optional_str(cfg.get("cas_number") or "")
+        # cas_number is auto-resolved from the SMILES inside
+        # get_or_create_molecule (NCI CIR, best-effort).
         external_id = normalize_optional_str(cfg.get("external_id") or "")
         hpc_data_root = (
             cfg.get("hpc_data_root")
@@ -296,7 +294,6 @@ class DbIngest(Node):
         ctx.set_inputs(
             smiles=smiles,
             source=cfg["source"],
-            cas_number=cas_number,
             external_id=external_id,
             dry_run=dry_run,
             n_conformer_records=len(conformer_records),
@@ -326,7 +323,6 @@ class DbIngest(Node):
                     nmr_run_params=nmr_inputs,
                     conformer_records=conformer_records,
                     source=cfg["source"],
-                    cas_number=cas_number,
                     external_id=external_id,
                     hpc_data_root=hpc_data_root,
                 )

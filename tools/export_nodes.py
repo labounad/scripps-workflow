@@ -270,7 +270,9 @@ NODES: dict[str, NodeSpec] = {
             inputs=[
                 "database_url",
                 "source",
-                "cas_number", "external_id",
+                # cas_number is auto-resolved from SMILES at ingest
+                # time (NCI CIR, best-effort) — no GUI port.
+                "external_id",
                 "hpc_data_root",
                 "dry_run",
             ],
