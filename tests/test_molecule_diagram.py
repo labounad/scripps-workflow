@@ -221,11 +221,15 @@ class TestRenderShiftHtml:
         assert '"x": 0.0' in html_text
         assert '"y": 0.0' in html_text
         assert '"z": 0.0' in html_text
-        # New format: TWO labels per group, bold letter + light shift.
+        # TWO labels per group: bold letter + regular-weight shift.
+        # Arial replaces Helvetica Neue Bold/Light so the bold-vs-regular
+        # distinction renders cross-platform (Helvetica Neue worked only
+        # on macOS). Colon between the two halves is dropped — the
+        # anchor-alignment split already separates them visually.
         assert '"text": "A"' in html_text
-        assert "Helvetica Neue Bold" in html_text
-        assert '"text": ": 1.26 (4)"' in html_text
-        assert "Helvetica Neue Light" in html_text
+        assert "Arial Bold" in html_text
+        assert '"text": " 1.26 (4)"' in html_text
+        assert '"font": "Arial"' in html_text
 
     def test_singleton_group_atom_position_label(self):
         # NONE-tier group → labels at the single atom's position. Same
@@ -236,9 +240,9 @@ class TestRenderShiftHtml:
         )
         # Atom 2 in _TETRA_XYZ is at (-1, 1, -1).
         assert '"x": -1.0' in html_text
-        # Bold letter + light shift:multiplicity pair.
+        # Bold letter + regular shift+multiplicity pair, no colon.
         assert '"text": "B"' in html_text
-        assert '"text": ": 3.50 (1)"' in html_text
+        assert '"text": " 3.50 (1)"' in html_text
 
     def test_title_html_escaped(self):
         # XML/HTML special chars in the title shouldn't break the page.

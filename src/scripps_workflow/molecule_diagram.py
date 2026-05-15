@@ -25,22 +25,24 @@ reading the simulated spectrum: peak in spectrum at 1.26 ppm with
 
 Label format and placement:
 
-* Format ``"{name}: {shift:.2f} ({number})"`` — group letter, colon,
-  predicted δ in ppm, multiplicity in parens. Example: ``"A: 1.16 (3)"``
-  for a methyl HARD group; ``"D: 2.50 (1)"`` for a hydroxyl singleton.
-* HTML viewer renders this as TWO co-located 3Dmol.js labels with
-  different fonts: bold "A" right-aligned + light ": 1.16 (3)"
-  left-aligned. 3Dmol.js can't mix fonts in a single label, so the
-  two-label trick keeps the bold/light distinction Lucas requested.
+* SVG format ``"{name}: {shift:.2f} ({number})"`` — group letter,
+  colon, predicted δ in ppm, multiplicity in parens. Example:
+  ``"A: 1.16 (3)"`` for a methyl HARD group; ``"D: 2.50 (1)"`` for a
+  hydroxyl singleton.
+* HTML viewer renders the same information as TWO co-located 3Dmol.js
+  labels with different fonts: bold "A" right-aligned + regular
+  "1.16 (3)" left-aligned (NO colon — the anchor-alignment split
+  already separates the two pieces visually). 3Dmol.js can't mix
+  fonts in a single label, so the two-label trick keeps the bold /
+  regular distinction.
 
   Font caveat: 3Dmol.js's :class:`LabelSpec` has only ``font`` (no
   ``fontWeight`` / ``fontStyle``). The string is passed straight to
-  canvas font matching. On macOS, ``"Helvetica Neue Bold"`` and
-  ``"Helvetica Neue Light"`` are registered as standalone font NAMES
-  that resolve to the correct weight variants. On Windows/Linux,
-  those names typically aren't matched and the labels fall back to
-  the system default font with no weight distinction. The HTML
-  still renders correctly — just without the bold/light contrast.
+  canvas font matching. ``"Arial Bold"`` and ``"Arial"`` are used
+  here because Arial is universally available across macOS, Windows,
+  and Linux 3Dmol.js renderers — an earlier attempt to use
+  ``"Helvetica Neue Bold"`` / ``"Helvetica Neue Light"`` worked on
+  macOS but fell back to a serif default elsewhere.
 * For HARD groups (size ≥ 2 — methyls, symmetric methylenes), labels
   anchor at the centroid of the contributing atoms (one label-pair
   per group, not per atom).
@@ -236,13 +238,21 @@ def _labels_for_group(
 
     * Bold group letter, ``alignment="centerRight"`` so the text grows
       leftward and ends at the anchor.
-    * Light shift + multiplicity (``": 1.16 (3)"``),
+    * Regular-weight shift + multiplicity (``"1.16 (3)"``),
       ``alignment="centerLeft"`` so the text grows rightward starting
       at the anchor.
 
-    Together they read as ``"A: 1.16 (3)"`` with mixed Helvetica Neue
-    Bold / Light weights — 3Dmol.js can't mix fonts within a single
-    label, so the two-label trick is necessary.
+    Together they read as ``"A 1.16 (3)"`` with mixed Arial Bold and
+    regular Arial weights — 3Dmol.js can't mix fonts within a single
+    label, so the two-label trick is necessary. Arial is used because
+    it's universally available across macOS / Windows / Linux 3Dmol.js
+    renderers; Helvetica Neue Bold/Light worked on macOS but fell back
+    to a serif default on other platforms.
+
+    The historic ``": "`` separator between the group letter and shift
+    is intentionally absent — the two labels are already visually
+    separated by anchor alignment, so the colon was both redundant and
+    confusing (it read as part of the shift number).
 
     Returns ``[]`` if the group's atom indices are out of range for
     the supplied positions list (defensive — shouldn't happen if
@@ -263,13 +273,13 @@ def _labels_for_group(
         {
             "position": pos,
             "text": group.name,
-            "font": "Helvetica Neue Bold",
+            "font": "Arial Bold",
             "alignment": "centerRight",
         },
         {
             "position": pos,
-            "text": f": {group.shift_avg_ppm:.2f} ({group.number})",
-            "font": "Helvetica Neue Light",
+            "text": f" {group.shift_avg_ppm:.2f} ({group.number})",
+            "font": "Arial",
             "alignment": "centerLeft",
         },
     ]
