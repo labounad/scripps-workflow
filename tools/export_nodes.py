@@ -298,6 +298,20 @@ ENV_PY="${{ENV_PY:-{env_py}}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 
+# Source the env's activation hooks so vars pinned in activate.d/
+# (NMR_DATABASE_URL, NMR_HPC_DATA_ROOT, anything else) propagate into
+# the python subprocess we exec below. The workflow engine spawns
+# this script from a process that never ran ``micromamba activate``,
+# so without this loop those hooks would never fire and any node
+# that relies on env-var config (wf_db_ingest is the obvious one)
+# would die with "no_database_url" or similar.
+ACT_DIR="$(dirname "$ENV_PY")/../etc/conda/activate.d"
+if [ -d "$ACT_DIR" ]; then
+    for hook in "$ACT_DIR"/*.sh; do
+        [ -r "$hook" ] && . "$hook"
+    done
+fi
+
 # Prevent Franken-Python via inherited env vars
 unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONNOUSERSITE
 
