@@ -211,6 +211,43 @@ def _thermo_manifest_path(nmr_manifest_dict: dict[str, Any]) -> Path | None:
     return p if p.exists() else None
 
 
+def _find_upstream_manifest_by_step(
+    start: dict[str, Any], step_name: str, max_hops: int = 12
+) -> dict[str, Any] | None:
+    """Walk the upstream manifest chain starting at ``start`` and return
+    the first manifest whose ``step`` matches ``step_name``.
+
+    The chain is followed via successive ``upstream.manifest_path``
+    references. ``start`` itself is checked too — so passing the
+    nmr_aggregate manifest and ``step_name="crest"`` returns the
+    wf_crest manifest that produced the conformer ensemble feeding the
+    current run. ``max_hops`` is a safety cap against pathological
+    chains.
+
+    Returns ``None`` if no matching manifest is found within ``max_hops``.
+    """
+    visited: set[str] = set()
+    current: dict[str, Any] | None = start
+    for _ in range(max_hops):
+        if current is None:
+            return None
+        if (current.get("step") or "") == step_name:
+            return current
+        upstream = current.get("upstream") or {}
+        mpath = upstream.get("manifest_path")
+        if not mpath or mpath in visited:
+            return None
+        visited.add(mpath)
+        p = Path(mpath)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
+
+
 def _node_script_path(manifest_dict: dict[str, Any]) -> Path | None:
     """Return the path to the Python entry script that produced this
     manifest, pulled from ``inputs.raw_argv[0]``.
@@ -358,6 +395,12 @@ class DbIngest(Node):
         # ---- 4) Load thermo_aggregate manifest for conformer records ----
         thermo_dict = _load_thermo_manifest(nmr_dict)
         thermo_manifest_path: Path | None = _thermo_manifest_path(nmr_dict)
+
+        # Walk further up the chain for the wf_crest manifest. Its
+        # recorded inputs feed the v6.4 EnsembleKey fingerprint that
+        # both this side (writer) and CREST itself (reader) use, so
+        # the two sides land on the same cache row.
+        crest_dict = _find_upstream_manifest_by_step(nmr_dict, "crest")
         if thermo_dict is None:
             # Non-fatal: proceed without conformer energy data
             ctx.manifest.add_failure(
@@ -489,6 +532,12 @@ class DbIngest(Node):
                     # ingest layer can build the cache-key rows
                     # (ConformerEnsemble + ThermoRun) from its inputs.
                     thermo_manifest_dict=thermo_dict,
+                    # v6.4b: pass the parsed wf_crest manifest so the
+                    # ingest layer builds the ensemble fingerprint via
+                    # the same nmr_data.cache.build_crest_ensemble_key
+                    # helper CREST itself uses for read-side lookups —
+                    # ensuring the writer and reader hashes match.
+                    crest_manifest_dict=crest_dict,
                 )
         finally:
             # Restore original env var

@@ -83,6 +83,7 @@ _RDKIT_IMPORT_ERROR: str | None = None
 try:
     from nmr_data.cache import (  # noqa: F401
         EnsembleKey,
+        build_crest_ensemble_key,
         find_ensemble,
         fingerprint as _cache_fingerprint,
     )
@@ -94,9 +95,12 @@ except Exception as _e:  # broad catch: pydantic_core / sqlalchemy / etc. surfac
     _HAS_NMR_DATA = False
     _NMR_DATA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
+# RDKit is also probed independently — build_crest_ensemble_key needs it
+# (the InChIKey lookup), and we want a distinct log line if it's the
+# missing piece rather than nmr_data itself.
 try:
-    from rdkit.Chem.inchi import MolToInchiKey  # type: ignore[attr-defined]
-    from rdkit import Chem
+    from rdkit.Chem.inchi import MolToInchiKey  # type: ignore[attr-defined]  # noqa: F401
+    from rdkit import Chem  # noqa: F401
     _HAS_RDKIT = True
 except Exception as _e:
     _HAS_RDKIT = False
@@ -431,32 +435,16 @@ def _find_upstream_smiles(ctx: NodeContext) -> str | None:
 def _build_ensemble_key(cfg: dict[str, Any], smiles: str) -> "EnsembleKey | None":
     """Construct an EnsembleKey from CREST's config + the upstream SMILES.
 
-    Returns None if RDKit isn't available to compute the InChIKey (the
-    cache check needs it as the per-molecule scope), or the SMILES
-    can't be parsed.
+    Thin wrapper around :func:`nmr_data.cache.build_crest_ensemble_key`
+    that the writer side (db_ingest) calls with the *same* helper.
+    Symmetric construction → matching fingerprints → cache hits land.
+
+    Returns None if RDKit isn't available to compute the InChIKey, or
+    the SMILES can't be parsed.
     """
     if not _HAS_NMR_DATA or not _HAS_RDKIT:
         return None
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    inchikey = MolToInchiKey(mol)
-    if not inchikey:
-        return None
-    return EnsembleKey(
-        inchikey=inchikey,
-        charge=int(cfg.get("charge", 0) or 0),
-        multiplicity=int(cfg.get("unpaired_electrons", 0) or 0) + 1,
-        opt_method=cfg.get("theory"),
-        conformer_search="crest",
-        solvent_model="ALPB" if cfg.get("solvent") else None,
-        solvent=cfg.get("solvent"),
-        search_options={
-            "mode": cfg.get("mode"),
-            "ewin_kcal": cfg.get("ewin_kcal"),
-            "max_conformers": cfg.get("max_conformers"),
-        },
-    )
+    return build_crest_ensemble_key(cfg, smiles)
 
 
 def _check_ensemble_cache(
