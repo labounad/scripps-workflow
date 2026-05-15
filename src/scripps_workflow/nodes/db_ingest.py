@@ -301,9 +301,18 @@ class DbIngest(Node):
 
         # ---- 6) Dry-run short-circuit ----
         if dry_run:
-            from nmr_data.ingest import _compute_inchikey
+            from nmr_data.ingest import (
+                _compute_inchikey,
+                _resolve_cas_from_smiles,
+            )
             inchikey = _compute_inchikey(smiles)
+            # Fire the CAS resolver here too so the dry-run manifest
+            # shows whatever the real ingest path would have stored.
+            # Returns None on network failure / timeout / no match —
+            # safe to surface either way.
+            cas_number = _resolve_cas_from_smiles(smiles)
             ctx.set_input("dry_run_inchikey", inchikey)
+            ctx.set_input("dry_run_cas_number", cas_number)
             ctx.set_input("dry_run_shifts_rows", _count_csv_rows(shifts_path))
             ctx.set_input("dry_run_couplings_rows", _count_csv_rows(couplings_path))
             return  # success, nothing written
