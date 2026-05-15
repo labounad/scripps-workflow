@@ -52,6 +52,8 @@ from .. import logging_utils
 from ..config_schema import ConfigField, NodeSchema, apply_schema
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
+from ..parsing import parse_bool
+from ..schema import Manifest
 
 # Import shared helpers from xtb_calc rather than duplicate. If a third
 # node grows the same dependency, factor these out into a shared util
@@ -63,6 +65,29 @@ from .xtb_calc import (
     resolve_threads,
     slurm_threads_fallback,
 )
+
+
+# --------------------------------------------------------------------
+# Optional nmr_data import — cache check is best-effort. If the package
+# isn't installed (dev sandbox, light CI), CREST runs normally.
+# --------------------------------------------------------------------
+
+try:
+    from nmr_data.cache import EnsembleKey, find_ensemble, fingerprint as _cache_fingerprint
+    from nmr_data.db import get_session
+    from nmr_data.models import Molecule
+
+    try:
+        from rdkit.Chem.inchi import MolToInchiKey  # type: ignore[attr-defined]
+        from rdkit import Chem
+        _HAS_RDKIT = True
+    except ImportError:
+        _HAS_RDKIT = False
+
+    _HAS_NMR_DATA = True
+except ImportError:
+    _HAS_NMR_DATA = False
+    _HAS_RDKIT = False
 
 
 # --------------------------------------------------------------------
@@ -350,6 +375,116 @@ def _positive_float(value: float) -> float:
     return value
 
 
+# --------------------------------------------------------------------
+# v6.4 — ensemble cache check
+# --------------------------------------------------------------------
+
+
+def _find_upstream_smiles(ctx: NodeContext) -> str | None:
+    """Walk the upstream manifest chain for ``inputs.smiles``.
+
+    CREST itself doesn't take SMILES as a config port — it gets an xyz
+    from xtb_calc, which in turn gets one from smiles_to_3d. The SMILES
+    string is two manifests upstream. Walk the chain by following
+    successive ``upstream.manifest_path`` references until we find an
+    ``inputs.smiles`` field or run out of links.
+
+    Returns the SMILES string, or ``None`` if no upstream manifest
+    carries one (in which case the cache check skips itself).
+    """
+    visited: set[str] = set()
+    current = ctx.upstream_manifest
+    while current is not None:
+        m = current.to_dict() if hasattr(current, "to_dict") else current
+        inputs = m.get("inputs") or {}
+        s = inputs.get("smiles")
+        if isinstance(s, str) and s:
+            return s
+        upstream = m.get("upstream") or {}
+        up_path = upstream.get("manifest_path")
+        if not up_path or up_path in visited:
+            return None
+        visited.add(up_path)
+        p = Path(up_path)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p)
+        except Exception:
+            return None
+    return None
+
+
+def _build_ensemble_key(cfg: dict[str, Any], smiles: str) -> "EnsembleKey | None":
+    """Construct an EnsembleKey from CREST's config + the upstream SMILES.
+
+    Returns None if RDKit isn't available to compute the InChIKey (the
+    cache check needs it as the per-molecule scope), or the SMILES
+    can't be parsed.
+    """
+    if not _HAS_NMR_DATA or not _HAS_RDKIT:
+        return None
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    inchikey = MolToInchiKey(mol)
+    if not inchikey:
+        return None
+    return EnsembleKey(
+        inchikey=inchikey,
+        charge=int(cfg.get("charge", 0) or 0),
+        multiplicity=int(cfg.get("unpaired_electrons", 0) or 0) + 1,
+        opt_method=cfg.get("theory"),
+        conformer_search="crest",
+        solvent_model="ALPB" if cfg.get("solvent") else None,
+        solvent=cfg.get("solvent"),
+        search_options={
+            "mode": cfg.get("mode"),
+            "ewin_kcal": cfg.get("ewin_kcal"),
+            "max_conformers": cfg.get("max_conformers"),
+        },
+    )
+
+
+def _check_ensemble_cache(
+    cfg: dict[str, Any], smiles: str, database_url: str
+) -> "tuple[str, str, list[str]] | None":
+    """Look up a cached ConformerEnsemble for the given CREST config.
+
+    Returns ``(inchikey, ensemble_path, conformer_xyz_paths)`` on hit,
+    or ``None`` on miss. ``conformer_xyz_paths`` is the sorted list of
+    relative paths into the central tree (one per conformer).
+
+    All ``*_path`` strings are relative to ``NMR_HPC_DATA_ROOT`` so the
+    caller composes absolute paths.
+    """
+    key = _build_ensemble_key(cfg, smiles)
+    if key is None:
+        return None
+
+    # Temporarily set NMR_DATABASE_URL so nmr_data.config picks it up.
+    _orig = os.environ.get("NMR_DATABASE_URL")
+    os.environ["NMR_DATABASE_URL"] = database_url
+    try:
+        with get_session() as session:
+            mol = session.query(Molecule).filter_by(inchikey=key.inchikey).one_or_none()
+            if mol is None:
+                return None
+            ensemble = find_ensemble(session, molecule_id=mol.id, key=key)
+            if ensemble is None or not ensemble.ensemble_path:
+                return None
+            # Snapshot the data while the session is alive — the row
+            # detaches once we exit the context manager.
+            ensemble_path = ensemble.ensemble_path
+    finally:
+        if _orig is None:
+            os.environ.pop("NMR_DATABASE_URL", None)
+        else:
+            os.environ["NMR_DATABASE_URL"] = _orig
+
+    return key.inchikey, ensemble_path, []  # the xyz paths come from disk walk below
+
+
 SCHEMA = NodeSchema(
     step_name="crest",
     cli_entrypoint="wf-crest",
@@ -436,6 +571,31 @@ SCHEMA = NodeSchema(
                 "from SLURM if available, else 1."
             ),
         ),
+        ConfigField(
+            name="use_cache",
+            type="bool",
+            default=True,
+            coercer=parse_bool,
+            description=(
+                "Consult the nmr-data ConformerEnsemble cache on entry. "
+                "On hit, skip the CREST run entirely and emit a "
+                "manifest pointing at the central-tree xyz files. "
+                "Set to false to always re-run."
+            ),
+        ),
+        ConfigField(
+            name="force_recompute",
+            type="bool",
+            default=False,
+            coercer=parse_bool,
+            description=(
+                "Force a fresh CREST run even when the cache would hit. "
+                "Useful when investigating non-determinism or after "
+                "upgrading CREST. The cache row from the prior run "
+                "stays in the DB; the new compute output gets a new "
+                "predicted_run UUID at db_ingest time."
+            ),
+        ),
     ),
 )
 
@@ -468,7 +628,17 @@ class CrestConformerSearch(Node):
             ewin_kcal=cfg["ewin_kcal"],
             max_conformers=cfg["max_conformers"],
             threads_requested=cfg["threads"],
+            use_cache=bool(cfg.get("use_cache", True)),
+            force_recompute=bool(cfg.get("force_recompute", False)),
         )
+
+        # ---- v6.4 ensemble cache check ----
+        # Best-effort: if the cache hits, we short-circuit and emit a
+        # manifest pointing at the central-tree xyz files. If it
+        # misses (or the cache infra isn't available), fall through to
+        # a real CREST run.
+        if self._maybe_emit_cached_manifest(ctx, cfg):
+            return  # cache hit; downstream consumers see the cached ensemble
 
         # Locate both binaries — crest shells out to xtb internally, so a
         # missing xtb is just as fatal as a missing crest. The wrapper
@@ -596,6 +766,145 @@ class CrestConformerSearch(Node):
             ctx.fail("no_best_xyz_artifact_produced")
 
     # -------------------- helpers --------------------
+
+    def _maybe_emit_cached_manifest(
+        self, ctx: NodeContext, cfg: dict[str, Any]
+    ) -> bool:
+        """Try to short-circuit by serving the ensemble from cache.
+
+        Returns True if a cache hit was found AND the manifest was
+        populated. The caller (``run``) should ``return`` immediately
+        on True — the manifest is in a publishable state. Returns
+        False on cache miss / cache disabled / cache infra missing.
+
+        Cache-miss path is silent (one log line so the operator knows
+        it was checked); the caller then runs CREST normally.
+        """
+        if not cfg.get("use_cache", True):
+            logging_utils.log_info("crest cache: disabled via use_cache=false")
+            return False
+        if cfg.get("force_recompute", False):
+            logging_utils.log_info(
+                "crest cache: force_recompute=true → ignoring cache"
+            )
+            return False
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                "crest cache: nmr_data not importable, skipping check"
+            )
+            return False
+
+        database_url = os.environ.get("NMR_DATABASE_URL")
+        hpc_data_root = os.environ.get("NMR_HPC_DATA_ROOT")
+        if not database_url or not hpc_data_root:
+            logging_utils.log_info(
+                "crest cache: NMR_DATABASE_URL or NMR_HPC_DATA_ROOT unset, "
+                "skipping check"
+            )
+            return False
+
+        smiles = _find_upstream_smiles(ctx)
+        if not smiles:
+            logging_utils.log_info(
+                "crest cache: no SMILES found in upstream chain, skipping check"
+            )
+            return False
+
+        try:
+            hit = _check_ensemble_cache(cfg, smiles, database_url)
+        except Exception as e:
+            # A bad cache check shouldn't kill the workflow — fall
+            # through to compute. Operator can see the warn in stderr.
+            logging_utils.log_warn(f"crest cache: lookup raised, falling through: {e}")
+            return False
+
+        if hit is None:
+            logging_utils.log_info(
+                f"crest cache: miss for smiles={smiles!r} "
+                f"(theory={cfg.get('theory')}, solvent={cfg.get('solvent')})"
+            )
+            return False
+
+        inchikey, ensemble_path_rel, _ = hit
+        ensemble_dir = Path(hpc_data_root) / ensemble_path_rel / "conformers"
+        if not ensemble_dir.is_dir():
+            logging_utils.log_warn(
+                f"crest cache: DB row found but disk dir missing at "
+                f"{ensemble_dir} — falling through"
+            )
+            return False
+
+        # Walk the cached conformer subdirs and emit a manifest.
+        conf_dirs = sorted(
+            d for d in ensemble_dir.iterdir()
+            if d.is_dir() and d.name.startswith("conf_")
+        )
+        if not conf_dirs:
+            logging_utils.log_warn(
+                f"crest cache: ensemble dir {ensemble_dir} has no conformers, "
+                "falling through"
+            )
+            return False
+
+        # Stage a "best.xyz" inside our outputs dir so downstream nodes
+        # that read xyz bucket "best" get a usable absolute path.
+        outputs_dir = ctx.outputs_dir
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        conf_dir = outputs_dir / "conformers"
+        conf_dir.mkdir(parents=True, exist_ok=True)
+
+        # Emit one ``conformers`` artifact per cached geometry. Paths
+        # point straight at the central-tree files — no copies, no
+        # duplication. ``rel_energy_kcal`` is intentionally omitted:
+        # CREST energies aren't in the cache (v6.4 limitation). Marc/
+        # prism downstream will treat them as no-info and pass through,
+        # which is the correct behavior for a single-conformer molecule
+        # (methanol smoke) and the documented v6.4 limitation otherwise.
+        for i, cd in enumerate(conf_dirs, start=1):
+            xyzs = sorted(cd.glob("*.xyz"))
+            if not xyzs:
+                continue
+            xyz = xyzs[0]
+            ctx.add_artifact(
+                "conformers",
+                {
+                    "index": i,
+                    "label": f"conf_{i:04d}",
+                    "path_abs": str(xyz.resolve()),
+                    "sha256": sha256_file(xyz),
+                    "format": "xyz",
+                    "cache_hit": True,
+                },
+            )
+
+        # Publish a "best" representative (first conformer) so xyz-bucket
+        # consumers don't trip on an empty bucket.
+        first_xyz = sorted(conf_dirs[0].glob("*.xyz"))[0]
+        best_dst = conf_dir / "best.xyz"
+        shutil.copy2(first_xyz, best_dst)
+        ctx.add_artifact(
+            "xyz",
+            {
+                "label": "best",
+                "path_abs": str(best_dst.resolve()),
+                "sha256": sha256_file(best_dst),
+                "format": "xyz",
+                "cache_hit": True,
+            },
+        )
+
+        # Surface the cache hit prominently in the manifest's inputs so
+        # downstream operators can see at a glance that crest was a no-op.
+        ctx.set_input("cache_hit", True)
+        ctx.set_input("cached_ensemble_path", ensemble_path_rel)
+        ctx.set_input("cached_inchikey", inchikey)
+        ctx.set_input("n_cached_conformers", len(conf_dirs))
+
+        logging_utils.log_info(
+            f"crest cache: HIT — ensemble={ensemble_path_rel} "
+            f"({len(conf_dirs)} conformer(s)). Skipping CREST run."
+        )
+        return True
 
     def _collect_outputs(
         self,

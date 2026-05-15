@@ -520,16 +520,26 @@ class DbIngest(Node):
                 f"      v6 cache: ensemble={summary.get('ensemble_id', '<none>')}, "
                 f"thermo_run={summary.get('thermo_run_id', '<none>')}"
             )
-        if "run_root_path" in summary:
-            if summary.get("artifacts_already_existed"):
+        # v6.3: three separate stage trees, each with its own copy count.
+        # Idempotent re-runs land 0 files copied for that stage.
+        if any(k in summary for k in ("ensemble_path", "thermo_run_path", "run_root_path")):
+            ens_n = summary.get("ensemble_files_copied")
+            thermo_n = summary.get("thermo_files_copied")
+            pr_n = summary.get("predicted_files_copied")
+            if "ensemble_path" in summary:
                 log_info(
-                    f"      central tree: {summary['run_root_path']} "
-                    f"(already existed — idempotent skip, 0 files copied)"
+                    f"      ensemble dir:      {summary['ensemble_path']} "
+                    f"({ens_n if ens_n is not None else '?'} files)"
                 )
-            else:
+            if "thermo_run_path" in summary:
                 log_info(
-                    f"      central tree: {summary['run_root_path']} "
-                    f"({summary.get('n_files_copied', 0)} files copied)"
+                    f"      thermo_run dir:    {summary['thermo_run_path']} "
+                    f"({thermo_n if thermo_n is not None else '?'} files)"
+                )
+            if "run_root_path" in summary:
+                log_info(
+                    f"      predicted_run dir: {summary['run_root_path']} "
+                    f"({pr_n if pr_n is not None else '?'} files)"
                 )
         else:
             log_info("      central tree: not copied (no hpc_data_root)")
