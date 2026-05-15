@@ -211,12 +211,21 @@ def _thermo_manifest_path(nmr_manifest_dict: dict[str, Any]) -> Path | None:
     return p if p.exists() else None
 
 
-def _node_script_path(manifest_path: Path) -> Path | None:
-    """Locate the engine-rendered ``script.sh`` for the call that produced
-    ``manifest_path``. Engine layout: ``<call_dir>/script.sh`` and
-    ``<call_dir>/outputs/manifest.json`` — so the script sits one level
-    up from outputs/. Returns None if it isn't there."""
-    candidate = manifest_path.parent.parent / "script.sh"
+def _node_script_path(manifest_dict: dict[str, Any]) -> Path | None:
+    """Return the path to the Python entry script that produced this
+    manifest, pulled from ``inputs.raw_argv[0]``.
+
+    The engine writes ``script.py`` per-call into
+    ``<workflow_root>/scripts/<call_id>/`` (separate from the per-call
+    ``calls/<step>/outputs/`` directory the manifest lives in), and
+    invokes it as ``argv[0]``. Reading argv[0] back out is the most
+    reliable way to find that file — no path heuristics needed.
+
+    Returns None if argv[0] is absent or the file is gone."""
+    raw_argv = manifest_dict.get("inputs", {}).get("raw_argv") or []
+    if not raw_argv:
+        return None
+    candidate = Path(str(raw_argv[0]))
     return candidate if candidate.exists() else None
 
 
@@ -379,7 +388,10 @@ class DbIngest(Node):
             if upm.exists():
                 nmr_manifest_path = upm
                 nmr_outputs_dir = upm.parent
-                nmr_script_path = _node_script_path(upm)
+                # raw_argv[0] from the upstream nmr_aggregate manifest is
+                # the canonical pointer to the per-call script.py written
+                # by the engine. Pull it from the already-parsed dict.
+                nmr_script_path = _node_script_path(nmr_dict)
 
         # thermo_aggregate's outputs/ dir similarly sits next to its
         # manifest — that's where conformer_thermo.csv lives.
@@ -473,6 +485,10 @@ class DbIngest(Node):
                     nmr_outputs_dir=nmr_outputs_dir,
                     thermo_outputs_dir=thermo_outputs_dir,
                     nmr_script_path=nmr_script_path,
+                    # v6.1b: pass the parsed thermo manifest so the
+                    # ingest layer can build the cache-key rows
+                    # (ConformerEnsemble + ThermoRun) from its inputs.
+                    thermo_manifest_dict=thermo_dict,
                 )
         finally:
             # Restore original env var
@@ -499,6 +515,11 @@ class DbIngest(Node):
             f"n_shifts={summary.get('n_shifts')}, "
             f"n_couplings={summary.get('n_couplings')}"
         )
+        if "ensemble_id" in summary or "thermo_run_id" in summary:
+            log_info(
+                f"      v6 cache: ensemble={summary.get('ensemble_id', '<none>')}, "
+                f"thermo_run={summary.get('thermo_run_id', '<none>')}"
+            )
         if "run_root_path" in summary:
             if summary.get("artifacts_already_existed"):
                 log_info(

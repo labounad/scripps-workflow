@@ -1440,6 +1440,19 @@ class NmrAggregate(Node):
             return
 
         upm_dict = ctx.upstream_manifest.to_dict()
+
+        # Propagate ``temperature_k`` from the upstream thermo_aggregate
+        # manifest into our own inputs. Temperature is a thermo-stage
+        # concern — there's no NMR config knob that sets it — but
+        # downstream consumers (wf-db-ingest → predicted_runs.temperature_k)
+        # need it on the NMR manifest to populate the cache key. Without
+        # this, predicted_run.temperature_k lands NULL and the
+        # uq_predicted_run_method_tuple constraint collapses runs that
+        # actually differ by temperature.
+        upstream_inputs = upm_dict.get("inputs", {})
+        upstream_temperature_k = upstream_inputs.get("temperature_k")
+        if upstream_temperature_k is not None:
+            ctx.set_input("temperature_k", upstream_temperature_k)
         confs = collect_conformer_records(upm_dict)
         if not confs:
             ctx.fail("upstream_missing_conformers_bucket")
