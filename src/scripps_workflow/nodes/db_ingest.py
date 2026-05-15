@@ -489,6 +489,11 @@ class DbIngest(Node):
             f"[7/8] DB write OK: molecule={summary.get('inchikey')} [{mol_state}], "
             f"run={summary.get('run_id')} [{run_state}]"
         )
+        if not summary.get("is_new_predicted_run"):
+            log_info(
+                "      idempotent re-ingest — child rows already present, "
+                "no inserts performed"
+            )
         log_info(
             f"      rows: n_conformers={summary.get('n_conformers')}, "
             f"n_shifts={summary.get('n_shifts')}, "
