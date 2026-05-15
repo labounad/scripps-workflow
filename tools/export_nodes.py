@@ -61,15 +61,26 @@ from typing import Iterable
 #
 # ``module`` is the dotted path under ``scripps_workflow.nodes``.
 
-DEFAULT_ENV_PY = "/gpfs/group/shenvi/envs/workflow/bin/python"
+#: Lab's canonical Python interpreter for pipeline nodes. Previously
+#: split between an older 3.11 env (``/gpfs/group/shenvi/envs/workflow``)
+#: and this 3.12 env — the 3.11 default caused a footgun where
+#: nmr-data installed in 3.12 wasn't importable from nodes running
+#: under 3.11 (surfaced live as the v6.4 CREST cache check silently
+#: bailing with "nmr_data not importable"). Pipeline standardized on
+#: 3.12 in 2026-05; the older env is retained only for legacy bundles
+#: that haven't been re-exported yet, and will retire when those are
+#: gone.
+DEFAULT_ENV_PY = "/gpfs/group/shenvi/envs/workflow312/bin/python"
 
-#: Sibling Python 3.12 env on the same gpfs share. Some nodes need
-#: dependencies that don't currently install cleanly under the lab's
-#: 3.11 env (notably ``prism_pruner``, which requires 3.12+ on this
-#: cluster). NodeSpec entries that need this env should set
-#: ``env_py=ENV_PY_312`` so the rendered ``script.sh`` exec's the
-#: right interpreter for that node and that node only.
-ENV_PY_312 = "/gpfs/group/shenvi/envs/workflow312/bin/python"
+#: Backward-compatible alias kept as a single source of truth for nodes
+#: that *historically* required the 3.12 env — currently identical to
+#: ``DEFAULT_ENV_PY`` (the alias is a no-op since the pipeline
+#: standardized on 3.12). Retained so per-node ``env_py=ENV_PY_312``
+#: overrides keep documenting *why* that node has a 3.12 hard dep
+#: (e.g. ``wf-prism`` needs prism_pruner; ``wf-db-ingest`` needs the
+#: nmr-data 3.12 stack). If the lab ever splits envs again, the
+#: overrides will route correctly without code changes.
+ENV_PY_312 = DEFAULT_ENV_PY
 DEFAULT_HOST = "workflow.scripps.edu"
 DEFAULT_VERSION = "1.1.0"
 DEFAULT_CATEGORY = "Script"
