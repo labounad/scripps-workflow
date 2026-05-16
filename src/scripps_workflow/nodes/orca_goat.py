@@ -47,6 +47,7 @@ avoid needing a real ORCA install.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -57,12 +58,73 @@ from typing import Any
 from .. import logging_utils
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
+from ..parsing import parse_bool
+from ..schema import Manifest
 from ..config_schema import ConfigField, NodeSchema, apply_schema
 
 # Reuse crest's xyz parsing helpers — split_multixyz / write_xyz_block
 # are the canonical multi-xyz primitives in this package.
 from .crest import XyzBlock, split_multixyz, write_xyz_block
 from .xtb_calc import find_first_xyz_path, resolve_threads, slurm_threads_fallback
+
+
+# --------------------------------------------------------------------
+# v6.7 — optional cache imports. Mirrors the CREST cache scaffolding;
+# any of these missing → cache check silently bails to compute.
+# --------------------------------------------------------------------
+
+_NMR_DATA_IMPORT_ERROR: str | None = None
+_RDKIT_IMPORT_ERROR: str | None = None
+
+try:
+    from nmr_data.cache import (  # noqa: F401
+        build_goat_ensemble_key,
+        find_ensemble,
+        fingerprint as _cache_fingerprint,
+    )
+    from nmr_data.db import get_session
+    from nmr_data.models import Molecule
+    _HAS_NMR_DATA = True
+except Exception as _e:
+    _HAS_NMR_DATA = False
+    _NMR_DATA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    from rdkit import Chem  # noqa: F401
+    _HAS_RDKIT = True
+except Exception as _e:
+    _HAS_RDKIT = False
+    _RDKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+
+def _walk_upstream_for_smiles(ctx: NodeContext) -> str | None:
+    """Walk back through ``upstream.manifest_path`` references for the
+    first ``inputs.smiles`` — same shape as the CREST helper.
+
+    GOAT typically sits where CREST would in the pipeline (after
+    smiles_to_3d → xtb_calc), so the SMILES is two manifests upstream.
+    """
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        s = (current.get("inputs") or {}).get("smiles")
+        if isinstance(s, str) and s:
+            return s
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
 
 
 # --------------------------------------------------------------------
@@ -532,6 +594,29 @@ SCHEMA = NodeSchema(
                 "``%maxcore``."
             ),
         ),
+        ConfigField(
+            name="use_cache",
+            type="bool",
+            default=True,
+            coercer=parse_bool,
+            description=(
+                "Consult the nmr-data ConformerEnsemble cache on entry. "
+                "On hit, skip the GOAT run entirely and emit a "
+                "manifest pointing at the central-tree xyz files. "
+                "Set to false to always re-run."
+            ),
+        ),
+        ConfigField(
+            name="force_recompute",
+            type="bool",
+            default=False,
+            coercer=parse_bool,
+            description=(
+                "Force a fresh GOAT run even when the cache would hit. "
+                "Useful when investigating ORCA non-determinism or "
+                "after upgrading the ORCA version."
+            ),
+        ),
     ),
 )
 
@@ -563,7 +648,15 @@ class OrcaGoat(Node):
             max_conformers=cfg["max_conformers"],
             threads_requested=cfg["threads"],
             maxcore_mb=cfg["maxcore_mb"],
+            use_cache=bool(cfg.get("use_cache", True)),
+            force_recompute=bool(cfg.get("force_recompute", False)),
         )
+
+        # v6.7 ensemble cache check — same shape as CREST's
+        # (build a typed key from inputs, look up via nmr_data.cache,
+        # on hit emit a manifest pointing at central-tree xyzs).
+        if self._maybe_emit_cached_manifest_goat(ctx, cfg):
+            return
 
         orca_exe = shutil.which("orca")
         if not orca_exe:
@@ -692,6 +785,182 @@ class OrcaGoat(Node):
             ctx.fail("no_best_xyz_artifact_produced")
 
     # -------------------- helpers --------------------
+
+    def _maybe_emit_cached_manifest_goat(
+        self, ctx: NodeContext, cfg: dict[str, Any]
+    ) -> bool:
+        """v6.7 cache check: short-circuit on a matching ConformerEnsemble.
+
+        Mirrors CREST's helper: walk upstream for SMILES, build an
+        :class:`EnsembleKey` via :func:`build_goat_ensemble_key` (which
+        sets ``conformer_search="goat"`` so GOAT and CREST can't collide
+        on the same row), look up via :func:`find_ensemble`. On hit,
+        emit a manifest pointing at central-tree xyz files and skip the
+        whole GOAT run.
+
+        Returns True on a verified hit; False on any miss / disabled /
+        infra-missing path. Logs the reason either way.
+        """
+        if not cfg.get("use_cache", True):
+            logging_utils.log_info("orca-goat cache: disabled via use_cache=false")
+            return False
+        if cfg.get("force_recompute", False):
+            logging_utils.log_info(
+                "orca-goat cache: force_recompute=true → ignoring cache"
+            )
+            return False
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"orca-goat cache: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping check"
+            )
+            return False
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"orca-goat cache: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping check"
+            )
+            return False
+
+        db_url = os.environ.get("NMR_DATABASE_URL")
+        hpc_root = os.environ.get("NMR_HPC_DATA_ROOT")
+        if not db_url or not hpc_root:
+            logging_utils.log_info(
+                "orca-goat cache: NMR_DATABASE_URL or NMR_HPC_DATA_ROOT "
+                "unset, skipping check"
+            )
+            return False
+
+        smiles = _walk_upstream_for_smiles(ctx)
+        if not smiles:
+            logging_utils.log_info(
+                "orca-goat cache: no SMILES found in upstream chain, "
+                "skipping check"
+            )
+            return False
+
+        try:
+            ens_key = build_goat_ensemble_key(cfg, smiles)
+        except Exception as e:
+            logging_utils.log_warn(
+                f"orca-goat cache: key build raised, falling through: {e}"
+            )
+            return False
+        if ens_key is None:
+            logging_utils.log_info(
+                "orca-goat cache: could not build EnsembleKey "
+                "(rdkit / SMILES parse failure), skipping check"
+            )
+            return False
+
+        from nmr_data.cache import inchikey_from_smiles
+        _orig_url = os.environ.get("NMR_DATABASE_URL")
+        os.environ["NMR_DATABASE_URL"] = db_url
+        try:
+            with get_session() as session:
+                inchikey = inchikey_from_smiles(smiles)
+                if not inchikey:
+                    return False
+                mol = session.query(Molecule).filter_by(
+                    inchikey=inchikey
+                ).one_or_none()
+                if mol is None:
+                    logging_utils.log_info(
+                        f"orca-goat cache: miss — no molecule row for "
+                        f"{inchikey}"
+                    )
+                    return False
+                ensemble = find_ensemble(
+                    session, molecule_id=mol.id, key=ens_key,
+                )
+                if ensemble is None or not ensemble.ensemble_path:
+                    logging_utils.log_info(
+                        f"orca-goat cache: miss for smiles={smiles!r} "
+                        f"(theory={cfg.get('theory')}, "
+                        f"solvent={cfg.get('solvent')})"
+                    )
+                    return False
+                ensemble_path_rel = ensemble.ensemble_path
+        finally:
+            if _orig_url is None:
+                os.environ.pop("NMR_DATABASE_URL", None)
+            else:
+                os.environ["NMR_DATABASE_URL"] = _orig_url
+
+        hpc_root_path = Path(hpc_root)
+        ens_abs = hpc_root_path / ensemble_path_rel
+        confs_root = ens_abs / "conformers"
+        if not confs_root.is_dir():
+            logging_utils.log_warn(
+                f"orca-goat cache: DB row found but disk dir missing at "
+                f"{confs_root} — falling through"
+            )
+            return False
+
+        conf_dirs = sorted(
+            d for d in confs_root.iterdir()
+            if d.is_dir() and d.name.startswith("conf_")
+        )
+        if not conf_dirs:
+            logging_utils.log_warn(
+                f"orca-goat cache: ensemble dir {confs_root} has no "
+                f"conformers, falling through"
+            )
+            return False
+
+        outputs_dir = ctx.outputs_dir
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        conf_dir = outputs_dir / "conformers"
+        conf_dir.mkdir(parents=True, exist_ok=True)
+
+        # Emit one entry per cached geometry. Paths point straight at
+        # the central-tree files — no copies, no duplication. Energies
+        # aren't in this cache (same v6.4-era limitation that applies
+        # to CREST); marc/prism downstream treat missing
+        # rel_energy_kcal as no-info and pass through.
+        for i, cd in enumerate(conf_dirs, start=1):
+            xyzs = sorted(cd.glob("*.xyz"))
+            if not xyzs:
+                continue
+            xyz = xyzs[0]
+            ctx.add_artifact(
+                "conformers",
+                {
+                    "index": i,
+                    "label": f"conf_{i:04d}",
+                    "path_abs": str(xyz.resolve()),
+                    "sha256": sha256_file(xyz),
+                    "format": "xyz",
+                    "cache_hit": True,
+                },
+            )
+
+        # Publish a "best" representative so xyz-bucket consumers
+        # downstream don't trip on an empty bucket.
+        first_xyz = sorted(conf_dirs[0].glob("*.xyz"))[0]
+        best_dst = conf_dir / "best.xyz"
+        shutil.copy2(first_xyz, best_dst)
+        ctx.add_artifact(
+            "xyz",
+            {
+                "label": "best",
+                "path_abs": str(best_dst.resolve()),
+                "sha256": sha256_file(best_dst),
+                "format": "xyz",
+                "cache_hit": True,
+            },
+        )
+
+        ctx.set_input("cache_hit", True)
+        ctx.set_input("cached_ensemble_path", ensemble_path_rel)
+        ctx.set_input("cached_inchikey", inchikey)
+        ctx.set_input("n_cached_conformers", len(conf_dirs))
+
+        logging_utils.log_info(
+            f"orca-goat cache: HIT — ensemble={ensemble_path_rel} "
+            f"({len(conf_dirs)} conformer(s)). Skipping GOAT run."
+        )
+        return True
 
     def _collect_outputs(
         self,

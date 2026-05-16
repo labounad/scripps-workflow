@@ -396,11 +396,14 @@ class DbIngest(Node):
         thermo_dict = _load_thermo_manifest(nmr_dict)
         thermo_manifest_path: Path | None = _thermo_manifest_path(nmr_dict)
 
-        # Walk further up the chain for the wf_crest manifest. Its
-        # recorded inputs feed the v6.4 EnsembleKey fingerprint that
-        # both this side (writer) and CREST itself (reader) use, so
-        # the two sides land on the same cache row.
+        # Walk further up the chain for the conformer-search manifest.
+        # Either wf_crest or wf_orca_goat can be the source — both
+        # produce an EnsembleKey-compatible row. db_ingest doesn't care
+        # which engine ran; it just needs whichever manifest is present.
+        # If both happen to be in the chain (unusual but possible),
+        # wf_crest wins by virtue of being checked first.
         crest_dict = _find_upstream_manifest_by_step(nmr_dict, "crest")
+        goat_dict = _find_upstream_manifest_by_step(nmr_dict, "orca_goat")
 
         # v6.5: same shape for the thermo cache key — find the
         # orca_thermo_array and orca_dft_array manifests so the writer
@@ -551,6 +554,9 @@ class DbIngest(Node):
                     # helper CREST itself uses for read-side lookups —
                     # ensuring the writer and reader hashes match.
                     crest_manifest_dict=crest_dict,
+                    # v6.7: same shape if the operator swapped CREST
+                    # for orca_goat as the conformer-search engine.
+                    goat_manifest_dict=goat_dict,
                     # v6.5: same shape for the ThermoRun fingerprint —
                     # orca_thermo_array's recorded inputs (and
                     # orca_dft_array's, which describe the geometries
