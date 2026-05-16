@@ -997,15 +997,17 @@ class OrcaDftArray(Node):
             else:
                 os.environ["NMR_DATABASE_URL"] = _orig_url
 
-        # Geometries source: parent ensemble's central tree. Walk its
-        # conformers/conf_NNNN/ subdirs, stage each xyz locally so
-        # downstream consumers see a normal-looking optimized_conformers/
-        # tree.
-        ens_abs = Path(hpc_root) / ensemble_path_rel
-        confs_root = ens_abs / "conformers"
+        # Geometries source: this DftRun's *own* central tree subtree
+        # (v6.6 v2 layout). Each conf_NNNN/ has the DFT-optimized xyz
+        # produced by the prior run of this node under matching
+        # inputs. The parent ensemble's tree has xtb-level xyzs —
+        # not what we want here.
+        dft_run_path_rel = f"{inchikey}/dft_runs/{dft_run_id_str}"
+        dft_abs = Path(hpc_root) / dft_run_path_rel
+        confs_root = dft_abs / "conformers"
         if not confs_root.is_dir():
             logging_utils.log_warn(
-                f"orca-dft cache: ensemble dir {confs_root} missing on disk, "
+                f"orca-dft cache: dft_run dir {confs_root} missing on disk, "
                 "falling through to compute"
             )
             return False
@@ -1051,13 +1053,13 @@ class OrcaDftArray(Node):
 
         ctx.set_input("cache_hit", True)
         ctx.set_input("cached_ensemble_path", ensemble_path_rel)
+        ctx.set_input("cached_dft_run_path", dft_run_path_rel)
         ctx.set_input("cached_dft_run_id", dft_run_id_str)
         ctx.set_input("n_cached_conformers", len(conf_dirs))
 
         logging_utils.log_info(
-            f"orca-dft cache: HIT — dft_run={dft_run_id_str[:8]}..., "
-            f"sourced {len(conf_dirs)} conformer(s) from "
-            f"ensemble={ensemble_path_rel}. Skipping SLURM array."
+            f"orca-dft cache: HIT — dft_run={dft_run_path_rel} "
+            f"({len(conf_dirs)} conformer(s)). Skipping SLURM array."
         )
         return True
 

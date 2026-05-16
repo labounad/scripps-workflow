@@ -118,8 +118,10 @@ _RDKIT_IMPORT_ERROR: str | None = None
 try:
     from nmr_data.cache import (  # noqa: F401
         build_crest_ensemble_key,
+        build_dft_run_key,
         build_predicted_run_key,
         build_thermo_run_key,
+        find_dft_run,
         find_ensemble,
         find_predicted_run,
         find_thermo_run,
@@ -1137,7 +1139,10 @@ class OrcaThermoArray(Node):
         own_inputs: dict[str, Any] = dict(cfg)
         own_inputs["multiplicity"] = multiplicity
 
-        # Build the three keys + their fingerprints.
+        # Build the four keys + their fingerprints in dependency order.
+        # ConformerEnsemble (from CREST/GOAT) → DftRun (from this
+        # node's upstream orca_dft_array) → ThermoRun (from own inputs)
+        # → PredictedRun (NMR side, also from own inputs).
         try:
             ens_key = build_crest_ensemble_key(crest_inputs, smiles)
             if ens_key is None:
@@ -1147,10 +1152,11 @@ class OrcaThermoArray(Node):
                 )
                 return False
             ens_fp = _cache_fingerprint(ens_key)
+            dft_key = build_dft_run_key(dft_inputs, ensemble_fingerprint=ens_fp)
+            dft_fp = _cache_fingerprint(dft_key)
             thermo_key = build_thermo_run_key(
                 own_inputs,
-                ensemble_fingerprint=ens_fp,
-                dft_array_inputs=dft_inputs or None,
+                dft_run_fingerprint=dft_fp,
                 thermo_aggregate_inputs=None,  # downstream, not available here
             )
             thermo_fp = _cache_fingerprint(thermo_key)
@@ -1163,7 +1169,7 @@ class OrcaThermoArray(Node):
             )
             return False
 
-        # DB lookup — both rows must exist for the joint hit.
+        # DB lookup — all four rows must exist for the joint hit.
         _orig_url = os.environ.get("NMR_DATABASE_URL")
         os.environ["NMR_DATABASE_URL"] = db_url
         try:
@@ -1186,8 +1192,16 @@ class OrcaThermoArray(Node):
                         "orca-thermo cache: no matching ensemble row"
                     )
                     return False
+                dft_row = find_dft_run(
+                    session, ensemble_id=ensemble.id, key=dft_key,
+                )
+                if dft_row is None or not dft_row.dft_run_path:
+                    logging_utils.log_info(
+                        "orca-thermo cache: no matching dft_run row"
+                    )
+                    return False
                 thermo_row = find_thermo_run(
-                    session, ensemble_id=ensemble.id, key=thermo_key,
+                    session, dft_run_id=dft_row.id, key=thermo_key,
                 )
                 if thermo_row is None or not thermo_row.thermo_run_path:
                     logging_utils.log_info(
@@ -1204,6 +1218,7 @@ class OrcaThermoArray(Node):
                     return False
                 # Snapshot paths since the row detaches when the session ends.
                 ensemble_path_rel = ensemble.ensemble_path
+                dft_path_rel = dft_row.dft_run_path
                 thermo_path_rel = thermo_row.thermo_run_path
                 predicted_path_rel = predicted_row.run_root_path
         finally:
@@ -1216,10 +1231,12 @@ class OrcaThermoArray(Node):
         thermo_abs = hpc_root_path / thermo_path_rel
         predicted_abs = hpc_root_path / predicted_path_rel
         ensemble_abs = hpc_root_path / ensemble_path_rel
+        dft_abs = hpc_root_path / dft_path_rel
         for label, p in (
             ("thermo", thermo_abs),
             ("predicted", predicted_abs),
             ("ensemble", ensemble_abs),
+            ("dft_run", dft_abs),
         ):
             if not p.is_dir():
                 logging_utils.log_warn(
@@ -1276,10 +1293,14 @@ class OrcaThermoArray(Node):
                     if src.exists():
                         _gunzip_to(src, local_task / dst_name)
 
-            # 3) input.xyz from ensembles/<uuid>/conformers/<same>/
-            ens_conf = ensemble_abs / "conformers" / thermo_conf.name
-            if ens_conf.is_dir():
-                xyzs = sorted(ens_conf.glob("*.xyz"))
+            # 3) input.xyz from dft_runs/<uuid>/conformers/<same>/
+            # (DFT-optimized geometries — what this node's freq + SP
+            # jobs actually run on). Note: ensembles/<uuid>/ now
+            # contains xtb-level geometries from CREST/GOAT — wrong
+            # source for thermo.
+            dft_conf = dft_abs / "conformers" / thermo_conf.name
+            if dft_conf.is_dir():
+                xyzs = sorted(dft_conf.glob("*.xyz"))
                 if xyzs:
                     shutil.copy2(xyzs[0], local_task / "input.xyz")
 
@@ -1310,6 +1331,7 @@ class OrcaThermoArray(Node):
         ctx.set_input("cache_hit", True)
         ctx.set_input("cached_thermo_run_path", thermo_path_rel)
         ctx.set_input("cached_predicted_run_path", predicted_path_rel)
+        ctx.set_input("cached_dft_run_path", dft_path_rel)
         ctx.set_input("cached_ensemble_path", ensemble_path_rel)
         ctx.set_input("n_cached_conformers", n_tasks)
 

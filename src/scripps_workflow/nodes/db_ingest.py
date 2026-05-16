@@ -596,16 +596,25 @@ class DbIngest(Node):
                 f"      v6 cache: ensemble={summary.get('ensemble_id', '<none>')}, "
                 f"thermo_run={summary.get('thermo_run_id', '<none>')}"
             )
-        # v6.3: three separate stage trees, each with its own copy count.
-        # Idempotent re-runs land 0 files copied for that stage.
-        if any(k in summary for k in ("ensemble_path", "thermo_run_path", "run_root_path")):
+        # v6.3 / v6.6 v2: four separate stage trees, each with its own
+        # copy count. Idempotent re-runs land 0 files copied per stage.
+        stage_keys = (
+            "ensemble_path", "dft_run_path", "thermo_run_path", "run_root_path",
+        )
+        if any(k in summary for k in stage_keys):
             ens_n = summary.get("ensemble_files_copied")
+            dft_n = summary.get("dft_files_copied")
             thermo_n = summary.get("thermo_files_copied")
             pr_n = summary.get("predicted_files_copied")
             if "ensemble_path" in summary:
                 log_info(
                     f"      ensemble dir:      {summary['ensemble_path']} "
                     f"({ens_n if ens_n is not None else '?'} files)"
+                )
+            if "dft_run_path" in summary:
+                log_info(
+                    f"      dft_run dir:       {summary['dft_run_path']} "
+                    f"({dft_n if dft_n is not None else '?'} files)"
                 )
             if "thermo_run_path" in summary:
                 log_info(
