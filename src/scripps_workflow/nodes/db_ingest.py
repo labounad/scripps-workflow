@@ -401,6 +401,19 @@ class DbIngest(Node):
         # both this side (writer) and CREST itself (reader) use, so
         # the two sides land on the same cache row.
         crest_dict = _find_upstream_manifest_by_step(nmr_dict, "crest")
+
+        # v6.5: same shape for the thermo cache key — find the
+        # orca_thermo_array and orca_dft_array manifests so the writer
+        # registers ThermoRun rows under the same fingerprint
+        # orca_thermo_array (reader) computes on entry. Either may be
+        # absent in older / partial pipelines; the ingest layer falls
+        # back to the v6.1b placeholder when missing.
+        thermo_array_dict = _find_upstream_manifest_by_step(
+            nmr_dict, "orca_thermo_array"
+        )
+        dft_array_dict = _find_upstream_manifest_by_step(
+            nmr_dict, "orca_dft_array"
+        )
         if thermo_dict is None:
             # Non-fatal: proceed without conformer energy data
             ctx.manifest.add_failure(
@@ -538,6 +551,14 @@ class DbIngest(Node):
                     # helper CREST itself uses for read-side lookups —
                     # ensuring the writer and reader hashes match.
                     crest_manifest_dict=crest_dict,
+                    # v6.5: same shape for the ThermoRun fingerprint —
+                    # orca_thermo_array's recorded inputs (and
+                    # orca_dft_array's, which describe the geometries
+                    # thermo runs on) feed the writer-side ThermoKey
+                    # so it matches what orca_thermo_array computes
+                    # on the reader side.
+                    thermo_array_manifest_dict=thermo_array_dict,
+                    dft_array_manifest_dict=dft_array_dict,
                 )
         finally:
             # Restore original env var
