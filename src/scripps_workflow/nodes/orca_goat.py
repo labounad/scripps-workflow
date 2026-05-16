@@ -83,6 +83,7 @@ try:
         fingerprint as _cache_fingerprint,
     )
     from nmr_data.db import get_session
+    from nmr_data.ingest import load_ensemble_energies
     from nmr_data.models import Molecule
     _HAS_NMR_DATA = True
 except Exception as _e:
@@ -913,27 +914,31 @@ class OrcaGoat(Node):
         conf_dir = outputs_dir / "conformers"
         conf_dir.mkdir(parents=True, exist_ok=True)
 
-        # Emit one entry per cached geometry. Paths point straight at
-        # the central-tree files — no copies, no duplication. Energies
-        # aren't in this cache (same v6.4-era limitation that applies
-        # to CREST); marc/prism downstream treat missing
-        # rel_energy_kcal as no-info and pass through.
+        # Sidecar energies written by db_ingest on the previous fresh
+        # run. If present, repopulate ``rel_energy_kcal`` on each
+        # cached record so marc/prism downstream filter consistently
+        # with what a fresh GOAT run would have produced. Empty dict
+        # when the ensemble pre-dates the sidecar feature.
+        cached_energies = load_ensemble_energies(
+            Path(hpc_root) / ensemble_path_rel
+        )
+
         for i, cd in enumerate(conf_dirs, start=1):
             xyzs = sorted(cd.glob("*.xyz"))
             if not xyzs:
                 continue
             xyz = xyzs[0]
-            ctx.add_artifact(
-                "conformers",
-                {
-                    "index": i,
-                    "label": f"conf_{i:04d}",
-                    "path_abs": str(xyz.resolve()),
-                    "sha256": sha256_file(xyz),
-                    "format": "xyz",
-                    "cache_hit": True,
-                },
-            )
+            rec: dict[str, Any] = {
+                "index": i,
+                "label": f"conf_{i:04d}",
+                "path_abs": str(xyz.resolve()),
+                "sha256": sha256_file(xyz),
+                "format": "xyz",
+                "cache_hit": True,
+            }
+            if i in cached_energies:
+                rec["rel_energy_kcal"] = cached_energies[i]
+            ctx.add_artifact("conformers", rec)
 
         # Publish a "best" representative so xyz-bucket consumers
         # downstream don't trip on an empty bucket.
