@@ -102,6 +102,42 @@ from typing import Any
 from .. import logging_utils
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
+from ..parsing import parse_bool
+from ..schema import Manifest
+
+
+# --------------------------------------------------------------------
+# v6.5b — optional cache imports. Best-effort: a missing nmr_data /
+# rdkit / DB just falls through to compute.
+# --------------------------------------------------------------------
+
+_NMR_DATA_IMPORT_ERROR: str | None = None
+_RDKIT_IMPORT_ERROR: str | None = None
+
+try:
+    from nmr_data.cache import (  # noqa: F401
+        build_crest_ensemble_key,
+        build_predicted_run_key,
+        build_thermo_run_key,
+        find_ensemble,
+        find_predicted_run,
+        find_thermo_run,
+        fingerprint as _cache_fingerprint,
+        inchikey_from_smiles,
+    )
+    from nmr_data.db import get_session
+    from nmr_data.models import Molecule
+    _HAS_NMR_DATA = True
+except Exception as _e:
+    _HAS_NMR_DATA = False
+    _NMR_DATA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    from rdkit import Chem  # noqa: F401
+    _HAS_RDKIT = True
+except Exception as _e:
+    _HAS_RDKIT = False
+    _RDKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 from ..orca import (
     concat_xyz_files,
     make_orca_compound_input,
@@ -140,6 +176,82 @@ from .orca_dft_array import (
     resolve_multiplicity,
     stage_conformer_inputs,
 )
+
+
+# --------------------------------------------------------------------
+# v6.5b cache helpers — upstream-chain walkers + .gz hydration
+# --------------------------------------------------------------------
+#
+# Same pattern as the CREST cache check (build a typed key from
+# upstream-recorded inputs, look up via nmr_data.cache, on hit
+# materialize the central-tree files locally). orca_thermo_array's
+# hit path is more involved than CREST's because thermo_aggregate and
+# nmr_aggregate downstream walk a per-conformer task_dir tree that
+# this node normally builds via SLURM submission. We reconstruct that
+# tree from the central tree's gzipped .out files.
+
+
+def _walk_upstream_for_step(ctx: NodeContext, step_name: str) -> dict | None:
+    """Walk back through ``upstream.manifest_path`` references looking
+    for a manifest whose ``step`` matches. Bounded to a handful of hops
+    so a pathological chain can't spin."""
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        if (current.get("step") or "") == step_name:
+            return current
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
+
+
+def _walk_upstream_for_smiles(ctx: NodeContext) -> str | None:
+    """Same chain walk, looking for ``inputs.smiles`` (carried by
+    smiles_to_3d at the top of the chain)."""
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        s = (current.get("inputs") or {}).get("smiles")
+        if isinstance(s, str) and s:
+            return s
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
+
+
+def _gunzip_to(src_gz: Path, dst: Path) -> None:
+    """Decompress ``src_gz`` (a .gz file) into ``dst``. Creates parent
+    dirs; idempotent on dst existence (skips if dst already there)."""
+    import gzip
+    if dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(src_gz, "rb") as f_in, open(dst, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
 
 
 #: ORCA module name to ``module load`` inside the SLURM array script.
@@ -607,6 +719,32 @@ SCHEMA = NodeSchema(
                 "SCF thresholds uniform with the freq/SP jobs."
             ),
         ),
+        ConfigField(
+            name="use_cache",
+            type="bool",
+            default=True,
+            coercer=parse_bool,
+            description=(
+                "Consult the nmr-data ThermoRun + PredictedRun caches "
+                "on entry. On hit, skip the whole SLURM array — "
+                "decompress central-tree .out files into a local "
+                "task_dir tree so thermo_aggregate + nmr_aggregate "
+                "downstream walk them transparently. Set to false to "
+                "always re-run the freq+SP and NMR jobs."
+            ),
+        ),
+        ConfigField(
+            name="force_recompute",
+            type="bool",
+            default=False,
+            coercer=parse_bool,
+            description=(
+                "Force a fresh SLURM array submission even when the "
+                "cache would hit. Useful when investigating ORCA non-"
+                "determinism or after a functional-alias bug fix that "
+                "should change the values written to the database."
+            ),
+        ),
     ),
 )
 
@@ -665,6 +803,13 @@ class OrcaThermoArray(Node):
             multiplicity=cfg["multiplicity"],
             unpaired_electrons=cfg["unpaired_electrons"],
         )
+
+        # v6.5b cache check fires BEFORE any work (input staging, SLURM
+        # array build, sbatch). On hit, the manifest is fully
+        # populated from central-tree .gz files and we return; the
+        # whole SLURM round-trip is skipped.
+        if self._maybe_emit_cached_manifest_thermo(ctx, cfg, multiplicity):
+            return
 
         ctx.set_inputs(
             max_concurrency=cfg["max_concurrency"],
@@ -906,6 +1051,273 @@ class OrcaThermoArray(Node):
                 jobid=jobid,
                 execs=execs,
             )
+
+    # ------------------------------------------------------------------
+    # v6.5b cache hit path
+    # ------------------------------------------------------------------
+
+    def _maybe_emit_cached_manifest_thermo(
+        self, ctx: NodeContext, cfg: dict[str, Any], multiplicity: int
+    ) -> bool:
+        """Joint ThermoRun + PredictedRun cache check.
+
+        Both must hit (this node runs both thermo SP/freq AND NMR
+        shielding/coupling jobs in one SLURM array, so a thermo-only
+        hit doesn't save the NMR work and a NMR-only hit doesn't save
+        the thermo work — only a *both-hit* short-circuits cleanly).
+
+        On hit:
+          * Walks central tree at ``<hpc_data_root>/<thermo_run_path>``
+            and ``<predicted_run_path>`` (set on the cache rows by
+            db_ingest's v6.3 copy step).
+          * Gunzips each conformer's ``orca_thermo.out.gz`` from the
+            thermo dir + ``orca_nmr_h.out.gz`` / ``_c.gz`` / ``_j.gz``
+            from the predicted_run dir into a local
+            ``<outputs>/array/tasks/conf_NNNN/`` task_dir.
+          * Stages the input.xyz from the ensemble dir into each
+            task_dir so anything that reads it still works.
+          * Populates ``artifacts.array``, ``artifacts.conformers`` so
+            thermo_aggregate + nmr_aggregate downstream walk the
+            local tree transparently.
+
+        Returns True if the manifest is in a publishable cache-hit
+        state; False on any miss (cache disabled, infra unavailable,
+        DB row missing, central-tree dir missing). On False the
+        caller runs the SLURM array normally.
+        """
+        if not cfg.get("use_cache", True):
+            logging_utils.log_info(
+                "orca-thermo cache: disabled via use_cache=false"
+            )
+            return False
+        if cfg.get("force_recompute", False):
+            logging_utils.log_info(
+                "orca-thermo cache: force_recompute=true → ignoring cache"
+            )
+            return False
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"orca-thermo cache: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping check"
+            )
+            return False
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"orca-thermo cache: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping check"
+            )
+            return False
+        db_url = os.environ.get("NMR_DATABASE_URL")
+        hpc_root = os.environ.get("NMR_HPC_DATA_ROOT")
+        if not db_url or not hpc_root:
+            logging_utils.log_info(
+                "orca-thermo cache: NMR_DATABASE_URL or NMR_HPC_DATA_ROOT "
+                "unset, skipping check"
+            )
+            return False
+
+        # Walk upstream chain for the inputs we need.
+        smiles = _walk_upstream_for_smiles(ctx)
+        crest_dict = _walk_upstream_for_step(ctx, "crest")
+        dft_dict = _walk_upstream_for_step(ctx, "orca_dft_array")
+        if not smiles or not crest_dict:
+            logging_utils.log_info(
+                "orca-thermo cache: SMILES or wf_crest manifest not found "
+                "in upstream chain, skipping check"
+            )
+            return False
+
+        crest_inputs = (crest_dict.get("inputs") or {})
+        dft_inputs = (dft_dict.get("inputs") if dft_dict else None) or {}
+
+        # Construct the same set of inputs the writer side will see in
+        # this node's manifest. set_inputs hasn't fired yet (we return
+        # *before* it), so build the dict from cfg in the same shape.
+        own_inputs: dict[str, Any] = dict(cfg)
+        own_inputs["multiplicity"] = multiplicity
+
+        # Build the three keys + their fingerprints.
+        try:
+            ens_key = build_crest_ensemble_key(crest_inputs, smiles)
+            if ens_key is None:
+                logging_utils.log_info(
+                    "orca-thermo cache: could not build EnsembleKey "
+                    "(rdkit / SMILES parse failure), skipping check"
+                )
+                return False
+            ens_fp = _cache_fingerprint(ens_key)
+            thermo_key = build_thermo_run_key(
+                own_inputs,
+                ensemble_fingerprint=ens_fp,
+                dft_array_inputs=dft_inputs or None,
+                thermo_aggregate_inputs=None,  # downstream, not available here
+            )
+            thermo_fp = _cache_fingerprint(thermo_key)
+            predicted_key = build_predicted_run_key(
+                own_inputs, thermo_run_fingerprint=thermo_fp,
+            )
+        except Exception as e:
+            logging_utils.log_warn(
+                f"orca-thermo cache: key build raised, falling through: {e}"
+            )
+            return False
+
+        # DB lookup — both rows must exist for the joint hit.
+        _orig_url = os.environ.get("NMR_DATABASE_URL")
+        os.environ["NMR_DATABASE_URL"] = db_url
+        try:
+            with get_session() as session:
+                inchikey = inchikey_from_smiles(smiles)
+                if not inchikey:
+                    return False
+                mol = session.query(Molecule).filter_by(
+                    inchikey=inchikey
+                ).one_or_none()
+                if mol is None:
+                    logging_utils.log_info(
+                        f"orca-thermo cache: no molecule row for {inchikey}, "
+                        f"skipping"
+                    )
+                    return False
+                ensemble = find_ensemble(session, molecule_id=mol.id, key=ens_key)
+                if ensemble is None or not ensemble.ensemble_path:
+                    logging_utils.log_info(
+                        "orca-thermo cache: no matching ensemble row"
+                    )
+                    return False
+                thermo_row = find_thermo_run(
+                    session, ensemble_id=ensemble.id, key=thermo_key,
+                )
+                if thermo_row is None or not thermo_row.thermo_run_path:
+                    logging_utils.log_info(
+                        "orca-thermo cache: no matching thermo_run row"
+                    )
+                    return False
+                predicted_row = find_predicted_run(
+                    session, molecule_id=mol.id, key=predicted_key,
+                )
+                if predicted_row is None or not predicted_row.run_root_path:
+                    logging_utils.log_info(
+                        "orca-thermo cache: no matching predicted_run row"
+                    )
+                    return False
+                # Snapshot paths since the row detaches when the session ends.
+                ensemble_path_rel = ensemble.ensemble_path
+                thermo_path_rel = thermo_row.thermo_run_path
+                predicted_path_rel = predicted_row.run_root_path
+        finally:
+            if _orig_url is None:
+                os.environ.pop("NMR_DATABASE_URL", None)
+            else:
+                os.environ["NMR_DATABASE_URL"] = _orig_url
+
+        hpc_root_path = Path(hpc_root)
+        thermo_abs = hpc_root_path / thermo_path_rel
+        predicted_abs = hpc_root_path / predicted_path_rel
+        ensemble_abs = hpc_root_path / ensemble_path_rel
+        for label, p in (
+            ("thermo", thermo_abs),
+            ("predicted", predicted_abs),
+            ("ensemble", ensemble_abs),
+        ):
+            if not p.is_dir():
+                logging_utils.log_warn(
+                    f"orca-thermo cache: {label} dir missing on disk at "
+                    f"{p} — falling through to compute"
+                )
+                return False
+
+        # Enumerate cached conformers via thermo_runs/<uuid>/conformers/.
+        thermo_confs_dir = thermo_abs / "conformers"
+        conf_dirs = sorted(
+            d for d in thermo_confs_dir.iterdir()
+            if d.is_dir() and d.name.startswith("conf_")
+        )
+        if not conf_dirs:
+            logging_utils.log_warn(
+                f"orca-thermo cache: thermo dir {thermo_confs_dir} has no "
+                f"conformers, falling through"
+            )
+            return False
+
+        # Materialize the local task_dir tree by decompressing .gz files
+        # from the three central-tree subtrees.
+        outputs_dir = ctx.outputs_dir
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        array_root = outputs_dir / "array"
+        tasks_root = array_root / "tasks"
+        tasks_root.mkdir(parents=True, exist_ok=True)
+
+        n_tasks = 0
+        for thermo_conf in conf_dirs:
+            try:
+                idx = int(thermo_conf.name.removeprefix("conf_"))
+            except ValueError:
+                continue
+            local_task = tasks_root / f"conf_{idx:04d}"
+            local_task.mkdir(parents=True, exist_ok=True)
+            n_tasks += 1
+
+            # 1) thermo .out.gz
+            t_gz = thermo_conf / "orca_thermo.out.gz"
+            if t_gz.exists():
+                _gunzip_to(t_gz, local_task / ORCA_OUT_NAME)
+
+            # 2) NMR .out.gz files from predicted_runs/<uuid>/conformers/<same>/
+            pr_conf = predicted_abs / "conformers" / thermo_conf.name
+            if pr_conf.is_dir():
+                for nmr_name, dst_name in (
+                    ("orca_nmr_h.out.gz", ORCA_NMR_H_OUT_NAME),
+                    ("orca_nmr_c.out.gz", ORCA_NMR_C_OUT_NAME),
+                    ("orca_nmr_j.out.gz", ORCA_NMR_J_OUT_NAME),
+                ):
+                    src = pr_conf / nmr_name
+                    if src.exists():
+                        _gunzip_to(src, local_task / dst_name)
+
+            # 3) input.xyz from ensembles/<uuid>/conformers/<same>/
+            ens_conf = ensemble_abs / "conformers" / thermo_conf.name
+            if ens_conf.is_dir():
+                xyzs = sorted(ens_conf.glob("*.xyz"))
+                if xyzs:
+                    shutil.copy2(xyzs[0], local_task / "input.xyz")
+
+            ctx.add_artifact(
+                "conformers",
+                {
+                    "index": idx,
+                    "label": f"conf_{idx:04d}",
+                    "task_dir_abs": str(local_task.resolve()),
+                    "path_abs": str((local_task / "input.xyz").resolve()),
+                    "format": "xyz",
+                    "cache_hit": True,
+                },
+            )
+
+        # Top-level array metadata mirrors what set_array_info would write
+        # on a fresh run, minus SLURM fields (jobid, submit_ok, etc.)
+        # which don't apply on a hit.
+        ctx.manifest.set_array_info(
+            tasks_root_abs=str(tasks_root.resolve()),
+            n_tasks=n_tasks,
+            array_root_abs=str(array_root.resolve()),
+            aggregated=True,
+            cache_hit=True,
+        )
+
+        # Manifest-level inputs that the cache fan-out makes visible.
+        ctx.set_input("cache_hit", True)
+        ctx.set_input("cached_thermo_run_path", thermo_path_rel)
+        ctx.set_input("cached_predicted_run_path", predicted_path_rel)
+        ctx.set_input("cached_ensemble_path", ensemble_path_rel)
+        ctx.set_input("n_cached_conformers", n_tasks)
+
+        logging_utils.log_info(
+            f"orca-thermo cache: HIT — thermo_run={thermo_path_rel}, "
+            f"predicted_run={predicted_path_rel} ({n_tasks} conformer(s)). "
+            f"Skipping SLURM array."
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Step handlers
