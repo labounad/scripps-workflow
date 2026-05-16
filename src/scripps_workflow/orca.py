@@ -275,6 +275,7 @@ def make_orca_compound_input(
     smd_solvent_override: Optional[str] = None,
     xyz_filename: str = "input.xyz",
     reset_3c_dispersion_in_post_jobs: bool = True,
+    freq_temperature_k: Optional[float] = None,
 ) -> str:
     """Render a chain of ORCA jobs separated by ``$new_job``.
 
@@ -337,6 +338,14 @@ def make_orca_compound_input(
             ``True`` and is a no-op when the first job isn't a 3c
             composite. Set to ``False`` to suppress the injection if
             you're hand-tuning the chain.
+        freq_temperature_k: When set, injects a ``%freq Temp <T> end``
+            block into the first job (the freq calc) so ORCA prints
+            thermal corrections at the requested temperature instead
+            of its built-in 298.15 K default. None disables the
+            injection (preserves legacy behavior). Downstream
+            :mod:`scripps_workflow.nodes.thermo_aggregate` reads
+            ``temperature_k`` directly off the ORCA output, so its
+            Boltzmann math lines up with the freq T automatically.
     """
     # Normalize the call shape into a single list of jobs.
     jobs: list[dict[str, Any]] = []
@@ -358,6 +367,19 @@ def make_orca_compound_input(
                 }
             )
 
+    # If a freq temperature override was passed, inject a ``%freq Temp T end``
+    # block into job1's extra_blocks. ORCA's default is 298.15 K; passing
+    # a non-default lets the operator parameterize thermochemistry from
+    # the workflow without hand-editing ORCA inputs. The block is only
+    # meaningful if ``keywords`` actually requests a freq calc (``Freq``
+    # in the ! line), but ORCA tolerates a ``%freq`` block in other
+    # contexts so we don't gate-keep here.
+    job1_extra: Optional[list[str]] = None
+    if freq_temperature_k is not None:
+        job1_extra = [
+            f"%freq\n  Temp {float(freq_temperature_k):.6g}\nend"
+        ]
+
     job1 = make_orca_simple_input(
         keywords=keywords,
         nprocs=nprocs,
@@ -367,6 +389,7 @@ def make_orca_compound_input(
         solvent=solvent,
         smd_solvent_override=smd_solvent_override,
         xyz_filename=xyz_filename,
+        extra_blocks=job1_extra,
     )
     if not jobs:
         return job1

@@ -222,7 +222,7 @@ NODES: dict[str, NodeSpec] = {
                 "max_concurrency", "job_name",
                 "charge", "unpaired_electrons", "multiplicity",
                 "solvent", "smd_solvent",
-                "keywords", "singlepoint_keywords",
+                "keywords", "singlepoint_keywords", "temperature_k",
                 "maxcore", "nprocs", "time_limit", "partition",
                 "orca_module", "submit", "monitor",
                 "monitor_interval_s", "monitor_timeout_min",

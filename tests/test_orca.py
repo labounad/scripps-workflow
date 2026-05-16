@@ -363,6 +363,33 @@ class TestMakeOrcaCompoundInput:
         )
         assert compound == simple
 
+    def test_freq_temperature_k_injects_freq_block(self):
+        # Setting freq_temperature_k adds a ``%freq Temp T end`` block
+        # to the first (freq) job, before the geometry line, so ORCA's
+        # printed thermal corrections are computed at the requested T
+        # rather than its 298.15 K default.
+        text = self._base(freq_temperature_k=310.15)
+        # Block appears exactly once (only on job1, not on the SP).
+        assert text.count("%freq") == 1
+        # Block content matches ORCA syntax.
+        assert "%freq\n  Temp 310.15\nend" in text
+        # Appears in the freq job, before the SP separator.
+        assert text.index("%freq") < text.index("$new_job")
+
+    def test_freq_temperature_k_none_omits_block(self):
+        # Default (None) leaves the input unchanged — important for the
+        # byte-for-byte ``test_full_compound_shape`` golden to keep working.
+        text = self._base(freq_temperature_k=None)
+        assert "%freq" not in text
+
+    def test_freq_temperature_k_298_15_still_injects(self):
+        # Even at ORCA's own default, the block is still injected when
+        # the caller passes an explicit value. This makes the .inp file
+        # self-describing about what T it ran at, instead of relying on
+        # ORCA's compiled-in default.
+        text = self._base(freq_temperature_k=298.15)
+        assert "%freq\n  Temp 298.15\nend" in text
+
     def test_final_e_parser_takes_sp_value(self):
         # Critical contract: parse_orca_final_energy uses [-1] which,
         # for a two-job compound, is the SP energy. Build a synthetic
