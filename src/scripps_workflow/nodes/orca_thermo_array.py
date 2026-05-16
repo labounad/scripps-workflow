@@ -48,6 +48,10 @@ Config keys (``key=value`` tokens or one JSON object) — same shape as
     keywords               First-job ``!`` line (the freq calc)         ["r2scan-3c TightSCF Freq"]
     singlepoint_keywords   Second-job ``!`` line, or null/none/"" to
                            skip the SP step entirely.                   ["wB97M-V def2-TZVPP TightSCF DEFGRID3"]
+    temperature_k          Thermo temperature (K). Must match
+                           ``thermo_aggregate.temperature_k``
+                           downstream or the v6.5 thermo cache
+                           drifts.                                       [298.15]
     maxcore                MB per ORCA process (clamped to >= 500)      [4000]
     nprocs                 ``%pal nprocs`` and ``--ntasks``              [8]
     time_limit             SBATCH ``-t``                                ["12:00:00"]
@@ -286,6 +290,16 @@ DEFAULT_SINGLEPOINT_KEYWORDS: str = "wB97M-V def2-TZVPP TightSCF DEFGRID3"
 #: rest of the array nodes' default of 8 — Frequency calculations
 #: parallelize well, but 8 is the cluster-wide sweet spot.
 DEFAULT_NPROCS: int = 8
+
+#: Temperature (K) used for thermochemistry. Matches
+#: :mod:`scripps_workflow.nodes.thermo_aggregate`'s default so the two
+#: nodes line up on the same value when neither is overridden. Pinned
+#: separately rather than imported to keep the inter-module coupling
+#: one-way (orca_thermo_array → thermo_aggregate, never the reverse).
+#: When this differs from thermo_aggregate's ``temperature_k`` the
+#: thermo cache key drifts and the cache misses (intentional — the
+#: thermal corrections aren't the same physics).
+DEFAULT_TEMPERATURE_K: float = 298.15
 
 #: Per-task ORCA input/output filenames. Note there is no
 #: ``ORCA_OPT_XYZ`` analogue — frequency runs preserve the input
@@ -595,6 +609,23 @@ SCHEMA = NodeSchema(
                 "tokens before they reach this node."
             ),
         ),
+        ConfigField(
+            name="temperature_k",
+            type="float",
+            default=DEFAULT_TEMPERATURE_K,
+            min_value=0.0,
+            description=(
+                "Temperature (K) at which the thermochemistry is "
+                "evaluated. Injected into ORCA's ``%freq Temp`` block "
+                "so the printed thermal corrections (H_corr, TS, …) "
+                "are computed at this T, and also used to build the "
+                "v6.5 ThermoRun + PredictedRun cache keys at node "
+                "entry. Must match ``thermo_aggregate.temperature_k`` "
+                "downstream — wire a shared tag node into both ports "
+                "when overriding, or the downstream Boltzmann math "
+                "will use a different T than the ORCA freq calc."
+            ),
+        ),
         # ----- NMR section -----
         ConfigField(
             name="run_shielding_h",
@@ -807,13 +838,12 @@ class OrcaThermoArray(Node):
             unpaired_electrons=cfg["unpaired_electrons"],
         )
 
-        # v6.5b cache check fires BEFORE any work (input staging, SLURM
-        # array build, sbatch). On hit, the manifest is fully
-        # populated from central-tree .gz files and we return; the
-        # whole SLURM round-trip is skipped.
-        if self._maybe_emit_cached_manifest_thermo(ctx, cfg, multiplicity):
-            return
-
+        # Record resolved config in manifest.inputs FIRST — before
+        # any cache check or compute. Anything that fails later (cache
+        # helper raises, sbatch errors, ORCA crashes mid-array) still
+        # leaves a self-describing manifest behind. Sibling nodes
+        # (crest, orca_goat, orca_dft_array) already follow this
+        # ordering; bug #56 was that this one didn't.
         ctx.set_inputs(
             max_concurrency=cfg["max_concurrency"],
             charge=cfg["charge"],
@@ -823,6 +853,7 @@ class OrcaThermoArray(Node):
             smd_solvent=cfg["smd_solvent"],
             keywords=cfg["keywords"],
             singlepoint_keywords=cfg["singlepoint_keywords"],
+            temperature_k=cfg["temperature_k"],
             maxcore=cfg["maxcore"],
             nprocs=cfg["nprocs"],
             time_limit=cfg["time_limit"],
@@ -864,6 +895,15 @@ class OrcaThermoArray(Node):
                 cfg["coupling_method"]
             )[0],
         )
+
+        # v6.5b cache check fires BEFORE any compute work (input
+        # staging, SLURM array build, sbatch). On hit, the manifest
+        # is fully populated from central-tree .gz files and we
+        # return; the whole SLURM round-trip is skipped. On miss
+        # (or failure), we already have set_inputs() above for a
+        # self-describing manifest.
+        if self._maybe_emit_cached_manifest_thermo(ctx, cfg, multiplicity):
+            return
 
         if ctx.upstream_manifest is None:
             ctx.fail("no_upstream_manifest")
@@ -942,6 +982,12 @@ class OrcaThermoArray(Node):
             solvent=cfg["solvent"],
             smd_solvent_override=cfg["smd_solvent"],
             xyz_filename="input.xyz",
+            # Thread the operator's T into ORCA's ``%freq Temp`` so the
+            # printed thermal corrections (H_corr, TS, etc.) are computed
+            # at the same T thermo_aggregate uses for ΔG / Boltzmann
+            # weights. Without this, overriding ``temperature_k`` only
+            # affected the downstream math, not the freq calc itself.
+            freq_temperature_k=cfg["temperature_k"],
         )
         nmr_inputs = build_nmr_input_files(
             cfg=cfg, multiplicity=multiplicity, xyz_filename="input.xyz",
@@ -1154,14 +1200,27 @@ class OrcaThermoArray(Node):
             ens_fp = _cache_fingerprint(ens_key)
             dft_key = build_dft_run_key(dft_inputs, ensemble_fingerprint=ens_fp)
             dft_fp = _cache_fingerprint(dft_key)
+            # ``thermo_aggregate_inputs`` is downstream and not visible
+            # here, but the v6.5 thermo-key build needs ``temperature_k``
+            # + ``standard_state`` from it. We forward the values from
+            # *this* node's config — the operator is responsible for
+            # piping the same numbers to both nodes via a tag node, and
+            # the writer side prefers this node's value when present
+            # (see ``ingest.py``'s thermo-key build). standard_state is
+            # left to the build_thermo_run_key default ("1m") since this
+            # node has no opinion on it.
             thermo_key = build_thermo_run_key(
                 own_inputs,
                 dft_run_fingerprint=dft_fp,
-                thermo_aggregate_inputs=None,  # downstream, not available here
+                thermo_aggregate_inputs={
+                    "temperature_k": cfg["temperature_k"],
+                },
             )
             thermo_fp = _cache_fingerprint(thermo_key)
             predicted_key = build_predicted_run_key(
-                own_inputs, thermo_run_fingerprint=thermo_fp,
+                own_inputs,
+                thermo_run_fingerprint=thermo_fp,
+                temperature_k=cfg["temperature_k"],
             )
         except Exception as e:
             logging_utils.log_warn(
