@@ -345,6 +345,14 @@ def monitor_array_job(
     iterations = 0
     start_t = time.monotonic()
 
+    # Dedupe the human-readable progress log: only emit when the
+    # rendered line differs from the previous one. Long SLURM array
+    # runs would otherwise spam the same "Progress: processed=0/100"
+    # line every monitor_interval_s, which buries any actual state
+    # change in noise. Internal counters + history snapshots still
+    # advance every iteration; only the visible log is throttled.
+    last_logged_line: str | None = None
+
     progress = progress_fn(tasks_root, n_tasks)
 
     while True:
@@ -353,7 +361,7 @@ def monitor_array_job(
         if record_history:
             history.append(progress.to_dict())
         if log_fn is not None:
-            log_fn(
+            line = (
                 "Progress: "
                 f"processed={progress.processed}/{progress.total} | "
                 f"success={progress.success} | "
@@ -361,6 +369,9 @@ def monitor_array_job(
                 f"in_progress={progress.in_progress} | "
                 f"left={progress.left}"
             )
+            if line != last_logged_line:
+                log_fn(line)
+                last_logged_line = line
 
         if timeout_s > 0 and (time.monotonic() - start_t) > timeout_s:
             return MonitorResult(

@@ -356,10 +356,15 @@ class TestMonitorArrayJob:
         )
         assert result.timed_out is False
 
-    def test_log_callback_invoked_per_iteration(self, tmp_path):
+    def test_log_dedupes_unchanged_progress(self, tmp_path):
+        """Successive iterations with identical progress emit ONE log
+        line, not one per iteration. This keeps long-running array
+        monitors from spamming the same status line every poll —
+        operators only see lines when state actually moves."""
         _write_tasks(tmp_path, ["empty", "empty"])
 
-        seq = [True, False]
+        # Five iterations, then drain.
+        seq = [True, True, True, True, True, False]
         idx = {"n": 0}
 
         def _sq(jobid: str) -> bool:
@@ -378,12 +383,50 @@ class TestMonitorArrayJob:
             sleep_fn=lambda s: None,
             log_fn=logs.append,
         )
-        # Two iterations → two log lines (then drain — drain branch
-        # does not log again).
+        # Both tasks stay "empty" across all five iterations →
+        # progress doesn't change → one log line total.
+        assert len(logs) == 1
+        assert "Progress:" in logs[0]
+        assert "processed=0/2" in logs[0]
+
+    def test_log_emits_new_line_on_progress_change(self, tmp_path):
+        """When progress actually moves, a fresh log line fires —
+        proves the dedupe is keyed on content, not call count."""
+        _write_tasks(tmp_path, ["empty", "empty"])
+
+        # Iterations: poll 1 sees empty/empty, between polls 1 and 2 a
+        # success sentinel lands, then drain.
+        polls = [True, True, False]
+        idx = {"n": 0}
+
+        def _sq(jobid: str) -> bool:
+            v = polls[idx["n"]]
+            idx["n"] += 1
+            # Drop a real ``.wf_status/done_success`` sentinel between
+            # iterations 1 and 2 so count_task_progress sees a state
+            # change at the next poll.
+            if idx["n"] == 1:
+                status = tmp_path / "task_0001" / ".wf_status"
+                status.mkdir(parents=True, exist_ok=True)
+                (status / "done_success").touch()
+            return v
+
+        logs: list[str] = []
+        monitor_array_job(
+            jobid="1",
+            tasks_root=tmp_path,
+            n_tasks=2,
+            monitor_interval_s=1,
+            monitor_timeout_min=0,
+            squeue_check=_sq,
+            sleep_fn=lambda s: None,
+            log_fn=logs.append,
+        )
+        # Iter 1: processed=0/2. Iter 2: processed=1/2 (one success
+        # landed). Two distinct lines.
         assert len(logs) == 2
-        for line in logs:
-            assert "Progress:" in line
-            assert "processed=" in line
+        assert "processed=0/2" in logs[0]
+        assert "processed=1/2" in logs[1]
 
     def test_record_history_off_by_default(self, tmp_path):
         _write_tasks(tmp_path, ["success"])
