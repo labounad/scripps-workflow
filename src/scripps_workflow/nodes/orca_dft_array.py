@@ -57,6 +57,7 @@ their wrapper to ``wf-orca-dft-array``.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable
@@ -64,6 +65,92 @@ from typing import Any, Callable
 from .. import logging_utils
 from ..hashing import sha256_file
 from ..node import Node, NodeContext
+from ..parsing import parse_bool
+from ..schema import Manifest
+
+
+# --------------------------------------------------------------------
+# v6.6 — optional cache imports. Best-effort, mirrors the CREST /
+# orca_thermo_array pattern.
+# --------------------------------------------------------------------
+
+_NMR_DATA_IMPORT_ERROR: str | None = None
+_RDKIT_IMPORT_ERROR: str | None = None
+
+try:
+    from nmr_data.cache import (  # noqa: F401
+        build_crest_ensemble_key,
+        build_dft_run_key,
+        build_goat_ensemble_key,
+        find_dft_run,
+        find_ensemble,
+        fingerprint as _cache_fingerprint,
+        inchikey_from_smiles,
+    )
+    from nmr_data.db import get_session
+    from nmr_data.models import Molecule
+    _HAS_NMR_DATA = True
+except Exception as _e:
+    _HAS_NMR_DATA = False
+    _NMR_DATA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    from rdkit import Chem  # noqa: F401
+    _HAS_RDKIT = True
+except Exception as _e:
+    _HAS_RDKIT = False
+    _RDKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+
+def _walk_upstream_for_step(ctx: NodeContext, step_name: str) -> dict | None:
+    """Walk back through ``upstream.manifest_path`` references for a
+    manifest whose ``step`` matches. Bounded to a handful of hops."""
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        if (current.get("step") or "") == step_name:
+            return current
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
+
+
+def _walk_upstream_for_smiles(ctx: NodeContext) -> str | None:
+    """Same shape as the CREST / orca_thermo_array helpers — walks the
+    chain looking for the first ``inputs.smiles``."""
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        s = (current.get("inputs") or {}).get("smiles")
+        if isinstance(s, str) and s:
+            return s
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
 from ..orca import (
     concat_xyz_files,
     make_orca_simple_input,
@@ -367,6 +454,33 @@ def _make_slurm_array_fields(
                 "cluster."
             ),
         ),
+        ConfigField(
+            name="use_cache",
+            type="bool",
+            default=True,
+            coercer=parse_bool,
+            description=(
+                "Consult the nmr-data DftRun cache on entry. On hit, "
+                "skip the SLURM DFT-opt array entirely — emit a "
+                "manifest pointing at the parent ensemble's "
+                "central-tree optimized xyzs so downstream nodes "
+                "(orca_thermo_array etc.) see the geometries as if "
+                "this node had just produced them. Set to false to "
+                "always re-run."
+            ),
+        ),
+        ConfigField(
+            name="force_recompute",
+            type="bool",
+            default=False,
+            coercer=parse_bool,
+            description=(
+                "Force a fresh DFT-opt array even when the cache "
+                "would hit. Useful when investigating ORCA non-"
+                "determinism or after an ORCA version bump that "
+                "should change the optimized geometries."
+            ),
+        ),
     )
 
 
@@ -590,7 +704,15 @@ class OrcaDftArray(Node):
             monitor_interval_s=cfg["monitor_interval_s"],
             monitor_timeout_min=cfg["monitor_timeout_min"],
             silence_openib=cfg["silence_openib"],
+            use_cache=bool(cfg.get("use_cache", True)),
+            force_recompute=bool(cfg.get("force_recompute", False)),
         )
+
+        # v6.6 cache check — fires before any input staging or SLURM
+        # work. On hit, the manifest is populated from the parent
+        # ensemble's central tree and we return.
+        if self._maybe_emit_cached_manifest_dft(ctx, cfg):
+            return
 
         if ctx.upstream_manifest is None:
             ctx.fail("no_upstream_manifest")
@@ -739,6 +861,205 @@ class OrcaDftArray(Node):
     # ------------------------------------------------------------------
     # Step handlers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # v6.6 cache hit path
+    # ------------------------------------------------------------------
+
+    def _maybe_emit_cached_manifest_dft(
+        self, ctx: NodeContext, cfg: dict[str, Any]
+    ) -> bool:
+        """Look up an existing :class:`DftRun` row for this molecule +
+        ensemble + dft-opt recipe. On hit, emit a manifest whose
+        ``artifacts.conformers`` bucket points at the parent
+        ensemble's central-tree optimized xyzs — downstream nodes
+        (orca_thermo_array etc.) walk it the same way they would a
+        fresh DFT-opt array output.
+
+        Returns True on a verified hit; False on any miss or
+        infra-missing path. Logs the reason in both cases so an
+        operator can grep stderr to figure out why a re-run did/didn't
+        cache.
+
+        v6.6 limitation: the cached *geometries* live in the parent
+        ConformerEnsemble's central tree, not under a dedicated
+        ``dft_runs/<uuid>/`` subtree. Means re-running the same CREST
+        recipe with a *different* dft-opt method on the same molecule
+        would silently reuse the first dft-opt's geometries — fine
+        for single-recipe pipelines, addressable later by a tiered
+        schema split.
+        """
+        if not cfg.get("use_cache", True):
+            logging_utils.log_info("orca-dft cache: disabled via use_cache=false")
+            return False
+        if cfg.get("force_recompute", False):
+            logging_utils.log_info(
+                "orca-dft cache: force_recompute=true → ignoring cache"
+            )
+            return False
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"orca-dft cache: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping check"
+            )
+            return False
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"orca-dft cache: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping check"
+            )
+            return False
+
+        db_url = os.environ.get("NMR_DATABASE_URL")
+        hpc_root = os.environ.get("NMR_HPC_DATA_ROOT")
+        if not db_url or not hpc_root:
+            logging_utils.log_info(
+                "orca-dft cache: NMR_DATABASE_URL or NMR_HPC_DATA_ROOT "
+                "unset, skipping check"
+            )
+            return False
+
+        # Walk upstream chain for SMILES + conformer-search inputs
+        # (CREST OR orca_goat — whichever produced the parent ensemble).
+        smiles = _walk_upstream_for_smiles(ctx)
+        crest_dict = _walk_upstream_for_step(ctx, "crest")
+        goat_dict = _walk_upstream_for_step(ctx, "orca_goat")
+        if not smiles or (crest_dict is None and goat_dict is None):
+            logging_utils.log_info(
+                "orca-dft cache: SMILES or upstream conformer-search "
+                "manifest not found, skipping check"
+            )
+            return False
+
+        try:
+            if crest_dict is not None:
+                ens_key = build_crest_ensemble_key(
+                    crest_dict.get("inputs") or {}, smiles
+                )
+            else:
+                ens_key = build_goat_ensemble_key(
+                    goat_dict.get("inputs") or {}, smiles
+                )
+            if ens_key is None:
+                logging_utils.log_info(
+                    "orca-dft cache: could not build EnsembleKey "
+                    "(rdkit / SMILES parse failure), skipping check"
+                )
+                return False
+            ens_fp = _cache_fingerprint(ens_key)
+
+            # Build the DftRunKey from our own cfg. Reader-side mapping
+            # mirrors what db_ingest's writer will eventually compute
+            # from this node's manifest inputs.
+            dft_key = build_dft_run_key(dict(cfg), ensemble_fingerprint=ens_fp)
+        except Exception as e:
+            logging_utils.log_warn(
+                f"orca-dft cache: key build raised, falling through: {e}"
+            )
+            return False
+
+        _orig_url = os.environ.get("NMR_DATABASE_URL")
+        os.environ["NMR_DATABASE_URL"] = db_url
+        try:
+            with get_session() as session:
+                inchikey = inchikey_from_smiles(smiles)
+                if not inchikey:
+                    return False
+                mol = session.query(Molecule).filter_by(
+                    inchikey=inchikey
+                ).one_or_none()
+                if mol is None:
+                    logging_utils.log_info(
+                        f"orca-dft cache: miss — no molecule row for {inchikey}"
+                    )
+                    return False
+                ensemble = find_ensemble(
+                    session, molecule_id=mol.id, key=ens_key,
+                )
+                if ensemble is None or not ensemble.ensemble_path:
+                    logging_utils.log_info(
+                        "orca-dft cache: miss — no matching ensemble row"
+                    )
+                    return False
+                dft_row = find_dft_run(
+                    session, ensemble_id=ensemble.id, key=dft_key,
+                )
+                if dft_row is None:
+                    logging_utils.log_info(
+                        "orca-dft cache: miss — no matching dft_run row"
+                    )
+                    return False
+                ensemble_path_rel = ensemble.ensemble_path
+                dft_run_id_str = str(dft_row.id)
+        finally:
+            if _orig_url is None:
+                os.environ.pop("NMR_DATABASE_URL", None)
+            else:
+                os.environ["NMR_DATABASE_URL"] = _orig_url
+
+        # Geometries source: parent ensemble's central tree. Walk its
+        # conformers/conf_NNNN/ subdirs, stage each xyz locally so
+        # downstream consumers see a normal-looking optimized_conformers/
+        # tree.
+        ens_abs = Path(hpc_root) / ensemble_path_rel
+        confs_root = ens_abs / "conformers"
+        if not confs_root.is_dir():
+            logging_utils.log_warn(
+                f"orca-dft cache: ensemble dir {confs_root} missing on disk, "
+                "falling through to compute"
+            )
+            return False
+
+        conf_dirs = sorted(
+            d for d in confs_root.iterdir()
+            if d.is_dir() and d.name.startswith("conf_")
+        )
+        if not conf_dirs:
+            logging_utils.log_warn(
+                f"orca-dft cache: no conformers under {confs_root}, "
+                "falling through"
+            )
+            return False
+
+        outputs_dir = ctx.outputs_dir
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        opt_root = outputs_dir / "optimized_conformers"
+        opt_root.mkdir(parents=True, exist_ok=True)
+
+        for cd in conf_dirs:
+            try:
+                idx = int(cd.name.removeprefix("conf_"))
+            except ValueError:
+                continue
+            xyzs = sorted(cd.glob("*.xyz"))
+            if not xyzs:
+                continue
+            src = xyzs[0]
+            dst = opt_root / f"conf_{idx:04d}.xyz"
+            shutil.copy2(src, dst)
+            ctx.add_artifact(
+                "conformers",
+                {
+                    "index": idx,
+                    "label": f"conf_{idx:04d}",
+                    "path_abs": str(dst.resolve()),
+                    "sha256": sha256_file(dst),
+                    "format": "xyz",
+                    "cache_hit": True,
+                },
+            )
+
+        ctx.set_input("cache_hit", True)
+        ctx.set_input("cached_ensemble_path", ensemble_path_rel)
+        ctx.set_input("cached_dft_run_id", dft_run_id_str)
+        ctx.set_input("n_cached_conformers", len(conf_dirs))
+
+        logging_utils.log_info(
+            f"orca-dft cache: HIT — dft_run={dft_run_id_str[:8]}..., "
+            f"sourced {len(conf_dirs)} conformer(s) from "
+            f"ensemble={ensemble_path_rel}. Skipping SLURM array."
+        )
+        return True
 
     def _submit(
         self,
