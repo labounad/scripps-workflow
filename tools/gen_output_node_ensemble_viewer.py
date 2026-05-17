@@ -423,12 +423,16 @@ function load_page() {
     // RDKit and the viewer state to be ready before drawing the inset.
     kick_off_rdkit();
 
-    // Preferred deployed-workflow path. wf-extract-conformers can stage
-    // the resolved xyz directly under this output block as
-    // data/viewer_input.json + data/<file>. That avoids all browser-side
-    // calls to workflow_backend/opaat resolver services, which are often
-    // blocked by iframe sandboxing, missing bearer tokens, or CORS.
-    resolve_staged_viewer_data()
+    // Preferred deployed-workflow path. wf-extract-conformers embeds the
+    // resolved xyz directly into this output block's index.html. That is more
+    // reliable than any browser-side API/inport lookup, and even more robust
+    // than fetching sibling data files because some GUI deployments only serve
+    // the original output-node asset paths.
+    resolve_embedded_viewer_data()
+        .then(function(loaded) {
+            if (loaded) return true;
+            return resolve_staged_viewer_data();
+        })
         .then(function(loaded) {
             if (loaded) return;
             switch (mode) {
@@ -439,6 +443,27 @@ function load_page() {
                 default:              return show_dropzone();
             }
         });
+}
+
+function resolve_embedded_viewer_data() {
+    return new Promise(function(resolve) {
+        var el = document.getElementById('scripps-viewer-input');
+        if (!el) return resolve(false);
+        try {
+            var meta = JSON.parse(el.textContent || '{}');
+            if (meta.smiles && !window.__pending_smiles) {
+                window.__pending_smiles = meta.smiles;
+            }
+            var xyz_text = meta.xyz_text || meta.xyz || meta.text;
+            if (!xyz_text) return resolve(false);
+            set_status('loading embedded ensemble data');
+            init_ensemble(String(xyz_text));
+            return resolve(true);
+        } catch (err) {
+            console.warn('Embedded viewer payload could not be parsed:', err);
+            return resolve(false);
+        }
+    });
 }
 
 function resolve_staged_viewer_data() {
@@ -563,7 +588,7 @@ function workflow_inport_service_url() {
     // occur when Layout nodes try to resolve inports through the old
     // opaat.scripps.edu endpoint.
     var origin = window.location.origin || 'https://workflow.scripps.edu';
-    return origin.replace(/\/$/, '')
+    return origin.replace(/\\/$/, '')
         + '/workflow_backend/exp_services.php'
         + '?serviceName=get_inputs_for_output_node';
 }
@@ -616,7 +641,7 @@ function try_inport_resolver(resolver, params) {
 
 function resolve_inport_with_fallbacks(params) {
     var same_origin_prefix = (window.location.origin || 'https://workflow.scripps.edu')
-        .replace(/\/$/, '') + '/';
+        .replace(/\\/$/, '') + '/';
 
     var resolvers = [
         {

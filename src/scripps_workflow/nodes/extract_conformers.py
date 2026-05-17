@@ -225,6 +225,57 @@ def _output_steps_consuming_file(script_text: str, *, source_protocol_id: int) -
     return steps
 
 
+def _embed_viewer_payload(block_dir: Path, *, meta: dict[str, Any], xyz_path: Path) -> Path | None:
+    """Embed the viewer payload directly into an output block's index.html.
+
+    The workflow GUI iframe has proven unreliable for fetching either inport
+    resolver endpoints or sibling ``data/*.json`` files. The one thing the GUI
+    must serve is the output block's ``index.html``. Embedding the XYZ text in
+    that HTML gives the viewer a zero-network primary path. The sidecar data
+    files are still written as useful artifacts/fallbacks.
+    """
+    index_path = block_dir / "index.html"
+    if not index_path.is_file():
+        _log(f"viewer embed skipped: missing {index_path}")
+        return None
+
+    try:
+        html = index_path.read_text(encoding="utf-8", errors="replace")
+        xyz_text = xyz_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        _log(f"viewer embed skipped: could not read payload/html: {e}")
+        return None
+
+    payload = dict(meta)
+    payload["inline"] = True
+    payload["xyz_text"] = xyz_text
+    payload_json = json.dumps(payload, sort_keys=True)
+    # Avoid ever closing the script tag from data, even though XYZ should not
+    # normally contain this sequence.
+    payload_json = payload_json.replace("</", "<\\/")
+    tag = (
+        '<script id="scripps-viewer-input" type="application/json">\n'
+        f'{payload_json}\n'
+        '</script>'
+    )
+
+    pattern = re.compile(
+        r'\n?\s*<script\s+id=["\']scripps-viewer-input["\']\s+type=["\']application/json["\']>.*?</script>\s*',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if pattern.search(html):
+        new_html = pattern.sub("\n" + tag + "\n", html, count=1)
+    elif "</body>" in html:
+        new_html = html.replace("</body>", tag + "\n</body>", 1)
+    elif "</html>" in html:
+        new_html = html.replace("</html>", tag + "\n</html>", 1)
+    else:
+        new_html = html + "\n" + tag + "\n"
+
+    index_path.write_text(new_html, encoding="utf-8")
+    return index_path.resolve()
+
+
 def _stage_for_output_viewers(
     *,
     exported_path: Path,
@@ -248,7 +299,11 @@ def _stage_for_output_viewers(
       outputs/<output_protocol_id>/onlb_*/data/viewer_input.json
       outputs/<output_protocol_id>/onlb_*/data/ensemble.xyz or geometry.xyz
 
-    The viewer tries this local staged file before any API/inport fallback.
+    It also embeds the same payload directly into index.html as an
+    application/json script tag. The direct embed is the primary path: some
+    workflow GUI deployments serve the output node HTML/JS but do not expose
+    newly-created sibling data files through the same static route. Embedding
+    in the already-served HTML avoids all browser-side inport/API fetches.
     """
     if not exported_path or not exported_path.is_file():
         return []
@@ -320,14 +375,18 @@ def _stage_for_output_viewers(
 
             meta_path = data_dir / "viewer_input.json"
             meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            embedded_index = _embed_viewer_payload(block_dir, meta=meta, xyz_path=staged_xyz)
             staged.append(
                 {
                     "output_protocol_id": output_protocol_id,
                     "block_dir": str(block_dir.resolve()),
                     "xyz_path": str(staged_xyz.resolve()),
                     "manifest_path": str(meta_path.resolve()),
+                    "embedded_index": str(embedded_index) if embedded_index else None,
                 }
             )
+            if embedded_index:
+                _log(f"embedded viewer data -> {embedded_index}")
             _log(f"staged viewer data -> {staged_xyz}")
 
     return staged

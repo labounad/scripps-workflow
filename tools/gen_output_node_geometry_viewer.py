@@ -216,11 +216,15 @@ function load_page() {
     var mode = pick_resolution_mode(params);
     console.log('geometry_viewer resolution mode:', mode);
 
-    // Preferred deployed-workflow path. A bridge node can stage the
-    // resolved xyz directly under this output block as
-    // data/viewer_input.json + data/<file>. This avoids browser-side
-    // resolver calls that can fail under the workflow GUI iframe.
-    resolve_staged_viewer_data()
+    // Preferred deployed-workflow path. A bridge node can embed the resolved
+    // xyz directly into this output block's index.html. That avoids all
+    // browser-side resolver calls and avoids depending on the GUI serving
+    // newly-created sibling data files.
+    resolve_embedded_viewer_data()
+        .then(function(loaded) {
+            if (loaded) return true;
+            return resolve_staged_viewer_data();
+        })
         .then(function(loaded) {
             if (loaded) return;
             switch (mode) {
@@ -231,6 +235,24 @@ function load_page() {
                 default:              return show_dropzone();
             }
         });
+}
+
+function resolve_embedded_viewer_data() {
+    return new Promise(function(resolve) {
+        var el = document.getElementById('scripps-viewer-input');
+        if (!el) return resolve(false);
+        try {
+            var meta = JSON.parse(el.textContent || '{}');
+            var xyz_text = meta.xyz_text || meta.xyz || meta.text;
+            if (!xyz_text) return resolve(false);
+            set_status('loading embedded geometry data');
+            init_viewer(String(xyz_text));
+            return resolve(true);
+        } catch (err) {
+            console.warn('Embedded viewer payload could not be parsed:', err);
+            return resolve(false);
+        }
+    });
 }
 
 function resolve_staged_viewer_data() {
@@ -299,7 +321,7 @@ function workflow_inport_service_url() {
     // occur when Layout nodes try to resolve inports through the old
     // opaat.scripps.edu endpoint.
     var origin = window.location.origin || 'https://workflow.scripps.edu';
-    return origin.replace(/\/$/, '')
+    return origin.replace(/\\/$/, '')
         + '/workflow_backend/exp_services.php'
         + '?serviceName=get_inputs_for_output_node';
 }
@@ -352,7 +374,7 @@ function try_inport_resolver(resolver, params) {
 
 function resolve_inport_with_fallbacks(params) {
     var same_origin_prefix = (window.location.origin || 'https://workflow.scripps.edu')
-        .replace(/\/$/, '') + '/';
+        .replace(/\\/$/, '') + '/';
 
     var resolvers = [
         {
