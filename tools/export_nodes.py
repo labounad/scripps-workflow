@@ -163,6 +163,25 @@ NODES: dict[str, NodeSpec] = {
             outputs=["file"],
             output_tags="file path",
         ),
+        NodeSpec(
+            name="wf-extract-conformers",
+            module="extract_conformers",
+            description=(
+                "Opinionated bridge node for Output/Layout viewers: consume "
+                "a wf.pointer.v1 manifest pointer from a conformer-producing "
+                "node and emit a concrete XYZ file path. With no config, it "
+                "extracts all conformers as a multi-frame XYZ for the ensemble "
+                "viewer. Optionally set conformer_index to a 1-based index or "
+                "'best' for a single-geometry viewer."
+            ),
+            inputs=[
+                "conformer_index",   # default all; integer 1-based; or best
+                "output_name",       # optional rename under outputs/
+                "copy_mode",         # copy | hardlink | symlink | none
+            ],
+            outputs=["file"],
+            output_tags="file path",
+        ),
         # --- conformer / QC pipeline ---
         NodeSpec(
             name="wf-xtb",

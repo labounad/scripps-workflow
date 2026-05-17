@@ -84,6 +84,7 @@ wf-nmr-aggregate     = "scripps_workflow.nodes.nmr_aggregate:main"
 wf-db-ingest         = "scripps_workflow.nodes.db_ingest:main"
 wf-tag-input         = "scripps_workflow.nodes.tag_input:main"
 wf-artifact-export   = "scripps_workflow.nodes.artifact_export:main"
+wf-extract-conformers = "scripps_workflow.nodes.extract_conformers:main"
 
 # GUI round-trip tooling.
 wf-export-gui = "scripps_workflow.gui.cli:export_main"
