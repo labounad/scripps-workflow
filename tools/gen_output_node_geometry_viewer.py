@@ -172,7 +172,7 @@ VIEWER_JS = """\
 //      then fetches the resolved URL. This is a best-guess pending
 //      first-hand observation of the GUI's actual iframe URL.
 //
-//   C. OPAAT_LEGACY: ?protocol_id=&user_id=
+//   C. GUI_INPORT: ?protocol_id=&user_id=
 //      The fasta_viewer-reference pattern at opaat.scripps.edu. Kept
 //      as a fallback in case some output is served from there.
 //
@@ -264,32 +264,107 @@ function resolve_workflow_gui(params) {
 
 // ---- Mode C: legacy opaat path ---------------------------------------
 
-function resolve_opaat_legacy(params) {
-    var url = OPAAT_LEGACY_SERVICE
+function workflow_inport_service_url() {
+    // Prefer the workflow GUI backend on the SAME ORIGIN as the
+    // iframe. This avoids the browser CORS/mixed-origin failures that
+    // occur when Layout nodes try to resolve inports through the old
+    // opaat.scripps.edu endpoint.
+    var origin = window.location.origin || 'https://workflow.scripps.edu';
+    return origin.replace(/\/$/, '')
+        + '/workflow_backend/exp_services.php'
+        + '?serviceName=get_inputs_for_output_node';
+}
+
+function build_inport_resolver_url(service_url, params) {
+    var url = service_url
         + '&protocol_id=' + encodeURIComponent(params.get('protocol_id'))
         + '&user_id='     + encodeURIComponent(params.get('user_id'))
         + '&index=0';
-    set_status('opaat-legacy mode: resolving inport');
-    fetch(url)
+
+    // The workflow backend has evolved over time. Older opaat-style
+    // resolvers only needed protocol_id/user_id/index; newer workflow
+    // endpoints may also use experiment_id or podid. Forward them when
+    // present without making them required.
+    ['experiment_id', 'podid'].forEach(function(k) {
+        if (params.get(k)) {
+            url += '&' + k + '=' + encodeURIComponent(params.get(k));
+        }
+    });
+    return url;
+}
+
+function resource_url_from_resolver_payload(data, resource_prefix) {
+    if (!data || !data[0] || !data[0].resource_url) {
+        return null;
+    }
+    return new URL(data[0].resource_url, resource_prefix).href;
+}
+
+function try_inport_resolver(resolver, params) {
+    var url = build_inport_resolver_url(resolver.url, params);
+    return fetch(url, { credentials: 'include' })
         .then(function(r) {
-            if (!r.ok) throw new Error('resolver HTTP ' + r.status);
+            if (!r.ok) {
+                throw new Error(resolver.name + ' HTTP ' + r.status);
+            }
             return r.json();
         })
         .then(function(data) {
-            if (!data || !data[0] || !data[0].resource_url) {
-                set_status('Upstream xyz not yet available', true);
-                return;
+            var xyz_url = resource_url_from_resolver_payload(
+                data,
+                resolver.resource_prefix
+            );
+            if (!xyz_url) {
+                throw new Error(resolver.name + ' returned no resource_url');
             }
-            var xyz_url = new URL(data[0].resource_url, OPAAT_RESOURCE_PREFIX).href;
+            return xyz_url;
+        });
+}
+
+function resolve_inport_with_fallbacks(params) {
+    var same_origin_prefix = (window.location.origin || 'https://workflow.scripps.edu')
+        .replace(/\/$/, '') + '/';
+
+    var resolvers = [
+        {
+            name: 'workflow-backend',
+            url: workflow_inport_service_url(),
+            resource_prefix: same_origin_prefix,
+        },
+        {
+            name: 'opaat-legacy',
+            url: OPAAT_LEGACY_SERVICE,
+            resource_prefix: OPAAT_RESOURCE_PREFIX,
+        },
+    ];
+
+    var errors = [];
+    function next(i) {
+        if (i >= resolvers.length) {
+            throw new Error(errors.join('; '));
+        }
+        return try_inport_resolver(resolvers[i], params)
+            .catch(function(err) {
+                console.warn('inport resolver failed:', resolvers[i].name, err);
+                errors.push(resolvers[i].name + ': ' + err.message);
+                return next(i + 1);
+            });
+    }
+    return next(0);
+}
+
+function resolve_opaat_legacy(params) {
+    set_status('workflow mode: resolving inport');
+    resolve_inport_with_fallbacks(params)
+        .then(function(xyz_url) {
             fetch_xyz(xyz_url);
         })
         .catch(function(err) {
             console.error(err);
-            set_status('Error resolving inport: ' + err, true);
+            set_status('Error resolving inport: ' + err.message, true);
         });
 }
 
-// ---- Mode D: drag-and-drop fallback ----------------------------------
 
 function show_dropzone() {
     set_status('no upstream binding — drop a file');
