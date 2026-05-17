@@ -46,6 +46,20 @@ htmlcov/
 outputs/
 .wf_status/
 slurm_logs/
+# … but DO commit the minimal fixture experiment dir used by the
+# local Output-node harnesses — it lives under tests/fixtures/ and
+# only carries placeholder files (the harness auto-deploys real
+# content on each run).
+!tests/fixtures/sample_experiment/outputs/
+!tests/fixtures/sample_experiment/outputs/**
+
+# Local-harness staging area (populated by `--xyz-file`).
+.harness_staged/
+
+# New-node bundles produced by tools/gen_output_node_*.py. Each
+# run generates a fresh ZIP under new_nodes_output/; only the
+# generator source belongs in git.
+new_nodes_output/
 
 # Engine round-trip caches
 .wf_export_cache/

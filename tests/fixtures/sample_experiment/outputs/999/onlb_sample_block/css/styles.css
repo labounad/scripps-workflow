@@ -1,0 +1,525 @@
+/* ensemble_viewer — viewer + sidebar layout. */
+
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+}
+
+#toolbar {
+    padding: 8px 12px;
+    background: #f4f4f6;
+    border-bottom: 1px solid #d8d8dc;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    height: 36px;
+    box-sizing: border-box;
+}
+
+#toolbar label {
+    color: #333;
+}
+
+#toolbar select,
+#toolbar button {
+    padding: 4px 8px;
+    font-size: 14px;
+}
+
+#status {
+    margin-left: auto;
+    color: #555;
+    font-size: 13px;
+    font-style: italic;
+}
+
+#content {
+    display: flex;
+    flex-direction: row;
+    height: calc(100vh - 53px);  /* 36px toolbar + ~17px border */
+    box-sizing: border-box;
+}
+
+#viewer {
+    position: relative;
+    flex: 1 1 auto;
+    height: 100%;
+    min-width: 0;
+}
+
+#sidebar {
+    width: 320px;
+    flex: 0 0 320px;
+    border-left: 1px solid #d8d8dc;
+    background: #fafafb;
+    overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+/* SMILES block: free-floating at the top of the sidebar, scrolls
+   with the content (not sticky — operator can scroll past it once
+   they're focused on conformers). */
+#smiles-block {
+    padding: 10px 12px 8px;
+    border-bottom: 1px solid #e4e4e8;
+    background: #fff;
+    font-size: 12px;
+}
+#smiles-block[hidden] {
+    display: none;
+}
+.sb-label {
+    color: #555;
+    font-size: 11px;
+    margin-bottom: 3px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+.sb-hint {
+    text-transform: none;
+    letter-spacing: 0;
+    color: #888;
+    font-style: italic;
+    font-size: 10px;
+    margin-left: 4px;
+}
+#smiles-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: #222;
+    word-break: break-all;
+    cursor: copy;
+    padding: 4px 6px;
+    background: #f6f6f9;
+    border-radius: 3px;
+    border: 1px solid #e8e8ec;
+    user-select: text;
+    position: relative;
+}
+
+/* Sticky sidebar sections. The header and the sparkline both pin
+   to the top so they stay visible while the conformer list scrolls.
+   They stack via incrementing ``top`` offsets. */
+.sidebar-section {
+    background: #fafafb;
+}
+.sticky-top {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    border-bottom: 1px solid #e4e4e8;
+}
+.sticky-below-header {
+    /* The header above is roughly 36px tall (single line of content
+       with padding). 38px gives a hair of margin so a 1px sub-pixel
+       round-up doesn't expose a gap. */
+    position: sticky;
+    top: 38px;
+    z-index: 2;
+    border-bottom: 1px solid #e4e4e8;
+}
+
+.sidebar-header {
+    padding: 8px 10px;
+    background: #f4f4f6;
+    font-size: 13px;
+    color: #333;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.sidebar-header strong {
+    font-weight: 600;
+}
+.sidebar-header span#conformer-count {
+    color: #888;
+    font-size: 12px;
+}
+.sidebar-header .spacer {
+    flex: 1;
+}
+
+/* Segmented toggle pill (energy unit, chart axis). */
+.seg-toggle {
+    display: inline-flex;
+    border: 1px solid #c8c8d0;
+    border-radius: 4px;
+    overflow: hidden;
+    font-size: 11px;
+}
+.seg-toggle button {
+    background: #fff;
+    border: none;
+    padding: 3px 7px;
+    cursor: pointer;
+    color: #555;
+    font-size: 11px;
+    line-height: 1.2;
+    border-right: 1px solid #c8c8d0;
+}
+.seg-toggle button:last-child {
+    border-right: none;
+}
+.seg-toggle button.active {
+    background: #2152a4;
+    color: #fff;
+}
+.seg-toggle.small button {
+    padding: 2px 6px;
+    font-size: 10px;
+}
+
+/* Sparkline block. The SVG's viewBox aspect (2.8:1) drives its
+   rendered height — no fixed CSS height — so circles stay
+   circular when the sidebar resizes. */
+.sparkline-row {
+    padding: 6px 8px 0;
+    background: #fafafb;
+}
+#sparkline {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+.sparkline-toolbar {
+    padding: 4px 10px 8px;
+    background: #fafafb;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+#sparkline-range {
+    color: #888;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    margin-left: auto;
+}
+
+#conformer-list {
+    flex: 1;
+}
+
+.conformer-card {
+    display: flex;
+    align-items: stretch;
+    cursor: pointer;
+    border-bottom: 1px solid #e8e8ec;
+    background: #fff;
+    transition: background 0.12s;
+}
+.conformer-card:hover {
+    background: #f0f4fa;
+}
+.conformer-card.active {
+    background: #e2ecfb;
+}
+.conformer-card.active .card-label {
+    font-weight: 600;
+}
+
+.color-band {
+    width: 4px;
+    flex: 0 0 4px;
+}
+
+.card-body {
+    flex: 1;
+    padding: 8px 10px;
+    min-width: 0;
+}
+
+.card-label {
+    font-size: 13px;
+    color: #222;
+    margin-bottom: 3px;
+}
+
+/* Energy badge — small framed monospace box, same visual treatment
+   as the SMILES box up top. The boxed bg/border gives the
+   .flash-copied green-flash overlay a visible target. */
+.card-dE {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    color: #333;
+    background: #f6f6f9;
+    border: 1px solid #e8e8ec;
+    border-radius: 3px;
+    padding: 2px 6px;
+    margin-bottom: 5px;
+    display: inline-block;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.35;
+}
+
+.bar-outer {
+    height: 4px;
+    background: #ececf0;
+    border-radius: 2px;
+    overflow: hidden;
+}
+.bar-inner {
+    height: 100%;
+    border-radius: 2px;
+}
+
+#dropzone {
+    position: absolute;
+    top: 36px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(248, 248, 252, 0.92);
+    z-index: 100;
+}
+/* The HTML5 ``hidden`` global attribute relies on the UA's
+   ``display: none`` rule. ID-targeted ``display`` properties below
+   have higher specificity (ID > attribute) and would otherwise win,
+   leaving the overlay permanently visible on top of the viewer.
+   These explicit overrides re-establish hidden-respect. */
+#dropzone[hidden],
+#structure-2d[hidden] {
+    display: none;
+}
+
+/* 2D structure inset. Three visual states:
+   (a) corner   — 80×80, bottom-left of viewer (default)
+   (b) hover    — 240×240 inline expansion (only when not .expanded)
+   (c) expanded — large overlay covering the viewer, for picking
+                  substructures comfortably
+   The cubic-bezier on the size + position properties uses the same
+   timing across all three so the inset feels physically anchored
+   as it grows / shrinks. */
+#structure-2d {
+    position: absolute;
+    bottom: 12px;
+    left: 12px;
+    width: 80px;
+    height: 80px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid #d8d8dc;
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: width 0.28s cubic-bezier(.4,.0,.2,1),
+                height 0.28s cubic-bezier(.4,.0,.2,1),
+                top 0.28s cubic-bezier(.4,.0,.2,1),
+                left 0.28s cubic-bezier(.4,.0,.2,1),
+                bottom 0.28s cubic-bezier(.4,.0,.2,1),
+                right 0.28s cubic-bezier(.4,.0,.2,1),
+                box-shadow 0.22s ease,
+                border-color 0.22s ease;
+    z-index: 50;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+#structure-2d:not(.expanded):hover {
+    width: 240px;
+    height: 240px;
+    border-color: #b8b8c0;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+}
+#structure-2d.expanded {
+    /* Use viewport-relative insets so the inset stays centered over
+       the 3D viewer no matter what size it is. The 3D viewer's
+       interaction is paused while expanded (overlay catches input). */
+    top: 16px;
+    right: 16px;
+    bottom: 16px;
+    left: 16px;
+    width: auto;
+    height: auto;
+    border-color: #b8b8c0;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22);
+}
+
+/* SVG host inside #structure-2d. RDKit's get_svg_with_highlights()
+   returns a self-contained <svg> we innerHTML in here; CSS makes
+   the SVG fill the host so it scales with the size transitions. */
+#structure-canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    overflow: hidden;
+}
+#structure-canvas svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: transparent;
+}
+/* RDKit emits ``class="atom-N"`` on heteroatom labels and
+   ``class="bond-N atom-A atom-B"`` on bond paths. Surface a copy
+   cursor over both so the user knows they're clickable; the
+   delegation handler on #structure-canvas does the rest. */
+#structure-canvas [class*="atom-"],
+#structure-canvas [class*="bond-"] {
+    cursor: pointer;
+}
+
+/* Chevron toggle in the inset's top-right. Only opaque on hover
+   (corner state) or always-on when .expanded. */
+#structure-expand-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 22px;
+    height: 22px;
+    border: 1px solid #d8d8dc;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.92);
+    color: #555;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.18s ease,
+                background 0.15s ease,
+                color 0.15s ease;
+    z-index: 2;
+}
+#structure-2d:hover #structure-expand-btn,
+#structure-2d.expanded #structure-expand-btn {
+    opacity: 1;
+}
+#structure-expand-btn:hover {
+    background: #2152a4;
+    color: #fff;
+    border-color: #2152a4;
+}
+
+/* Bottom toolbar — Align / Reset / "N selected" indicator. Hidden
+   in corner state, slides in on hover or expanded. */
+#structure-toolbar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 6px 8px;
+    background: linear-gradient(to top,
+                                rgba(245,245,250,0.96) 60%,
+                                rgba(245,245,250,0));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    pointer-events: none;
+    z-index: 2;
+}
+#structure-2d:hover #structure-toolbar,
+#structure-2d.expanded #structure-toolbar {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+#structure-selection-count {
+    flex: 1;
+    color: #555;
+    font-variant-numeric: tabular-nums;
+}
+.sb-action {
+    background: #fff;
+    border: 1px solid #c8c8d0;
+    color: #444;
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1.3;
+    transition: background 0.12s ease,
+                border-color 0.12s ease,
+                color 0.12s ease;
+}
+.sb-action:hover {
+    background: #f4f6fa;
+    border-color: #9aa6c4;
+}
+.sb-action.align {
+    background: #2152a4;
+    color: #fff;
+    border-color: #2152a4;
+}
+.sb-action.align:hover {
+    background: #1a4488;
+}
+.sb-action.align[disabled],
+.sb-action.reset[disabled] {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Copy-to-clipboard visual feedback. ``.flash-copied`` is added by
+   copy_value() for ~700ms after a successful clipboard write.
+   The "Copied!" pill sits BELOW the element and is horizontally
+   centered — works for the wide SMILES box (which sits near the
+   right edge of the sidebar) and the narrow energy boxes (which
+   sit on the left side of conformer cards) without overflowing
+   the sidebar on either side. */
+.copy-target {
+    cursor: copy;
+    position: relative;
+}
+.flash-copied {
+    background: #c8e6c9 !important;
+    border-color: #4caf50 !important;
+    box-shadow: 0 0 0 1px #4caf50, 0 0 8px rgba(76, 175, 80, 0.35);
+    transition: background 0.1s ease, border-color 0.1s ease,
+                box-shadow 0.1s ease;
+}
+.flash-copied::after {
+    content: 'Copied!';
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #4caf50;
+    color: #fff;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    font-weight: 500;
+    pointer-events: none;
+    white-space: nowrap;
+    z-index: 1000;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}
+#dropzone.dragging {
+    background: rgba(220, 232, 255, 0.92);
+    outline: 2px dashed #5e8fd8;
+    outline-offset: -8px;
+}
+.dropzone-inner {
+    text-align: center;
+    color: #333;
+    font-size: 15px;
+    line-height: 1.6;
+    padding: 32px 40px;
+    border: 1px dashed #b8b8c0;
+    border-radius: 8px;
+    background: #fff;
+}
+.dropzone-inner code {
+    background: #efeff3;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.filepicker {
+    color: #2152a4;
+    cursor: pointer;
+    text-decoration: underline;
+}
+.filepicker input {
+    display: none;
+}
