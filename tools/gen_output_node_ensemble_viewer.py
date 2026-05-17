@@ -92,10 +92,10 @@ THREEDMOL_CDN = "https://3Dmol.org/build/3Dmol-min.js"
 
 # Legacy opaat service shape, kept as fallback resolver mode C.
 OPAAT_SERVICE = (
-    "http://opaat.scripps.edu/workflow_webapp_api/services.php"
+    "https://opaat.scripps.edu/workflow_webapp_api/services.php"
     "?serviceName=get_inputs_for_output_node"
 )
-OPAAT_RESOURCE_PREFIX = "http://opaat.scripps.edu/"
+OPAAT_RESOURCE_PREFIX = "https://opaat.scripps.edu/"
 
 
 # ---------------------------------------------------------------------------
@@ -529,14 +529,17 @@ function resolve_opaat_legacy(params) {
         + '&index=0';
     set_status('opaat-legacy mode: resolving inport');
     fetch(url)
-        .then(function(r) { return r.json(); })
+        .then(function(r) {
+            if (!r.ok) throw new Error('resolver HTTP ' + r.status);
+            return r.json();
+        })
         .then(function(data) {
             if (!data || !data[0] || !data[0].resource_url) {
                 set_status('Upstream ensemble not yet available', true);
                 return;
             }
-            var resource = data[0].resource_url.replace('/', '//');
-            fetch_xyz(OPAAT_RESOURCE_PREFIX + resource);
+            var xyz_url = new URL(data[0].resource_url, OPAAT_RESOURCE_PREFIX).href;
+            fetch_xyz(xyz_url);
         })
         .catch(function(err) {
             console.error(err);

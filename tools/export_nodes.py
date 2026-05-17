@@ -142,6 +142,27 @@ NODES: dict[str, NodeSpec] = {
             inputs=["key", "value"],
             output_tags="",
         ),
+        NodeSpec(
+            name="wf-artifact-export",
+            module="artifact_export",
+            description=(
+                "Bridge node for GUI Layout/Output viewers: consume a "
+                "wf.pointer.v1 manifest pointer, select one artifact file "
+                "from the upstream manifest, copy it into this call's "
+                "outputs directory, and emit the concrete file path on "
+                "stdout. Wire this only into Output/Layout nodes, not "
+                "ordinary process nodes."
+            ),
+            inputs=[
+                "artifact_key",      # e.g. xyz, xyz_ensemble, files; 'auto' uses priority
+                "artifact_index",    # 0-based among usable files in the selected bucket
+                "artifact_label",    # optional exact label match
+                "output_name",       # optional rename under outputs/
+                "copy_mode",         # copy | hardlink | symlink | none
+            ],
+            outputs=["file"],
+            output_tags="file path",
+        ),
         # --- conformer / QC pipeline ---
         NodeSpec(
             name="wf-xtb",

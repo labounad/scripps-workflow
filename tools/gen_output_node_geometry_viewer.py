@@ -100,10 +100,10 @@ THREEDMOL_CDN = "https://3Dmol.org/build/3Dmol-min.js"
 # output node's inport bindings. Matches fasta_viewer.js verbatim;
 # changing this requires coordinating with the workflow GUI team.
 SERVICES_BASE = (
-    "http://opaat.scripps.edu/workflow_webapp_api/services.php"
+    "https://opaat.scripps.edu/workflow_webapp_api/services.php"
     "?serviceName=get_inputs_for_output_node"
 )
-RESOURCE_URL_PREFIX = "http://opaat.scripps.edu/"
+RESOURCE_URL_PREFIX = "https://opaat.scripps.edu/"
 
 
 # ---------------------------------------------------------------------------
@@ -271,14 +271,17 @@ function resolve_opaat_legacy(params) {
         + '&index=0';
     set_status('opaat-legacy mode: resolving inport');
     fetch(url)
-        .then(function(r) { return r.json(); })
+        .then(function(r) {
+            if (!r.ok) throw new Error('resolver HTTP ' + r.status);
+            return r.json();
+        })
         .then(function(data) {
             if (!data || !data[0] || !data[0].resource_url) {
                 set_status('Upstream xyz not yet available', true);
                 return;
             }
-            var resource = data[0].resource_url.replace('/', '//');
-            fetch_xyz(OPAAT_RESOURCE_PREFIX + resource);
+            var xyz_url = new URL(data[0].resource_url, OPAAT_RESOURCE_PREFIX).href;
+            fetch_xyz(xyz_url);
         })
         .catch(function(err) {
             console.error(err);
