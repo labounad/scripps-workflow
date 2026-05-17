@@ -721,54 +721,13 @@ function init_ensemble(text) {
     if ('HOVER_DURATION' in viewer) viewer.HOVER_DURATION = 0;
     frames.forEach(function(f) { viewer.addModel(f.text, 'xyz'); });
 
-    // Hover readout: 3Dmol.js fires the hover callback when the
-    // pointer enters an atom. We only surface the label when the
-    // hovered atom belongs to the currently-active conformer
-    // (atom.model === state.active_idx) — other-conformer atoms
-    // would be confusing since the user can't see / interact with
-    // them in single-conformer mode and they're greyed-out lines
-    // in overlay mode.
-    viewer.setHoverable(
-        {}, true,
-        function(atom /*, viewer_, event, container*/) {
-            var st = window.__viewer_state;
-            if (!st || !atom) return;
-            if (atom.model !== st.active_idx) return;
-            var info_el = document.getElementById('atom-hover-info');
-            if (!info_el) return;
-            var serial = (atom.serial != null) ? atom.serial : '';
-            info_el.textContent = (atom.elem || '?') + serial;
-            info_el.classList.add('visible');
-        },
-        function(/*atom, viewer_*/) {
-            var info_el = document.getElementById('atom-hover-info');
-            if (info_el) info_el.classList.remove('visible');
-        }
-    );
-    // Click-to-pin: clicking an atom of the active conformer pins
-    // its label at the bottom-center. Clicking the same atom again
-    // clears the pin. The hover readout (bottom-right) stays
-    // independent — it updates in real-time as the cursor moves.
-    viewer.setClickable(
-        {}, true,
-        function(atom /*, viewer_, event, container*/) {
-            var st = window.__viewer_state;
-            if (!st || !atom) return;
-            if (atom.model !== st.active_idx) return;
-            var pin_el = document.getElementById('atom-pinned-label');
-            if (!pin_el) return;
-            var serial = (atom.serial != null) ? atom.serial : '';
-            var label = (atom.elem || '?') + serial;
-            if (pin_el.textContent === label &&
-                pin_el.classList.contains('visible')) {
-                pin_el.classList.remove('visible');
-                pin_el.textContent = '';
-            } else {
-                pin_el.textContent = label;
-                pin_el.classList.add('visible');
-            }
-        }
-    );
+    // Hover + click registration happens in repaint_viewer() (called
+    // immediately below + on every active-conformer change). Without
+    // scoping to the active model, the overlay sticks of inactive
+    // conformers catch hover/click events first, blocking the active
+    // atom beneath. repaint_viewer flips hoverable/clickable on/off
+    // per model so picking always lands on the visible-and-active
+    // conformer.
 
     // Initial active = lowest-E conformer = first in sorted_indices.
     var lowest_idx = sorted_indices[0];
@@ -1860,6 +1819,46 @@ function set_chart_axis(axis) {
     render_sparkline();
 }
 
+// 3Dmol hover/click callbacks — module-level so repaint_viewer can
+// re-register them per-model without rebuilding closures every frame.
+
+function _viewer_hover_cb(atom /*, viewer_, ev, container*/) {
+    var st = window.__viewer_state;
+    if (!st || !atom) return;
+    // Should already be the active model (the selection scoping below
+    // limits hover registration to it), but keep the check as a
+    // belt-and-suspenders against stale callbacks.
+    if (atom.model !== st.active_idx) return;
+    var info_el = document.getElementById('atom-hover-info');
+    if (!info_el) return;
+    var serial = (atom.serial != null) ? atom.serial : '';
+    info_el.textContent = (atom.elem || '?') + serial;
+    info_el.classList.add('visible');
+}
+
+function _viewer_unhover_cb(/*atom, viewer_*/) {
+    var info_el = document.getElementById('atom-hover-info');
+    if (info_el) info_el.classList.remove('visible');
+}
+
+function _viewer_click_cb(atom /*, viewer_, ev, container*/) {
+    var st = window.__viewer_state;
+    if (!st || !atom) return;
+    if (atom.model !== st.active_idx) return;
+    var pin_el = document.getElementById('atom-pinned-label');
+    if (!pin_el) return;
+    var serial = (atom.serial != null) ? atom.serial : '';
+    var label = (atom.elem || '?') + serial;
+    if (pin_el.textContent === label &&
+        pin_el.classList.contains('visible')) {
+        pin_el.classList.remove('visible');
+        pin_el.textContent = '';
+    } else {
+        pin_el.textContent = label;
+        pin_el.classList.add('visible');
+    }
+}
+
 function repaint_viewer() {
     var state = window.__viewer_state;
     if (!state) return;
@@ -1870,11 +1869,22 @@ function repaint_viewer() {
     state.frames.forEach(function(_, i) {
         if (i === state.active_idx) {
             v.setStyle({ model: i }, active_style);
-        } else if (state.mode === 'overlay') {
-            v.setStyle({ model: i }, overlay_style);
+            // Only the active conformer's atoms accept hover/click —
+            // otherwise the inactive conformers' line geometry (the
+            // grey overlay sticks) eats picking events the user
+            // expects to land on the visible active atom underneath.
+            v.setHoverable({ model: i }, true,
+                           _viewer_hover_cb, _viewer_unhover_cb);
+            v.setClickable({ model: i }, true, _viewer_click_cb);
         } else {
-            // single mode: hide non-active models entirely.
-            v.setStyle({ model: i }, {});
+            if (state.mode === 'overlay') {
+                v.setStyle({ model: i }, overlay_style);
+            } else {
+                // single-conformer mode hides non-active models.
+                v.setStyle({ model: i }, {});
+            }
+            v.setHoverable({ model: i }, false);
+            v.setClickable({ model: i }, false);
         }
     });
     v.render();
