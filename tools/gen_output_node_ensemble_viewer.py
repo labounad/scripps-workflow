@@ -140,6 +140,17 @@ INDEX_HTML = """\
     </div>
     <div id="content">
         <div id="viewer">
+            <!-- Atom hover readout: small pill in the bottom-right
+                 corner of the viewer that surfaces "<elem><serial>"
+                 (e.g. "C2", "O11") when the cursor is over an atom
+                 of the active conformer. Other-conformer atoms are
+                 ignored. Empty / invisible when nothing is hovered. -->
+            <div id="atom-hover-info"></div>
+            <!-- Click-to-pin readout: bottom-center of the viewer.
+                 Set when the user clicks an atom. Independent of the
+                 hover readout above — both can be visible at once
+                 (hover updates the corner, click pins the center). -->
+            <div id="atom-pinned-label"></div>
             <!-- 2D structure inset. Three visual states:
                  (a) corner   — 80×80, bottom-left, default
                  (b) hover    — 240×240, expanded inline on hover
@@ -149,7 +160,7 @@ INDEX_HTML = """\
                  receives RDKit's get_svg_with_highlights() output;
                  clicks on atom-* / bond-* SVG classes are caught
                  via event delegation and drive the selection set. -->
-            <div id="structure-2d" hidden title="2D structure"
+            <div id="structure-2d" hidden
                  ondblclick="structure_bg_dblclick(event)">
                 <div id="structure-canvas"></div>
                 <button type="button" id="structure-expand-btn"
@@ -698,8 +709,66 @@ function init_ensemble(text) {
     // model. setStyle({model: N}, ...) controls visibility/appearance
     // per conformer without re-uploading geometry.
     var element = document.getElementById('viewer');
-    var viewer = $3Dmol.createViewer(element, { backgroundColor: 'white' });
+    var viewer = $3Dmol.createViewer(element, {
+        backgroundColor: 'white',
+        // 3Dmol's setHoverable defaults to a 500ms dwell time before
+        // the callback fires. That makes the atom-hover readout feel
+        // laggy; we want it to update the instant the cursor enters
+        // an atom. Setting via createViewer options for newer builds
+        // plus a direct property assignment below for older builds.
+        hoverDuration: 0,
+    });
+    if ('HOVER_DURATION' in viewer) viewer.HOVER_DURATION = 0;
     frames.forEach(function(f) { viewer.addModel(f.text, 'xyz'); });
+
+    // Hover readout: 3Dmol.js fires the hover callback when the
+    // pointer enters an atom. We only surface the label when the
+    // hovered atom belongs to the currently-active conformer
+    // (atom.model === state.active_idx) — other-conformer atoms
+    // would be confusing since the user can't see / interact with
+    // them in single-conformer mode and they're greyed-out lines
+    // in overlay mode.
+    viewer.setHoverable(
+        {}, true,
+        function(atom /*, viewer_, event, container*/) {
+            var st = window.__viewer_state;
+            if (!st || !atom) return;
+            if (atom.model !== st.active_idx) return;
+            var info_el = document.getElementById('atom-hover-info');
+            if (!info_el) return;
+            var serial = (atom.serial != null) ? atom.serial : '';
+            info_el.textContent = (atom.elem || '?') + serial;
+            info_el.classList.add('visible');
+        },
+        function(/*atom, viewer_*/) {
+            var info_el = document.getElementById('atom-hover-info');
+            if (info_el) info_el.classList.remove('visible');
+        }
+    );
+    // Click-to-pin: clicking an atom of the active conformer pins
+    // its label at the bottom-center. Clicking the same atom again
+    // clears the pin. The hover readout (bottom-right) stays
+    // independent — it updates in real-time as the cursor moves.
+    viewer.setClickable(
+        {}, true,
+        function(atom /*, viewer_, event, container*/) {
+            var st = window.__viewer_state;
+            if (!st || !atom) return;
+            if (atom.model !== st.active_idx) return;
+            var pin_el = document.getElementById('atom-pinned-label');
+            if (!pin_el) return;
+            var serial = (atom.serial != null) ? atom.serial : '';
+            var label = (atom.elem || '?') + serial;
+            if (pin_el.textContent === label &&
+                pin_el.classList.contains('visible')) {
+                pin_el.classList.remove('visible');
+                pin_el.textContent = '';
+            } else {
+                pin_el.textContent = label;
+                pin_el.classList.add('visible');
+            }
+        }
+    );
 
     // Initial active = lowest-E conformer = first in sorted_indices.
     var lowest_idx = sorted_indices[0];
@@ -954,10 +1023,22 @@ function render_2d_structure() {
         });
         var svg = mol.get_svg_with_highlights(opts);
         host.innerHTML = svg;
+        // Critical ordering: unhide the inset BEFORE expanding hit
+        // areas. expand_svg_hitboxes calls getBBox() on labeled-atom
+        // SVG elements to find their actual center, but getBBox()
+        // returns zeroes for elements whose ancestor is display:none.
+        // If we ran the hitbox pass while box was still hidden, the
+        // bond-endpoint fallback would fire and the O hitbox would
+        // land at the label edge instead of the label center — visible
+        // as "the O is only clickable on its second selection" since
+        // subsequent re-renders happen with box visible.
+        box.hidden = false;
+        // Force a synchronous layout pass so getBBox returns real
+        // values rather than zeros for newly-attached elements.
+        void box.offsetHeight;
         // Add invisible thicker hit areas for bonds + click circles
         // for unlabeled atoms so the user doesn't have to land on
-        // RDKit's thin paths perfectly. Must run after innerHTML and
-        // before installing the delegated handler.
+        // RDKit's thin paths perfectly.
         var svg_root = host.querySelector('svg');
         if (svg_root) expand_svg_hitboxes(svg_root);
         // Re-attach delegated click handler on host (innerHTML wipes
@@ -965,7 +1046,6 @@ function render_2d_structure() {
         // means we only need one listener regardless of re-renders).
         install_structure_click_handler(host);
         update_selection_toolbar();
-        box.hidden = false;
     } catch (err) {
         console.warn('RDKit render failed:', err);
     } finally {
@@ -1036,14 +1116,19 @@ function install_structure_click_handler(host) {
 }
 
 function structure_bg_dblclick(ev) {
-    // Toggle expand-to-center on a double-click of the inset
-    // background. Ignore double-clicks that hit an atom/bond hitbox
-    // (those should fall through to selection logic if anything).
+    // Double-clicking the inset background EXPANDS to the center
+    // overlay (a quick alternative to clicking the chevron). It
+    // does NOT collapse — collapse is chevron-only, so a stray
+    // double-click on the canvas while picking atoms can't accidentally
+    // tear down the expanded view. Atom/bond hits are ignored (they
+    // pass through to selection logic).
     var t = ev.target;
     if (t && t.getAttribute) {
         var cls = t.getAttribute('class') || '';
         if (/(?:^|\s)(atom-|bond-)/.test(cls)) return;
     }
+    var state = window.__viewer_state;
+    if (!state || state.is_expanded) return;
     toggle_structure_expanded(ev);
 }
 
@@ -1099,24 +1184,31 @@ function expand_svg_hitboxes(svg_root) {
     });
 
     // For atoms RDKit renders with a visible label (heteroatoms like
-    // O, N, S, …), the <text class="atom-N"> element sits at the
-    // atom's true center. Bond paths for these atoms are TRUNCATED to
-    // the label's bounding box, so the bond-endpoint position above
-    // is offset from the actual atom center. Override with the
-    // text element's x/y where it exists.
-    var atom_texts = svg_root.querySelectorAll('text[class*="atom-"]');
-    atom_texts.forEach(function(t) {
-        var cls = t.getAttribute('class') || '';
-        cls.split(/\\s+/).forEach(function(tok) {
-            var m = tok.match(/^atom-(\\d+)$/);
-            if (!m) return;
-            var idx = parseInt(m[1], 10);
-            var x = parseFloat(t.getAttribute('x'));
-            var y = parseFloat(t.getAttribute('y'));
-            if (isFinite(x) && isFinite(y)) {
-                atom_pos[idx] = [x, y];
-            }
-        });
+    // O, N, S, …), bond paths are TRUNCATED to the label's bounding
+    // box, so the bond-endpoint positions above are offset from the
+    // true atom centers. Override using the actual rendered bbox of
+    // each labeled atom element — this works regardless of how
+    // RDKit nests text (sometimes <text class="atom-N">, sometimes
+    // <g class="atom-N"><text>...</text></g>, sometimes split across
+    // <tspan>s for subscripts).
+    var atom_classed = svg_root.querySelectorAll('[class*="atom-"]');
+    atom_classed.forEach(function(el) {
+        var cls = el.getAttribute('class') || '';
+        if (/(?:^|\\s)(atom-hitbox|bond-)/.test(cls)) return;
+        var atom_tokens = cls.match(/atom-\\d+/g) || [];
+        // Bonds have two atom-* tokens (atom-A atom-B); atoms have one.
+        if (atom_tokens.length !== 1) return;
+        var idx = parseInt(atom_tokens[0].replace('atom-', ''), 10);
+        var bbox;
+        try {
+            bbox = el.getBBox();
+        } catch (e) {
+            return;
+        }
+        if (bbox && bbox.width > 0 && bbox.height > 0) {
+            atom_pos[idx] = [bbox.x + bbox.width / 2,
+                             bbox.y + bbox.height / 2];
+        }
     });
 
     // Add invisible click circles per atom. Radius 11 (up from 9) so
@@ -1195,10 +1287,13 @@ function toggle_structure_expanded(ev) {
     state.is_expanded = !state.is_expanded;
     if (state.is_expanded) {
         box.classList.add('expanded');
-        box.title = 'Click chevron to compact';
     } else {
         box.classList.remove('expanded');
-        box.title = '2D structure';
+    }
+    // Chevron tooltip reflects what the next click will do.
+    var btn = document.getElementById('structure-expand-btn');
+    if (btn) {
+        btn.title = state.is_expanded ? 'Collapse' : 'Expand to center';
     }
 }
 
@@ -1868,6 +1963,59 @@ html, body {
     flex: 1 1 auto;
     height: 100%;
     min-width: 0;
+}
+
+/* Atom-hover readout pinned to the bottom-right of the 3D viewer.
+   Empty / invisible by default; ``.visible`` is toggled by the
+   3Dmol setHoverable callback when the cursor is over an atom of
+   the active conformer. */
+#atom-hover-info {
+    position: absolute;
+    bottom: 12px;
+    right: 12px;
+    background: rgba(255, 255, 255, 0.94);
+    border: 1px solid #d8d8dc;
+    border-radius: 4px;
+    padding: 3px 9px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: #222;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+    z-index: 40;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+    min-width: 36px;
+    text-align: center;
+}
+#atom-hover-info.visible {
+    opacity: 1;
+}
+
+/* Click-to-pin atom label: bottom-center, accent-colored to feel
+   "selected". Empty / invisible until an atom in the active
+   conformer is clicked. Clicking the same atom again clears it. */
+#atom-pinned-label {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(33, 82, 164, 0.92);
+    color: #fff;
+    border-radius: 4px;
+    padding: 4px 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+    z-index: 40;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+}
+#atom-pinned-label.visible {
+    opacity: 1;
 }
 
 #sidebar {
