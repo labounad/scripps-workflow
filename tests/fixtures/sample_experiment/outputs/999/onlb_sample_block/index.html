@@ -34,6 +34,17 @@
     </div>
     <div id="content">
         <div id="viewer">
+            <!-- Atom hover readout: small pill in the bottom-right
+                 corner of the viewer that surfaces "<elem><serial>"
+                 (e.g. "C2", "O11") when the cursor is over an atom
+                 of the active conformer. Other-conformer atoms are
+                 ignored. Empty / invisible when nothing is hovered. -->
+            <div id="atom-hover-info"></div>
+            <!-- Click-to-pin readout: bottom-center of the viewer.
+                 Set when the user clicks an atom. Independent of the
+                 hover readout above — both can be visible at once
+                 (hover updates the corner, click pins the center). -->
+            <div id="atom-pinned-label"></div>
             <!-- 2D structure inset. Three visual states:
                  (a) corner   — 80×80, bottom-left, default
                  (b) hover    — 240×240, expanded inline on hover
@@ -43,7 +54,7 @@
                  receives RDKit's get_svg_with_highlights() output;
                  clicks on atom-* / bond-* SVG classes are caught
                  via event delegation and drive the selection set. -->
-            <div id="structure-2d" hidden title="2D structure"
+            <div id="structure-2d" hidden
                  ondblclick="structure_bg_dblclick(event)">
                 <div id="structure-canvas"></div>
                 <button type="button" id="structure-expand-btn"

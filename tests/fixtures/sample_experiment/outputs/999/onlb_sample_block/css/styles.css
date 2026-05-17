@@ -50,6 +50,59 @@ html, body {
     min-width: 0;
 }
 
+/* Atom-hover readout pinned to the bottom-right of the 3D viewer.
+   Empty / invisible by default; ``.visible`` is toggled by the
+   3Dmol setHoverable callback when the cursor is over an atom of
+   the active conformer. */
+#atom-hover-info {
+    position: absolute;
+    bottom: 12px;
+    right: 12px;
+    background: rgba(255, 255, 255, 0.94);
+    border: 1px solid #d8d8dc;
+    border-radius: 4px;
+    padding: 3px 9px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: #222;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+    z-index: 40;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+    min-width: 36px;
+    text-align: center;
+}
+#atom-hover-info.visible {
+    opacity: 1;
+}
+
+/* Click-to-pin atom label: bottom-center, accent-colored to feel
+   "selected". Empty / invisible until an atom in the active
+   conformer is clicked. Clicking the same atom again clears it. */
+#atom-pinned-label {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(33, 82, 164, 0.92);
+    color: #fff;
+    border-radius: 4px;
+    padding: 4px 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+    z-index: 40;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+}
+#atom-pinned-label.visible {
+    opacity: 1;
+}
+
 #sidebar {
     width: 320px;
     flex: 0 0 320px;
