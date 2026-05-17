@@ -31,9 +31,11 @@ that is what the GUI-generated ``step_updater.py`` expects for Output nodes.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import sys
@@ -150,6 +152,185 @@ def _copy_file(source: Path, dest: Path, *, copy_mode: str) -> Path:
     raise ExtractConformersError(
         f"unknown copy_mode={copy_mode!r}; expected copy, hardlink, symlink, or none"
     )
+
+
+def _protocol_id_from_call_dir(cwd: Path) -> int | None:
+    """Return the trailing GUI protocol id from a call directory name.
+
+    Example: ``wf_extract_conformers_imported_105443`` -> ``105443``.
+    """
+    m = re.search(r"_(\d+)$", cwd.name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _experiment_root_from_call_dir(cwd: Path) -> Path | None:
+    """Infer the experiment/run root from ``.../calls/<this-call>``."""
+    if cwd.parent.name == "calls":
+        return cwd.parent.parent.resolve()
+    return None
+
+
+def _step_protocol_map(script_text: str) -> dict[int, int]:
+    """Parse the GUI-generated ``-blanks -json`` step table.
+
+    The output-node shell blocks do not set ``protocol_id`` themselves, so
+    the only reliable way for a process node to discover the downstream
+    Output/Layout protocol id is the step table emitted at the top of the
+    generated script.
+    """
+    m = re.search(r"-blanks\s+-json\s+\"(.+?)\"", script_text, flags=re.DOTALL)
+    if not m:
+        return {}
+    raw = m.group(1)
+    try:
+        rows = ast.literal_eval(raw)
+    except Exception:
+        return {}
+
+    out: dict[int, int] = {}
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            out[int(row["step"])] = int(row["protocol_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _output_steps_consuming_file(script_text: str, *, source_protocol_id: int) -> list[int]:
+    """Return GUI step numbers whose output block consumes ``file_<pid>``."""
+    wanted = f"result_f=$file_{source_protocol_id}"
+    steps: list[int] = []
+    # Keep this intentionally simple/robust against cosmetic script changes:
+    # split on START markers and search each block for the exact assignment.
+    pattern = re.compile(
+        r"# START: Step\s+(\d+)\s+-+>\n(?P<body>.*?)(?=# START: Step|\Z)",
+        flags=re.DOTALL,
+    )
+    for m in pattern.finditer(script_text):
+        body = m.group("body")
+        if wanted in body and "-download" in body:
+            try:
+                steps.append(int(m.group(1)))
+            except ValueError:
+                pass
+    return steps
+
+
+def _stage_for_output_viewers(
+    *,
+    exported_path: Path,
+    output_kind: str | None,
+    inputs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Copy exported XYZ into linked Output/Layout viewer directories.
+
+    Why this exists:
+      The workflow GUI serves Layout nodes in an iframe, but browser-side
+      calls to ``get_inputs_for_output_node`` can fail because the iframe has
+      no bearer token and cross-origin requests to the legacy opaat endpoint
+      are blocked by CORS. Since this process node already has the concrete
+      file and runs on the same filesystem as the generated output block,
+      staging the data next to the viewer is the most robust contract.
+
+    The generated top-level script contains enough information to pair this
+    call with output blocks that consume ``$file_<this_protocol_id>``. For
+    each linked viewer, write:
+
+      outputs/<output_protocol_id>/onlb_*/data/viewer_input.json
+      outputs/<output_protocol_id>/onlb_*/data/ensemble.xyz or geometry.xyz
+
+    The viewer tries this local staged file before any API/inport fallback.
+    """
+    if not exported_path or not exported_path.is_file():
+        return []
+
+    cwd = Path.cwd().resolve()
+    run_root = _experiment_root_from_call_dir(cwd)
+    source_protocol_id = _protocol_id_from_call_dir(cwd)
+    if run_root is None or source_protocol_id is None:
+        _log("viewer staging skipped: could not infer run root/protocol id")
+        return []
+
+    script_path = run_root / "script"
+    if not script_path.is_file():
+        _log("viewer staging skipped: generated workflow script not found")
+        return []
+
+    try:
+        script_text = script_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        _log(f"viewer staging skipped: could not read script: {e}")
+        return []
+
+    step_to_protocol = _step_protocol_map(script_text)
+    consuming_steps = _output_steps_consuming_file(
+        script_text,
+        source_protocol_id=source_protocol_id,
+    )
+    output_protocol_ids = [
+        step_to_protocol[s] for s in consuming_steps if s in step_to_protocol
+    ]
+
+    if not output_protocol_ids:
+        _log("viewer staging: no linked output viewer blocks found")
+        return []
+
+    staged: list[dict[str, Any]] = []
+    default_file = "ensemble.xyz" if output_kind == "ensemble" else "geometry.xyz"
+    for output_protocol_id in output_protocol_ids:
+        output_dir = run_root / "outputs" / str(output_protocol_id)
+        if not output_dir.is_dir():
+            _log(f"viewer staging skipped: missing output dir {output_dir}")
+            continue
+
+        block_dirs = [p for p in output_dir.iterdir() if p.is_dir() and p.name.startswith("onlb_")]
+        if not block_dirs:
+            _log(f"viewer staging skipped: no onlb_* dir under {output_dir}")
+            continue
+
+        for block_dir in block_dirs:
+            data_dir = block_dir / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            staged_xyz = data_dir / default_file
+            shutil.copy2(exported_path, staged_xyz)
+
+            meta = {
+                "schema": "scripps.viewer_input.v1",
+                "file": staged_xyz.name,
+                "source_protocol_id": source_protocol_id,
+                "output_protocol_id": output_protocol_id,
+                "output_kind": output_kind,
+                "source_path_abs": str(exported_path.resolve()),
+            }
+            # Preserve a SMILES value in the sidecar when the user passes one
+            # through config. Most workflows do not, so viewers still degrade
+            # gracefully without the 2D inset/SMILES block.
+            smiles = inputs.get("smiles") or inputs.get("SMILES")
+            if smiles:
+                meta["smiles"] = str(smiles)
+
+            meta_path = data_dir / "viewer_input.json"
+            meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            staged.append(
+                {
+                    "output_protocol_id": output_protocol_id,
+                    "block_dir": str(block_dir.resolve()),
+                    "xyz_path": str(staged_xyz.resolve()),
+                    "manifest_path": str(meta_path.resolve()),
+                }
+            )
+            _log(f"staged viewer data -> {staged_xyz}")
+
+    return staged
 
 
 def _sort_key(item: dict[str, Any], fallback: int) -> tuple[int, int]:
@@ -297,6 +478,7 @@ def _write_manifest(
     source_kind: str | None,
     source_path: Path | None,
     source_records: list[SourceRecord],
+    staged_viewers: list[dict[str, Any]],
     failures: list[dict[str, Any]],
 ) -> None:
     manifest = Manifest.skeleton(
@@ -310,6 +492,8 @@ def _write_manifest(
     manifest.inputs.update(inputs)
     manifest.environment.update(_environment())
     manifest.failures.extend(failures)
+    if staged_viewers:
+        manifest.inputs["staged_viewers"] = staged_viewers
 
     if exported_path is not None and exported_path.is_file():
         try:
@@ -379,6 +563,7 @@ def _run(argv: Iterable[str]) -> int:
     source_kind: str | None = None
     source_path: Path | None = None
     selected_records: list[SourceRecord] = []
+    staged_viewers: list[dict[str, Any]] = []
 
     try:
         if len(argv_list) < 2:
@@ -543,6 +728,11 @@ def _run(argv: Iterable[str]) -> int:
                 )
 
         _log(f"exported -> {exported_path}")
+        staged_viewers = _stage_for_output_viewers(
+            exported_path=exported_path,
+            output_kind=output_kind,
+            inputs=inputs,
+        )
         _write_manifest(
             manifest_path=manifest_path,
             started_at_perf=started_at_perf,
@@ -554,6 +744,7 @@ def _run(argv: Iterable[str]) -> int:
             source_kind=source_kind,
             source_path=source_path,
             source_records=selected_records,
+            staged_viewers=staged_viewers,
             failures=failures,
         )
 
@@ -578,6 +769,7 @@ def _run(argv: Iterable[str]) -> int:
                 source_kind=source_kind,
                 source_path=source_path,
                 source_records=selected_records,
+                staged_viewers=staged_viewers,
                 failures=failures,
             )
         except Exception as write_err:

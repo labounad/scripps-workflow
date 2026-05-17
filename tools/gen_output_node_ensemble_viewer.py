@@ -412,7 +412,9 @@ function load_page() {
 
     // The SMILES is orthogonal to the resolution mode — any mode can
     // optionally carry it via ?smiles=<encoded>. Stash early so it's
-    // available when init_ensemble fires later.
+    // available when init_ensemble fires later. A staged viewer manifest
+    // may override this below when an upstream bridge node copied data
+    // directly into this output block.
     window.__pending_smiles = params.get('smiles') || null;
 
     install_keyboard_handler();
@@ -420,13 +422,46 @@ function load_page() {
     // It typically takes ~500ms; render_2d_structure() waits for both
     // RDKit and the viewer state to be ready before drawing the inset.
     kick_off_rdkit();
-    switch (mode) {
-        case 'LOCAL_TEST':    return resolve_local_test(params);
-        case 'WORKFLOW_GUI':  return resolve_workflow_gui(params);
-        case 'OPAAT_LEGACY':  return resolve_opaat_legacy(params);
-        case 'NONE':
-        default:              return show_dropzone();
-    }
+
+    // Preferred deployed-workflow path. wf-extract-conformers can stage
+    // the resolved xyz directly under this output block as
+    // data/viewer_input.json + data/<file>. That avoids all browser-side
+    // calls to workflow_backend/opaat resolver services, which are often
+    // blocked by iframe sandboxing, missing bearer tokens, or CORS.
+    resolve_staged_viewer_data()
+        .then(function(loaded) {
+            if (loaded) return;
+            switch (mode) {
+                case 'LOCAL_TEST':    return resolve_local_test(params);
+                case 'WORKFLOW_GUI':  return resolve_workflow_gui(params);
+                case 'OPAAT_LEGACY':  return resolve_opaat_legacy(params);
+                case 'NONE':
+                default:              return show_dropzone();
+            }
+        });
+}
+
+function resolve_staged_viewer_data() {
+    return fetch('data/viewer_input.json', { cache: 'no-store' })
+        .then(function(r) {
+            if (!r.ok) return false;
+            return r.json();
+        })
+        .then(function(meta) {
+            if (!meta) return false;
+            if (meta.smiles && !window.__pending_smiles) {
+                window.__pending_smiles = meta.smiles;
+            }
+            var file_name = meta.file || meta.file_name || 'ensemble.xyz';
+            var url = 'data/' + encodeURIComponent(file_name);
+            set_status('loading staged ensemble data');
+            fetch_xyz(url);
+            return true;
+        })
+        .catch(function(err) {
+            console.warn('No staged viewer data found; falling back to inport resolver:', err);
+            return false;
+        });
 }
 
 function kick_off_rdkit() {

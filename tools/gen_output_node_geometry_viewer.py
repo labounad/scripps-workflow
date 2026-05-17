@@ -215,13 +215,42 @@ function load_page() {
     var params = extract_get_parameters();
     var mode = pick_resolution_mode(params);
     console.log('geometry_viewer resolution mode:', mode);
-    switch (mode) {
-        case 'LOCAL_TEST':    return resolve_local_test(params);
-        case 'WORKFLOW_GUI':  return resolve_workflow_gui(params);
-        case 'OPAAT_LEGACY':  return resolve_opaat_legacy(params);
-        case 'NONE':
-        default:              return show_dropzone();
-    }
+
+    // Preferred deployed-workflow path. A bridge node can stage the
+    // resolved xyz directly under this output block as
+    // data/viewer_input.json + data/<file>. This avoids browser-side
+    // resolver calls that can fail under the workflow GUI iframe.
+    resolve_staged_viewer_data()
+        .then(function(loaded) {
+            if (loaded) return;
+            switch (mode) {
+                case 'LOCAL_TEST':    return resolve_local_test(params);
+                case 'WORKFLOW_GUI':  return resolve_workflow_gui(params);
+                case 'OPAAT_LEGACY':  return resolve_opaat_legacy(params);
+                case 'NONE':
+                default:              return show_dropzone();
+            }
+        });
+}
+
+function resolve_staged_viewer_data() {
+    return fetch('data/viewer_input.json', { cache: 'no-store' })
+        .then(function(r) {
+            if (!r.ok) return false;
+            return r.json();
+        })
+        .then(function(meta) {
+            if (!meta) return false;
+            var file_name = meta.file || meta.file_name || 'geometry.xyz';
+            var url = 'data/' + encodeURIComponent(file_name);
+            set_status('loading staged geometry data');
+            fetch_xyz(url);
+            return true;
+        })
+        .catch(function(err) {
+            console.warn('No staged viewer data found; falling back to inport resolver:', err);
+            return false;
+        });
 }
 
 function pick_resolution_mode(params) {
