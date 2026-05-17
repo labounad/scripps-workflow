@@ -5,7 +5,7 @@ Produces, for each node in :data:`NODES`, a directory tree::
 
     <out_dir>/<name>/
         <name>.json          # GUI metadata (top-level descriptor)
-        0/
+        <node_id>/
             script.sh        # bash shim that exec's the env-py against script.py
             script.py        # python shim that calls the package entry point
 
@@ -589,11 +589,19 @@ def write_node_bundle(
     # :func:`bundle_name`.
     surface = bundle_name(spec)
     bundle_dir = out_dir / surface
-    sub_dir = bundle_dir / "0"  # node_id placeholder; matches files_info paths
-    sub_dir.mkdir(parents=True, exist_ok=True)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
 
     env_py = resolve_env_py(spec, env_py)
     metadata = build_metadata(spec, env_py=env_py, host=host, version=version)
+    # The GUI importer expects the archive directory that contains script.sh/script.py
+    # to match metadata["node_id"] and files_info[*]["path"].  Older exports used a
+    # literal "0/" directory while files_info pointed at "<node_id>/..."; that
+    # imports poorly because the platform tries to rename a directory that is not
+    # actually present.
+    node_subdir_name = str(metadata["node_id"])
+    sub_dir = bundle_dir / node_subdir_name
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
     json_path = bundle_dir / f"{surface}.json"
     json_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -611,8 +619,8 @@ def write_node_bundle(
         zip_path = out_dir / f"NODE_{surface}_{suffix}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(json_path, arcname=json_path.name)
-            zf.write(sh_path, arcname=f"0/{sh_path.name}")
-            zf.write(py_path, arcname=f"0/{py_path.name}")
+            zf.write(sh_path, arcname=f"{node_subdir_name}/{sh_path.name}")
+            zf.write(py_path, arcname=f"{node_subdir_name}/{py_path.name}")
 
     return bundle_dir, zip_path
 
