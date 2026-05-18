@@ -25,7 +25,7 @@ NODE_DESCRIPTION = (
     "3Dmol.js single-geometry viewer. The source input may be a wf.pointer.v1 "
     "JSON string or a concrete XYZ path."
 )
-NODE_VERSION = "1.2.1"
+NODE_VERSION = "1.2.2"
 OUTPUT_ZIP = "geometry_viewer_bundle.zip"
 AUTHOR = {
     "user_id": 102,
@@ -83,9 +83,22 @@ def _maybe_reexec_into_workflow_python():
     if same:
         return
 
+    # The workflow GUI's plain `python3` often leaves PYTHONHOME/PYTHONPATH
+    # pointing at a system Python (observed: Python 3.8 stdlib paths leaking
+    # into the Python 3.12 workflow env, causing `SRE module mismatch`).  This
+    # must be scrubbed before exec.  Passing `-E` makes the target interpreter
+    # ignore any remaining PYTHON* environment variables during startup.
     env = os.environ.copy()
     env["SCRIPPS_WORKFLOW_NO_REEXEC"] = "1"
-    os.execvpe(env_py, [env_py, __file__, *sys.argv[1:]], env)
+    for key in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONNOUSERSITE",
+    ):
+        env.pop(key, None)
+    os.execvpe(env_py, [env_py, "-E", __file__, *sys.argv[1:]], env)
 
 
 _maybe_reexec_into_workflow_python()
