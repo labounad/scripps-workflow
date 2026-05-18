@@ -85,6 +85,8 @@ wf-db-ingest         = "scripps_workflow.nodes.db_ingest:main"
 wf-tag-input         = "scripps_workflow.nodes.tag_input:main"
 wf-artifact-export   = "scripps_workflow.nodes.artifact_export:main"
 wf-extract-conformers = "scripps_workflow.nodes.extract_conformers:main"
+wf-ensemble-viewer-bundle = "scripps_workflow.output_viewers.ensemble_bundle:main"
+wf-geometry-viewer-bundle = "scripps_workflow.output_viewers.geometry_bundle:main"
 
 # GUI round-trip tooling.
 wf-export-gui = "scripps_workflow.gui.cli:export_main"
