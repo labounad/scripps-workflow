@@ -71,6 +71,7 @@ def write_bundle(
     index_html: str,
     viewer_js: str,
     xyz_text: str,
+    css_text: str = COMMON_CSS,
     xyz_file_name: str,
     title: str | None,
     source_path: str | None,
@@ -107,7 +108,7 @@ def write_bundle(
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("index.html", html)
         zf.writestr("js/viewer.js", viewer_js)
-        zf.writestr("css/styles.css", COMMON_CSS)
+        zf.writestr("css/styles.css", css_text)
         zf.writestr(f"data/{xyz_file_name}", xyz_text)
         zf.writestr(
             "viewer_input.json",
@@ -141,6 +142,8 @@ Included files:
 - `viewer_input.json` — metadata copy with the bulky XYZ text omitted
 - `README.md` — this file
 
-The viewer loads 3Dmol.js from `https://3Dmol.org`, so internet access is
-required unless the browser has already cached that script.
+The ensemble viewer loads 3Dmol.js from `https://3Dmol.org` and RDKit.js
+from `https://unpkg.com/@rdkit/rdkit` for the optional 2D inset/selection
+tools, so internet access is required unless the browser has already cached
+those scripts.
 """
