@@ -371,8 +371,9 @@ def _register_file_for_output_viewers(
 
     registered: list[dict[str, Any]] = []
     for b in bindings:
+        step_updater_python = os.environ.get("WF_STEP_UPDATER_PYTHON", "python3")
         cmd = [
-            sys.executable,
+            step_updater_python,
             str(step_updater),
             "-e",
             str(experiment_id),

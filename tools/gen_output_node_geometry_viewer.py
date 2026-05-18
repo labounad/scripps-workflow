@@ -221,14 +221,22 @@ function load_page() {
     if (mode === 'LOCAL_TEST') return resolve_local_test(params);
     if (mode === 'WORKFLOW_GUI') return resolve_workflow_gui(params);
 
-    // Normal deployed GUI path. Match the platform's existing
-    // fasta_viewer contract: resolve the output-node inport through
-    // opaat's get_inputs_for_output_node service, then fetch the
-    // registered resource URL. The upstream wf-extract-conformers node
-    // proactively registers its concrete XYZ file against this output
-    // node's protocol id, because the GUI-generated output shell block
-    // can inherit stale protocol_id/protocol_name variables.
-    return resolve_opaat_legacy(params);
+    // Robust deployed-GUI path. First use data embedded/staged by
+    // wf-extract-conformers. This avoids browser-side auth/CORS issues
+    // entirely when the output HTML/data are available. If no staged
+    // payload is present, fall back to the platform's legacy resolver
+    // only when explicitly enabled.
+    return wait_for_viewer_data(params, { interval_ms: 2000, timeout_ms: 30000 })
+        .then(function(loaded) {
+            if (loaded) return;
+            if (params.get('allow_inport') === '1') {
+                return resolve_opaat_legacy(params);
+            }
+            set_status(
+                'No staged geometry data found. This viewer expects wf-extract-conformers to stage or register its output.',
+                true
+            );
+        });
 }
 
 function cache_bust(url) {
