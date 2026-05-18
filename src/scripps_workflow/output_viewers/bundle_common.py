@@ -71,7 +71,6 @@ def write_bundle(
     index_html: str,
     viewer_js: str,
     xyz_text: str,
-    css_text: str = COMMON_CSS,
     xyz_file_name: str,
     title: str | None,
     source_path: str | None,
@@ -89,6 +88,18 @@ def write_bundle(
     if output_path.exists():
         output_path.unlink()
 
+    metadata_payload = dict(metadata or {})
+    atom_map = metadata_payload.get("atom_map")
+    if atom_map is None and smiles:
+        try:
+            from .atom_mapping import derive_smiles_to_xyz_atom_map
+
+            atom_map = derive_smiles_to_xyz_atom_map(smiles, xyz_text)
+        except Exception:
+            atom_map = None
+    if atom_map is not None:
+        metadata_payload["atom_map"] = atom_map
+
     payload = {
         "schema": SCHEMA,
         "viewer": viewer_kind,
@@ -99,7 +110,8 @@ def write_bundle(
         "smiles": smiles,
         "selected_index": selected_index,
         "n_frames": n_frames,
-        "metadata": metadata or {},
+        "metadata": metadata_payload,
+        "atom_map": atom_map,
         "file_name": xyz_file_name,
         "xyz_text": xyz_text,
     }
@@ -108,7 +120,7 @@ def write_bundle(
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("index.html", html)
         zf.writestr("js/viewer.js", viewer_js)
-        zf.writestr("css/styles.css", css_text)
+        zf.writestr("css/styles.css", COMMON_CSS)
         zf.writestr(f"data/{xyz_file_name}", xyz_text)
         zf.writestr(
             "viewer_input.json",
@@ -142,8 +154,6 @@ Included files:
 - `viewer_input.json` — metadata copy with the bulky XYZ text omitted
 - `README.md` — this file
 
-The ensemble viewer loads 3Dmol.js from `https://3Dmol.org` and RDKit.js
-from `https://unpkg.com/@rdkit/rdkit` for the optional 2D inset/selection
-tools, so internet access is required unless the browser has already cached
-those scripts.
+The viewer loads 3Dmol.js from `https://3Dmol.org`, so internet access is
+required unless the browser has already cached that script.
 """
