@@ -137,7 +137,17 @@ def test_ensemble_viewer_generates_standalone_zip_bundle_from_pointer(tmp_path):
         "ensemble_viewer",
         "ensemble_viewer_bundle.zip",
     )
-    _run_output_script(node_zip, script_path, tmp_path, ptr, "ensemble_viewer_bundle.zip")
+    out = _run_output_script(node_zip, script_path, tmp_path, ptr, "ensemble_viewer_bundle.zip")
+    with zipfile.ZipFile(out) as zf:
+        html = zf.read("index.html").decode("utf-8")
+        js = zf.read("js/viewer.js").decode("utf-8")
+        css = zf.read("css/styles.css").decode("utf-8")
+        assert "structure-2d" in html
+        assert "RDKit_minimal.js" in html
+        assert "toggle_structure_expanded" in js
+        assert "align_to_selection" in js
+        assert "reset_alignment" in js
+        assert "#structure-2d" in css
 
 
 def test_geometry_viewer_generates_standalone_zip_bundle_from_pointer(tmp_path):
