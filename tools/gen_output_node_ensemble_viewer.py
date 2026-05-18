@@ -92,10 +92,10 @@ THREEDMOL_CDN = "https://3Dmol.org/build/3Dmol-min.js"
 
 # Legacy opaat service shape, kept as fallback resolver mode C.
 OPAAT_SERVICE = (
-    "https://opaat.scripps.edu/workflow_webapp_api/services.php"
+    "http://opaat.scripps.edu/workflow_webapp_api/services.php"
     "?serviceName=get_inputs_for_output_node"
 )
-OPAAT_RESOURCE_PREFIX = "https://opaat.scripps.edu/"
+OPAAT_RESOURCE_PREFIX = "http://opaat.scripps.edu/"
 
 
 # ---------------------------------------------------------------------------
@@ -428,31 +428,14 @@ function load_page() {
     if (mode === 'LOCAL_TEST') return resolve_local_test(params);
     if (mode === 'WORKFLOW_GUI') return resolve_workflow_gui(params);
 
-    // Normal deployed GUI path. Important: the output iframe can be
-    // loaded BEFORE wf-extract-conformers has patched this index.html.
-    // In that situation a one-shot lookup immediately falls through to
-    // the legacy inport resolver and produces the misleading
-    // "Failed to fetch" error. Instead, poll for either:
-    //   1. embedded JSON in the current DOM,
-    //   2. staged data/viewer_input.json, or
-    //   3. a newer copy of this same index.html containing embedded JSON.
-    // Only try the fragile legacy resolver if explicitly requested.
-    wait_for_viewer_data(params, {
-        timeout_ms: 10 * 60 * 1000,
-        interval_ms: 2000,
-        kind: 'ensemble',
-    }).then(function(loaded) {
-        if (loaded) return;
-        if (params.get('allow_inport') === '1') {
-            return resolve_opaat_legacy(params);
-        }
-        set_status(
-            'Waiting for ensemble data from wf-extract-conformers. ' +
-            'If the workflow has already finished, refresh or reopen this output panel.',
-            true
-        );
-        show_dropzone();
-    });
+    // Normal deployed GUI path. Match the platform's existing
+    // fasta_viewer contract: resolve the output-node inport through
+    // opaat's get_inputs_for_output_node service, then fetch the
+    // registered resource URL. The upstream wf-extract-conformers node
+    // proactively registers its concrete XYZ file against this output
+    // node's protocol id, because the GUI-generated output shell block
+    // can inherit stale protocol_id/protocol_name variables.
+    return resolve_opaat_legacy(params);
 }
 
 function cache_bust(url) {
@@ -725,7 +708,10 @@ function resource_url_from_resolver_payload(data, resource_prefix) {
 
 function try_inport_resolver(resolver, params) {
     var url = build_inport_resolver_url(resolver.url, params);
-    return fetch(url, { credentials: 'include' })
+    // Match the existing fasta_viewer node: use a plain GET without
+    // credentials. Adding credentials can trigger CORS failures against
+    // the legacy opaat endpoint.
+    return fetch(url)
         .then(function(r) {
             if (!r.ok) {
                 throw new Error(resolver.name + ' HTTP ' + r.status);
@@ -745,35 +731,16 @@ function try_inport_resolver(resolver, params) {
 }
 
 function resolve_inport_with_fallbacks(params) {
-    var same_origin_prefix = (window.location.origin || 'https://workflow.scripps.edu')
-        .replace(/\\/$/, '') + '/';
-
-    var resolvers = [
-        {
-            name: 'workflow-backend',
-            url: workflow_inport_service_url(),
-            resource_prefix: same_origin_prefix,
-        },
-        {
-            name: 'opaat-legacy',
-            url: OPAAT_LEGACY_SERVICE,
-            resource_prefix: OPAAT_RESOURCE_PREFIX,
-        },
-    ];
-
-    var errors = [];
-    function next(i) {
-        if (i >= resolvers.length) {
-            throw new Error(errors.join('; '));
-        }
-        return try_inport_resolver(resolvers[i], params)
-            .catch(function(err) {
-                console.warn('inport resolver failed:', resolvers[i].name, err);
-                errors.push(resolvers[i].name + ': ' + err.message);
-                return next(i + 1);
-            });
-    }
-    return next(0);
+    // Do not use workflow_backend from inside the iframe: in practice it
+    // returns 401 because the browser-side output iframe does not carry the
+    // bearer token used by step_updater.py. The shipped fasta_viewer uses
+    // only this legacy opaat resolver, so mirror that contract exactly.
+    var resolver = {
+        name: 'opaat-legacy',
+        url: OPAAT_LEGACY_SERVICE,
+        resource_prefix: OPAAT_RESOURCE_PREFIX,
+    };
+    return try_inport_resolver(resolver, params);
 }
 
 function resolve_opaat_legacy(params) {
