@@ -32,7 +32,7 @@ NODE_DESCRIPTION = (
     "3Dmol.js conformer ensemble viewer. The source input may be a "
     "wf.pointer.v1 JSON string or a concrete XYZ/multi-XYZ path."
 )
-NODE_VERSION = "1.2.2"
+NODE_VERSION = "1.2.3"
 OUTPUT_ZIP = "ensemble_viewer_bundle.zip"
 AUTHOR = {
     "user_id": 102,
@@ -109,6 +109,13 @@ def _maybe_reexec_into_workflow_python():
 
 
 _maybe_reexec_into_workflow_python()
+
+
+# Make the output-node deployment directory visible to the package code.
+# The GUI-generated shell uploads a fixed root-level zip, but users also
+# expect artifacts to appear under outputs/<protocol_id>/<block_key>/ in the
+# experiment file panel.  The package mirrors the generated zip there.
+os.environ.setdefault("SCRIPPS_VIEWER_OUTPUT_DIR", os.path.dirname(os.path.abspath(__file__)))
 
 
 # From here on we are either in the workflow Python or explicitly opted out.

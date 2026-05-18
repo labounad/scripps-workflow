@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import sys
 import zipfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -23,6 +26,42 @@ def _public_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Payload copy with bulky embedded data removed for viewer_input.json."""
 
     return {k: v for k, v in payload.items() if k != "xyz_text"}
+
+
+def _mirror_to_output_node_dir(output_path: Path) -> Path | None:
+    """Copy the bundle beside the deployed Output/Layout script if requested.
+
+    The workflow GUI's generated shell uploads a fixed root-level file such as
+    ``ensemble_viewer_bundle.zip``.  That upload path is useful for the GUI's
+    output block, but it is easy to miss in the experiment file browser and it
+    collides when the same output node appears more than once in a workflow.
+
+    The node shim sets ``SCRIPPS_VIEWER_OUTPUT_DIR`` to its deployment directory
+    (``outputs/<protocol_id>/<block_key>/``).  Mirroring the zip there gives each
+    viewer node a stable, per-node downloadable artifact in the file tree while
+    preserving the root-level file expected by the GUI-generated wrapper.
+    """
+
+    raw = os.environ.get("SCRIPPS_VIEWER_OUTPUT_DIR")
+    if not raw:
+        return None
+
+    target_dir = Path(raw).expanduser()
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / output_path.name
+        if target.resolve() == output_path.resolve():
+            return target
+        if target.exists():
+            target.unlink()
+        shutil.copy2(output_path, target)
+        return target
+    except OSError as exc:
+        print(
+            f"[output_viewer] WARNING: could not mirror bundle to {target_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def write_bundle(
@@ -75,6 +114,10 @@ def write_bundle(
             json.dumps(_public_payload(payload), indent=2, ensure_ascii=False) + "\n",
         )
         zf.writestr("README.md", _readme(viewer_kind=viewer_kind, xyz_file_name=xyz_file_name))
+
+    mirrored = _mirror_to_output_node_dir(output_path)
+    if mirrored is not None:
+        print(f"[output_viewer] mirrored bundle to {mirrored}", file=sys.stderr)
 
     return output_path
 
