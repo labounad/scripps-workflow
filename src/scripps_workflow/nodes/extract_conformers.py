@@ -427,6 +427,129 @@ def _register_file_for_output_viewers(
     return registered
 
 
+def _schedule_delayed_viewer_registrations(
+    *,
+    exported_path: Path,
+) -> list[dict[str, Any]]:
+    """Schedule post-output-step registration retries for linked viewers.
+
+    The GUI-generated Output/Layout shell block runs *after* this process node
+    and currently calls ``step_updater.py -download`` with stale
+    ``protocol_id`` / ``protocol_name`` variables. In practice that later stale
+    call can clobber the correct registration made synchronously by this node.
+
+    To make the bridge robust without editing GUI-generated ``step_updater.py``
+    or the generated workflow script, write and launch a tiny background shell
+    script that repeats the correct registration after the output step has had
+    time to run. The retry log is intentionally written under this call's
+    ``outputs/`` directory so exported run zips show exactly what happened.
+    """
+    if not exported_path or not exported_path.is_file():
+        return []
+
+    cwd = Path.cwd().resolve()
+    run_root = _experiment_root_from_call_dir(cwd)
+    source_protocol_id = _protocol_id_from_call_dir(cwd)
+    if run_root is None or source_protocol_id is None:
+        _log("delayed viewer registration skipped: could not infer run root/protocol id")
+        return []
+
+    step_updater = run_root / "step_updater.py"
+    script_path = run_root / "script"
+    if not step_updater.is_file() or not script_path.is_file():
+        _log("delayed viewer registration skipped: step_updater.py or script missing")
+        return []
+
+    try:
+        script_text = script_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        _log(f"delayed viewer registration skipped: could not read script: {e}")
+        return []
+
+    bindings = _output_bindings_consuming_file(script_text, source_protocol_id=source_protocol_id)
+    if not bindings:
+        _log("delayed viewer registration: no linked output viewer bindings found")
+        return []
+
+    experiment_id = os.environ.get("experiment_id") or run_root.name
+    step_updater_python = os.environ.get("WF_STEP_UPDATER_PYTHON", "python3")
+    outputs_dir = cwd / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    retry_script = outputs_dir / "viewer_registration_retry.sh"
+    retry_log = outputs_dir / "viewer_registration_retry.log"
+
+    lines = [
+        "#!/usr/bin/env bash",
+        "set +e",
+        f"LOG={str(retry_log)!r}",
+        "echo \"[viewer-registration-retry] start $(date -Is) host=$(hostname)\" >> \"$LOG\"",
+    ]
+    # Cumulative delays: 2s, 8s, 20s, 45s, 90s. This covers both immediate
+    # output-step clobbering and a user opening/reloading the viewer shortly
+    # after the process node finishes.
+    for delay in (2, 6, 12, 25, 45):
+        lines.append(f"sleep {delay}")
+        for b in bindings:
+            cmd = [
+                step_updater_python,
+                str(step_updater),
+                "-e", str(experiment_id),
+                "-pid", str(b.protocol_id),
+                "-pname", b.protocol_name,
+                "-download",
+                "-podid", str(b.podid),
+                "-body", str(exported_path.resolve()),
+            ]
+            quoted = " ".join(shlex_quote(x) for x in cmd)
+            lines.extend([
+                f"echo \"[viewer-registration-retry] $(date -Is) registering pid={b.protocol_id} pname={b.protocol_name} podid={b.podid} file={exported_path.resolve()}\" >> \"$LOG\"",
+                f"{quoted} >> \"$LOG\" 2>&1",
+                "rc=$?",
+                "echo \"[viewer-registration-retry] rc=${rc}\" >> \"$LOG\"",
+            ])
+    lines.append("echo \"[viewer-registration-retry] done $(date -Is)\" >> \"$LOG\"")
+    retry_script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    retry_script.chmod(0o755)
+
+    try:
+        subprocess.Popen(
+            ["bash", str(retry_script)],
+            cwd=str(run_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _log(f"scheduled delayed viewer registration retries -> {retry_log}")
+    except Exception as e:
+        _log(f"failed to schedule delayed viewer registration retries: {e}")
+
+    return [
+        {
+            "delayed_registration": {
+                "script": str(retry_script.resolve()),
+                "log": str(retry_log.resolve()),
+                "bindings": [
+                    {
+                        "step": b.step,
+                        "output_protocol_id": b.protocol_id,
+                        "output_protocol_name": b.protocol_name,
+                        "podid": b.podid,
+                    }
+                    for b in bindings
+                ],
+            }
+        }
+    ]
+
+
+def shlex_quote(s: object) -> str:
+    """Small local quote helper to avoid importing shlex in old bundles."""
+    text = str(s)
+    if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", text):
+        return text
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def _embed_viewer_payload(block_dir: Path, *, meta: dict[str, Any], xyz_path: Path) -> Path | None:
     """Embed the viewer payload directly into an output block's index.html.
 
@@ -1001,6 +1124,11 @@ def _run(argv: Iterable[str]) -> int:
             staged_viewers.extend(
                 {"registration": r} for r in registered_viewers
             )
+        delayed_registrations = _schedule_delayed_viewer_registrations(
+            exported_path=exported_path,
+        )
+        if delayed_registrations:
+            staged_viewers.extend(delayed_registrations)
         _write_manifest(
             manifest_path=manifest_path,
             started_at_perf=started_at_perf,

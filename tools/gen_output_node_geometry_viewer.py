@@ -229,13 +229,17 @@ function load_page() {
     return wait_for_viewer_data(params, { interval_ms: 2000, timeout_ms: 30000 })
         .then(function(loaded) {
             if (loaded) return;
-            if (params.get('allow_inport') === '1') {
-                return resolve_opaat_legacy(params);
-            }
-            set_status(
-                'No staged geometry data found. This viewer expects wf-extract-conformers to stage or register its output.',
-                true
-            );
+            // The GUI may serve the original imported output-node asset, not
+            // the run-directory copy patched by wf-extract-conformers. If the
+            // embedded/staged local payload is absent, keep polling the
+            // platform inport resolver; wf-extract-conformers schedules
+            // delayed re-registration to overwrite the GUI-generated stale
+            // -download call.
+            return wait_for_platform_inport(params, {
+                interval_ms: 5000,
+                timeout_ms: 600000,
+                kind: 'geometry'
+            });
         });
 }
 
@@ -498,6 +502,59 @@ function resolve_opaat_legacy(params) {
 }
 
 
+
+function wait_for_platform_inport(params, opts) {
+    var started = Date.now();
+    var interval_ms = opts.interval_ms || 5000;
+    var timeout_ms = opts.timeout_ms || 600000;
+    var kind = opts.kind || 'geometry';
+    var attempt_no = 0;
+    var diagnostic_prefix = '[' + kind + '_viewer] ';
+
+    function summarize_params() {
+        return 'href=' + window.location.href
+            + ' protocol_id=' + params.get('protocol_id')
+            + ' user_id=' + params.get('user_id')
+            + ' experiment_id=' + params.get('experiment_id')
+            + ' podid=' + params.get('podid');
+    }
+
+    function attempt() {
+        attempt_no += 1;
+        var elapsed = Math.round((Date.now() - started) / 1000);
+        set_status('No staged ' + kind + ' data in iframe; waiting for platform inport registration... '
+                   + elapsed + 's (attempt ' + attempt_no + ')');
+        console.log(diagnostic_prefix + 'platform resolver attempt', attempt_no, summarize_params());
+        return resolve_inport_with_fallbacks(params)
+            .then(function(xyz_url) {
+                console.log(diagnostic_prefix + 'platform resolver returned:', xyz_url);
+                set_status('platform inport resolved; loading ' + kind + ' xyz');
+                return fetch_xyz(xyz_url);
+            })
+            .then(function(ok) {
+                if (ok) return true;
+                throw new Error('fetch_xyz returned false');
+            })
+            .catch(function(err) {
+                console.warn(diagnostic_prefix + 'platform resolver/fetch attempt failed:', err);
+                if (Date.now() - started >= timeout_ms) {
+                    set_status(
+                        'Could not load ' + kind + ' data after ' + elapsed + 's. '
+                        + 'Last error: ' + (err && err.message ? err.message : err)
+                        + '. Diagnostics: ' + summarize_params(),
+                        true
+                    );
+                    return false;
+                }
+                return new Promise(function(resolve) {
+                    setTimeout(function() { resolve(attempt()); }, interval_ms);
+                });
+            });
+    }
+
+    return attempt();
+}
+
 function show_dropzone() {
     set_status('no upstream binding — drop a file');
     var dz = document.getElementById('dropzone');
@@ -544,15 +601,22 @@ function open_file(file) {
 // ---- Common: fetch + render -----------------------------------------
 
 function fetch_xyz(url) {
-    fetch(url)
+    console.log('[geometry_viewer] fetching xyz:', url);
+    return fetch(url)
         .then(function(response) {
-            if (!response.ok) throw new Error('HTTP ' + response.status);
+            if (!response.ok) throw new Error('HTTP ' + response.status + ' while fetching ' + url);
             return response.text();
         })
-        .then(function(text) { init_viewer(text); })
+        .then(function(text) {
+            console.log('[geometry_viewer] fetched xyz bytes:', text.length);
+            init_viewer(text);
+            window.__viewer_data_loaded = true;
+            return true;
+        })
         .catch(function(err) {
             console.error(err);
             set_status('Error fetching xyz: ' + err, true);
+            throw err;
         });
 }
 
