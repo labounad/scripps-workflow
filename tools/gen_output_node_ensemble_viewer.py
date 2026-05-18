@@ -416,6 +416,7 @@ function load_page() {
     // may override this below when an upstream bridge node copied data
     // directly into this output block.
     window.__pending_smiles = params.get('smiles') || null;
+    window.__viewer_data_loaded = false;
 
     install_keyboard_handler();
     // Kick off RDKit.js WASM init in parallel with the xyz fetch.
@@ -423,51 +424,110 @@ function load_page() {
     // RDKit and the viewer state to be ready before drawing the inset.
     kick_off_rdkit();
 
-    // Preferred deployed-workflow path. wf-extract-conformers embeds the
-    // resolved xyz directly into this output block's index.html. That is more
-    // reliable than any browser-side API/inport lookup, and even more robust
-    // than fetching sibling data files because some GUI deployments only serve
-    // the original output-node asset paths.
-    resolve_embedded_viewer_data()
-        .then(function(loaded) {
-            if (loaded) return true;
-            return resolve_staged_viewer_data();
-        })
-        .then(function(loaded) {
-            if (loaded) return;
-            switch (mode) {
-                case 'LOCAL_TEST':    return resolve_local_test(params);
-                case 'WORKFLOW_GUI':  return resolve_workflow_gui(params);
-                case 'OPAAT_LEGACY':  return resolve_opaat_legacy(params);
-                case 'NONE':
-                default:              return show_dropzone();
-            }
-        });
-}
+    // Local/manual modes should behave like ordinary static pages.
+    if (mode === 'LOCAL_TEST') return resolve_local_test(params);
+    if (mode === 'WORKFLOW_GUI') return resolve_workflow_gui(params);
 
-function resolve_embedded_viewer_data() {
-    return new Promise(function(resolve) {
-        var el = document.getElementById('scripps-viewer-input');
-        if (!el) return resolve(false);
-        try {
-            var meta = JSON.parse(el.textContent || '{}');
-            if (meta.smiles && !window.__pending_smiles) {
-                window.__pending_smiles = meta.smiles;
-            }
-            var xyz_text = meta.xyz_text || meta.xyz || meta.text;
-            if (!xyz_text) return resolve(false);
-            set_status('loading embedded ensemble data');
-            init_ensemble(String(xyz_text));
-            return resolve(true);
-        } catch (err) {
-            console.warn('Embedded viewer payload could not be parsed:', err);
-            return resolve(false);
+    // Normal deployed GUI path. Important: the output iframe can be
+    // loaded BEFORE wf-extract-conformers has patched this index.html.
+    // In that situation a one-shot lookup immediately falls through to
+    // the legacy inport resolver and produces the misleading
+    // "Failed to fetch" error. Instead, poll for either:
+    //   1. embedded JSON in the current DOM,
+    //   2. staged data/viewer_input.json, or
+    //   3. a newer copy of this same index.html containing embedded JSON.
+    // Only try the fragile legacy resolver if explicitly requested.
+    wait_for_viewer_data(params, {
+        timeout_ms: 10 * 60 * 1000,
+        interval_ms: 2000,
+        kind: 'ensemble',
+    }).then(function(loaded) {
+        if (loaded) return;
+        if (params.get('allow_inport') === '1') {
+            return resolve_opaat_legacy(params);
         }
+        set_status(
+            'Waiting for ensemble data from wf-extract-conformers. ' +
+            'If the workflow has already finished, refresh or reopen this output panel.',
+            true
+        );
+        show_dropzone();
     });
 }
 
+function cache_bust(url) {
+    var sep = url.indexOf('?') === -1 ? '?' : '&';
+    return url + sep + '_=' + Date.now();
+}
+
+function load_embedded_payload(meta, source_label) {
+    if (!meta) return false;
+    if (meta.smiles && !window.__pending_smiles) {
+        window.__pending_smiles = meta.smiles;
+    }
+    var xyz_text = meta.xyz_text || meta.xyz || meta.text;
+    if (!xyz_text) return false;
+    try {
+        set_status('loading ' + source_label + ' ensemble data');
+        init_ensemble(String(xyz_text));
+        window.__viewer_data_loaded = true;
+        return true;
+    } catch (err) {
+        console.error('Failed to initialize embedded ensemble:', err);
+        set_status('Failed to initialize embedded ensemble: ' + err, true);
+        return false;
+    }
+}
+
+function resolve_embedded_viewer_data() {
+    var el = document.getElementById('scripps-viewer-input');
+    if (!el) return Promise.resolve(false);
+    try {
+        return Promise.resolve(load_embedded_payload(
+            JSON.parse(el.textContent || '{}'),
+            'embedded'
+        ));
+    } catch (err) {
+        console.warn('Embedded viewer payload could not be parsed:', err);
+        return Promise.resolve(false);
+    }
+}
+
+function resolve_embedded_viewer_data_from_html(html_text) {
+    try {
+        var doc = new DOMParser().parseFromString(String(html_text), 'text/html');
+        var el = doc.getElementById('scripps-viewer-input');
+        if (!el) return false;
+        var meta = JSON.parse(el.textContent || '{}');
+        return load_embedded_payload(meta, 'refreshed embedded');
+    } catch (err) {
+        console.warn('Could not parse refreshed index.html for viewer payload:', err);
+        return false;
+    }
+}
+
+function resolve_refreshed_index_payload() {
+    var url = window.location.href.split('#')[0];
+    return fetch(cache_bust(url), { cache: 'no-store', credentials: 'same-origin' })
+        .then(function(r) {
+            if (!r.ok) return false;
+            return r.text();
+        })
+        .then(function(text) {
+            if (!text) return false;
+            return resolve_embedded_viewer_data_from_html(text);
+        })
+        .catch(function(err) {
+            console.warn('Could not refresh viewer index while waiting:', err);
+            return false;
+        });
+}
+
 function resolve_staged_viewer_data() {
-    return fetch('data/viewer_input.json', { cache: 'no-store' })
+    return fetch(cache_bust('data/viewer_input.json'), {
+            cache: 'no-store',
+            credentials: 'same-origin',
+        })
         .then(function(r) {
             if (!r.ok) return false;
             return r.json();
@@ -478,15 +538,60 @@ function resolve_staged_viewer_data() {
                 window.__pending_smiles = meta.smiles;
             }
             var file_name = meta.file || meta.file_name || 'ensemble.xyz';
-            var url = 'data/' + encodeURIComponent(file_name);
-            set_status('loading staged ensemble data');
-            fetch_xyz(url);
-            return true;
+            var url = cache_bust('data/' + encodeURIComponent(file_name));
+            return fetch(url, { cache: 'no-store', credentials: 'same-origin' })
+                .then(function(r) {
+                    if (!r.ok) return false;
+                    return r.text();
+                })
+                .then(function(text) {
+                    if (!text) return false;
+                    try {
+                        set_status('loading staged ensemble data');
+                        init_ensemble(text);
+                        window.__viewer_data_loaded = true;
+                        return true;
+                    } catch (err) {
+                        console.error('Failed to initialize staged ensemble:', err);
+                        set_status('Failed to initialize staged ensemble: ' + err, true);
+                        return false;
+                    }
+                });
         })
         .catch(function(err) {
-            console.warn('No staged viewer data found; falling back to inport resolver:', err);
+            console.warn('No staged viewer data found yet:', err);
             return false;
         });
+}
+
+function wait_for_viewer_data(params, opts) {
+    var started = Date.now();
+    var interval_ms = opts.interval_ms || 2000;
+    var timeout_ms = opts.timeout_ms || 600000;
+
+    function attempt() {
+        if (window.__viewer_data_loaded) return Promise.resolve(true);
+        return resolve_embedded_viewer_data()
+            .then(function(loaded) {
+                if (loaded) return true;
+                return resolve_staged_viewer_data();
+            })
+            .then(function(loaded) {
+                if (loaded) return true;
+                return resolve_refreshed_index_payload();
+            })
+            .then(function(loaded) {
+                if (loaded) return true;
+                if (Date.now() - started >= timeout_ms) return false;
+                var elapsed = Math.round((Date.now() - started) / 1000);
+                set_status('Waiting for ensemble data from wf-extract-conformers... ' + elapsed + 's');
+                return new Promise(function(resolve) {
+                    setTimeout(function() { resolve(attempt()); }, interval_ms);
+                });
+            });
+    }
+
+    return attempt();
 }
 
 function kick_off_rdkit() {

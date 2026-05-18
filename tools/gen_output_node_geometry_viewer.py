@@ -215,48 +215,104 @@ function load_page() {
     var params = extract_get_parameters();
     var mode = pick_resolution_mode(params);
     console.log('geometry_viewer resolution mode:', mode);
+    window.__viewer_data_loaded = false;
 
-    // Preferred deployed-workflow path. A bridge node can embed the resolved
-    // xyz directly into this output block's index.html. That avoids all
-    // browser-side resolver calls and avoids depending on the GUI serving
-    // newly-created sibling data files.
-    resolve_embedded_viewer_data()
-        .then(function(loaded) {
-            if (loaded) return true;
-            return resolve_staged_viewer_data();
-        })
-        .then(function(loaded) {
-            if (loaded) return;
-            switch (mode) {
-                case 'LOCAL_TEST':    return resolve_local_test(params);
-                case 'WORKFLOW_GUI':  return resolve_workflow_gui(params);
-                case 'OPAAT_LEGACY':  return resolve_opaat_legacy(params);
-                case 'NONE':
-                default:              return show_dropzone();
-            }
-        });
-}
+    // Local/manual modes should behave like ordinary static pages.
+    if (mode === 'LOCAL_TEST') return resolve_local_test(params);
+    if (mode === 'WORKFLOW_GUI') return resolve_workflow_gui(params);
 
-function resolve_embedded_viewer_data() {
-    return new Promise(function(resolve) {
-        var el = document.getElementById('scripps-viewer-input');
-        if (!el) return resolve(false);
-        try {
-            var meta = JSON.parse(el.textContent || '{}');
-            var xyz_text = meta.xyz_text || meta.xyz || meta.text;
-            if (!xyz_text) return resolve(false);
-            set_status('loading embedded geometry data');
-            init_viewer(String(xyz_text));
-            return resolve(true);
-        } catch (err) {
-            console.warn('Embedded viewer payload could not be parsed:', err);
-            return resolve(false);
+    // Normal deployed GUI path. The output iframe can be loaded before
+    // wf-extract-conformers patches this index.html, so wait/poll for
+    // staged or embedded data instead of immediately falling through to
+    // the fragile inport resolver.
+    wait_for_viewer_data(params, {
+        timeout_ms: 10 * 60 * 1000,
+        interval_ms: 2000,
+        kind: 'geometry',
+    }).then(function(loaded) {
+        if (loaded) return;
+        if (params.get('allow_inport') === '1') {
+            return resolve_opaat_legacy(params);
         }
+        set_status(
+            'Waiting for geometry data from wf-extract-conformers. ' +
+            'If the workflow has already finished, refresh or reopen this output panel.',
+            true
+        );
+        show_dropzone();
     });
 }
 
+function cache_bust(url) {
+    var sep = url.indexOf('?') === -1 ? '?' : '&';
+    return url + sep + '_=' + Date.now();
+}
+
+function load_embedded_payload(meta, source_label) {
+    if (!meta) return false;
+    var xyz_text = meta.xyz_text || meta.xyz || meta.text;
+    if (!xyz_text) return false;
+    try {
+        set_status('loading ' + source_label + ' geometry data');
+        init_viewer(String(xyz_text));
+        window.__viewer_data_loaded = true;
+        return true;
+    } catch (err) {
+        console.error('Failed to initialize embedded geometry:', err);
+        set_status('Failed to initialize embedded geometry: ' + err, true);
+        return false;
+    }
+}
+
+function resolve_embedded_viewer_data() {
+    var el = document.getElementById('scripps-viewer-input');
+    if (!el) return Promise.resolve(false);
+    try {
+        return Promise.resolve(load_embedded_payload(
+            JSON.parse(el.textContent || '{}'),
+            'embedded'
+        ));
+    } catch (err) {
+        console.warn('Embedded viewer payload could not be parsed:', err);
+        return Promise.resolve(false);
+    }
+}
+
+function resolve_embedded_viewer_data_from_html(html_text) {
+    try {
+        var doc = new DOMParser().parseFromString(String(html_text), 'text/html');
+        var el = doc.getElementById('scripps-viewer-input');
+        if (!el) return false;
+        var meta = JSON.parse(el.textContent || '{}');
+        return load_embedded_payload(meta, 'refreshed embedded');
+    } catch (err) {
+        console.warn('Could not parse refreshed index.html for viewer payload:', err);
+        return false;
+    }
+}
+
+function resolve_refreshed_index_payload() {
+    var url = window.location.href.split('#')[0];
+    return fetch(cache_bust(url), { cache: 'no-store', credentials: 'same-origin' })
+        .then(function(r) {
+            if (!r.ok) return false;
+            return r.text();
+        })
+        .then(function(text) {
+            if (!text) return false;
+            return resolve_embedded_viewer_data_from_html(text);
+        })
+        .catch(function(err) {
+            console.warn('Could not refresh viewer index while waiting:', err);
+            return false;
+        });
+}
+
 function resolve_staged_viewer_data() {
-    return fetch('data/viewer_input.json', { cache: 'no-store' })
+    return fetch(cache_bust('data/viewer_input.json'), {
+            cache: 'no-store',
+            credentials: 'same-origin',
+        })
         .then(function(r) {
             if (!r.ok) return false;
             return r.json();
@@ -264,15 +320,60 @@ function resolve_staged_viewer_data() {
         .then(function(meta) {
             if (!meta) return false;
             var file_name = meta.file || meta.file_name || 'geometry.xyz';
-            var url = 'data/' + encodeURIComponent(file_name);
-            set_status('loading staged geometry data');
-            fetch_xyz(url);
-            return true;
+            var url = cache_bust('data/' + encodeURIComponent(file_name));
+            return fetch(url, { cache: 'no-store', credentials: 'same-origin' })
+                .then(function(r) {
+                    if (!r.ok) return false;
+                    return r.text();
+                })
+                .then(function(text) {
+                    if (!text) return false;
+                    try {
+                        set_status('loading staged geometry data');
+                        init_viewer(text);
+                        window.__viewer_data_loaded = true;
+                        return true;
+                    } catch (err) {
+                        console.error('Failed to initialize staged geometry:', err);
+                        set_status('Failed to initialize staged geometry: ' + err, true);
+                        return false;
+                    }
+                });
         })
         .catch(function(err) {
-            console.warn('No staged viewer data found; falling back to inport resolver:', err);
+            console.warn('No staged viewer data found yet:', err);
             return false;
         });
+}
+
+function wait_for_viewer_data(params, opts) {
+    var started = Date.now();
+    var interval_ms = opts.interval_ms || 2000;
+    var timeout_ms = opts.timeout_ms || 600000;
+
+    function attempt() {
+        if (window.__viewer_data_loaded) return Promise.resolve(true);
+        return resolve_embedded_viewer_data()
+            .then(function(loaded) {
+                if (loaded) return true;
+                return resolve_staged_viewer_data();
+            })
+            .then(function(loaded) {
+                if (loaded) return true;
+                return resolve_refreshed_index_payload();
+            })
+            .then(function(loaded) {
+                if (loaded) return true;
+                if (Date.now() - started >= timeout_ms) return false;
+                var elapsed = Math.round((Date.now() - started) / 1000);
+                set_status('Waiting for geometry data from wf-extract-conformers... ' + elapsed + 's');
+                return new Promise(function(resolve) {
+                    setTimeout(function() { resolve(attempt()); }, interval_ms);
+                });
+            });
+    }
+
+    return attempt();
 }
 
 function pick_resolution_mode(params) {
