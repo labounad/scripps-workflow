@@ -16,8 +16,7 @@ NODE_VERSION = "1.2.4"
 WORKFLOW_HOST = "workflow.scripps.edu"
 DEFAULT_WORKFLOW_PYTHON = "/gpfs/group/shenvi/envs/workflow312/bin/python"
 DEFAULT_REPO_SRC_CANDIDATES = (
-    "/gpfs/group/shenvi/Users/labounader/scripps-workflow/src",
-    "/gpfs/home/labounader/scripps-workflow/src",
+    "/gpfs/group/shenvi/code/scripps-workflow/src",
 )
 
 AUTHOR = {

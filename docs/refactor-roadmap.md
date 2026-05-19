@@ -256,7 +256,7 @@ git commit -m "..."
 git push origin main
 
 # on HPC
-cd /gpfs/group/shenvi/Users/labounader/scripps-workflow
+cd /gpfs/group/shenvi/code/scripps-workflow
 git pull
 pip install -e .
 ```

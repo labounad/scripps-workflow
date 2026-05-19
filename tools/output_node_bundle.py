@@ -164,7 +164,6 @@ def render_script_py(spec: LayoutNodeSpec) -> str:
                     ])
 
             candidates.extend(Path(p) for p in DEFAULT_REPO_SRC_CANDIDATES)
-            candidates.append(Path.home() / "scripps-workflow" / "src")
 
             seen = set()
             out = []
@@ -177,8 +176,11 @@ def render_script_py(spec: LayoutNodeSpec) -> str:
                 if key in seen:
                     continue
                 seen.add(key)
-                if (resolved / "scripps_workflow").is_dir():
-                    out.append(resolved)
+                try:
+                    if (resolved / "scripps_workflow").is_dir():
+                        out.append(resolved)
+                except OSError:
+                    continue
             return out
 
 

@@ -21,7 +21,7 @@ cleanest in the existing zoo)::
       },
       "environment": {
           "python": "3.11.14",
-          "python_exe": "/gpfs/group/shenvi/envs/workflow/bin/python",
+          "python_exe": "/gpfs/group/shenvi/envs/workflow312/bin/python",
           "platform": "Linux-5.14.0-...",
           "host": "nodeb04092"
       },

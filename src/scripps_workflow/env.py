@@ -47,8 +47,8 @@ exec "$ENV_PY" -I -m {entrypoint_module}{fixed_args} "$@"
 
 # Default group env Python on Lucas's HPC. Centralized so we change it in
 # one place if the group env path moves.
-DEFAULT_ENV_PY: str = "/gpfs/group/shenvi/envs/workflow/bin/python"
-PRISM_ENV_PY: str = "/gpfs/group/shenvi/envs/workflow312/bin/python"
+DEFAULT_ENV_PY: str = "/gpfs/group/shenvi/envs/workflow312/bin/python"
+PRISM_ENV_PY: str = DEFAULT_ENV_PY
 
 
 def render_wrapper(
