@@ -169,3 +169,21 @@ def test_geometry_viewer_generates_standalone_zip_bundle_from_pointer(tmp_path):
         "geometry_viewer_bundle.zip",
     )
     _run_output_script(node_zip, script_path, tmp_path, ptr, "geometry_viewer_bundle.zip")
+
+
+def test_output_viewer_assets_are_static_files():
+    from scripps_workflow.output_viewers import assets
+
+    static_root = ROOT / "src" / "scripps_workflow" / "output_viewers" / "static"
+    ensemble_js_files = sorted((static_root / "ensemble" / "js").glob("*.js"))
+
+    assert (static_root / "ensemble" / "index.html").is_file()
+    assert (static_root / "geometry" / "index.html").is_file()
+    assert (static_root / "geometry" / "viewer.js").is_file()
+    assert (static_root / "common" / "styles.css").is_file()
+    assert ensemble_js_files
+
+    joined = "\n\n".join(p.read_text(encoding="utf-8").rstrip() for p in ensemble_js_files) + "\n"
+    assert assets.ENSEMBLE_VIEWER_JS == joined
+    assert "toggle_measurement_atom" in assets.ENSEMBLE_VIEWER_JS
+    assert "add_angle_wedge" in assets.ENSEMBLE_VIEWER_JS

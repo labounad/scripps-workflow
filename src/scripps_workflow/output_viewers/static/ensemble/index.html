@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Conformer Ensemble Viewer</title>
+    <link rel="stylesheet" type="text/css" href="css/styles.css">
+    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+    <!-- RDKit.js (minimal WASM build): renders the 2D structure inset
+         from the operator-supplied SMILES. Unpinned URL (always-
+         latest) — a specific @<version> pin had reachability
+         problems on unpkg. ``onerror`` surfaces a console log if
+         the script 404s or CSP-blocks; the viewer degrades
+         gracefully (no 2D inset) in either case. -->
+    <script src="https://unpkg.com/@rdkit/rdkit/dist/RDKit_minimal.js"
+            onerror="console.warn('RDKit.js CDN load failed (check Network tab); 2D inset will be hidden')"></script>
+    <script src="js/viewer.js"></script>
+</head>
+<body onload="load_page()">
+    <div id="toolbar">
+        <label for="style-select">Style:</label>
+        <select id="style-select" onchange="apply_style(this.value)">
+            <option value="ballstick" selected>Ball &amp; stick</option>
+            <option value="stick">Stick</option>
+            <option value="sphere">Sphere (CPK)</option>
+            <option value="line">Line</option>
+        </select>
+        <label for="mode-select" style="margin-left:12px;">View:</label>
+        <select id="mode-select" onchange="set_view_mode(this.value)">
+            <option value="overlay" selected>Focus + overlay</option>
+            <option value="single">Single conformer</option>
+        </select>
+        <button type="button" onclick="reset_view()">Reset zoom</button>
+        <span id="status">Loading...</span>
+    </div>
+    <div id="content">
+        <div id="viewer">
+            <!-- Atom hover readout: small pill in the bottom-right
+                 corner of the viewer that surfaces "<elem><serial>"
+                 (e.g. "C2", "O11") when the cursor is over an atom
+                 of the active conformer. Other-conformer atoms are
+                 ignored. Empty / invisible when nothing is hovered. -->
+            <div id="atom-hover-info"></div>
+            <!-- Click-to-pin readout: bottom-center of the viewer.
+                 Set when the user clicks an atom. Independent of the
+                 hover readout above — both can be visible at once
+                 (hover updates the corner, click pins the center). -->
+            <div id="atom-pinned-label"></div>
+            <!-- 2D structure inset. Three visual states:
+                 (a) corner   — 80×80, bottom-left, default
+                 (b) hover    — 240×240, expanded inline on hover
+                 (c) centered — large overlay covering the viewer,
+                                used for picking substructures
+                 The chevron toggles (a)↔(c). The inner svg host
+                 receives RDKit's get_svg_with_highlights() output;
+                 clicks on atom-* / bond-* SVG classes are caught
+                 via event delegation and drive the selection set. -->
+            <div id="structure-2d" hidden
+                 ondblclick="structure_bg_dblclick(event)">
+                <div id="structure-canvas"></div>
+                <button type="button" id="structure-expand-btn"
+                        title="Expand to center"
+                        onclick="toggle_structure_expanded(event)">&#x26F6;</button>
+                <div id="structure-toolbar">
+                    <span id="structure-selection-count"></span>
+                    <button type="button" class="sb-action align"
+                            onclick="align_to_selection()">Align</button>
+                    <button type="button" class="sb-action reset"
+                            onclick="reset_alignment()">Reset</button>
+                </div>
+            </div>
+        </div>
+        <aside id="sidebar">
+            <!-- SMILES block — hidden by default, shown when the
+                 viewer receives a smiles param via URL. Double-click
+                 anywhere on the SMILES text to copy. -->
+            <div id="smiles-block" hidden>
+                <div class="sb-label">
+                    SMILES
+                    <span class="sb-hint">double-click to copy</span>
+                </div>
+                <div id="smiles-value"
+                     class="copy-target"
+                     ondblclick="copy_smiles_dblclick(this)"></div>
+            </div>
+            <!-- Pinned sidebar header: count + energy-unit toggle. -->
+            <div class="sidebar-section sticky-top">
+                <div class="sidebar-header">
+                    <strong>Conformers</strong>
+                    <span id="conformer-count"></span>
+                    <div class="spacer"></div>
+                    <div class="seg-toggle" id="energy-unit-toggle">
+                        <button type="button" data-val="kcal" class="active"
+                                onclick="set_energy_unit('kcal')">&Delta;E kcal/mol</button>
+                        <button type="button" data-val="hartree"
+                                onclick="set_energy_unit('hartree')">E hartree</button>
+                    </div>
+                </div>
+            </div>
+            <!-- Pinned sparkline block: chart + y-axis toggle.
+                 viewBox 280×100 (2.8:1) keeps circles circular when
+                 the SVG scales to fit the sidebar width — earlier
+                 ``preserveAspectRatio=none`` was distorting points. -->
+            <div class="sidebar-section sticky-below-header">
+                <div class="sparkline-row">
+                    <svg id="sparkline" viewBox="0 0 280 100"></svg>
+                </div>
+                <div class="sparkline-toolbar">
+                    <div class="seg-toggle small" id="chart-axis-toggle">
+                        <button type="button" data-val="energy" class="active"
+                                onclick="set_chart_axis('energy')">&Delta;E</button>
+                        <button type="button" data-val="boltzmann"
+                                onclick="set_chart_axis('boltzmann')">Boltzmann %</button>
+                    </div>
+                    <span id="sparkline-range"></span>
+                </div>
+            </div>
+            <!-- Scrollable list of conformer cards. -->
+            <div id="conformer-list"></div>
+        </aside>
+    </div>
+    <div id="dropzone" hidden>
+        <div class="dropzone-inner">
+            <strong>No upstream ensemble bound.</strong><br>
+            Drop a multi-frame <code>.xyz</code> file here, or
+            <label class="filepicker">
+                <input type="file" accept=".xyz,chemical/x-xyz" onchange="open_picked_file(this)">
+                pick a file
+            </label>
+            to render.
+        </div>
+    </div>
+    <script id="scripps-viewer-input" type="application/json">__VIEWER_INPUT__</script>
+</body>
+</html>

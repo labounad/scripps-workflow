@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Geometry Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="css/styles.css">
+  <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+  <script src="js/viewer.js"></script>
+</head>
+<body onload="load_page()">
+  <div id="toolbar">
+    <label>Style:
+      <select id="style-select" onchange="apply_style(this.value)">
+        <option value="ballstick" selected>Ball &amp; stick</option>
+        <option value="stick">Stick</option>
+        <option value="sphere">Sphere</option>
+        <option value="line">Line</option>
+      </select>
+    </label>
+    <button type="button" onclick="reset_view()">Reset zoom</button>
+    <span id="status">Loading...</span>
+  </div>
+  <main id="viewer"></main>
+  <aside id="info-panel">
+    <h1 id="viewer-title">Geometry Viewer</h1>
+    <div class="label">Source</div>
+    <pre id="viewer-source"></pre>
+    <div id="smiles-block" hidden>
+      <div class="label">SMILES</div>
+      <pre id="smiles-value"></pre>
+    </div>
+  </aside>
+  <script id="viewer-input" type="application/json">__VIEWER_INPUT__</script>
+</body>
+</html>
