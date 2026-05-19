@@ -63,9 +63,13 @@ test = [
     "pytest>=7.4",
     "pyyaml>=6.0",
 ]
+# Browser smoke tests. Optional because Playwright browsers are not required for normal node runtime.
+browser = [
+    "playwright>=1.44",
+]
 # Everything (for development).
 all = [
-    "scripps-workflow[gui,chem,prism,db,test]",
+    "scripps-workflow[gui,chem,prism,db,test,browser]",
 ]
 
 [project.scripts]
@@ -123,6 +127,9 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+markers = [
+    "browser: optional browser-level smoke tests for generated viewer bundles",
+]
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:pydantic.*",

@@ -187,3 +187,28 @@ def test_output_viewer_assets_are_static_files():
     assert assets.ENSEMBLE_VIEWER_JS == joined
     assert "toggle_measurement_atom" in assets.ENSEMBLE_VIEWER_JS
     assert "add_angle_wedge" in assets.ENSEMBLE_VIEWER_JS
+
+
+def test_output_viewer_generators_use_shared_layout_helper():
+    ensemble_gen = _load_module(ROOT / "tools" / "gen_output_node_ensemble_viewer.py")
+    geometry_gen = _load_module(ROOT / "tools" / "gen_output_node_geometry_viewer.py")
+    helper = (ROOT / "tools" / "output_node_bundle.py").read_text(encoding="utf-8")
+
+    assert ensemble_gen.SPEC.entrypoint == "scripps_workflow.output_viewers.ensemble_bundle:main"
+    assert geometry_gen.SPEC.entrypoint == "scripps_workflow.output_viewers.geometry_bundle:main"
+    assert "DEFAULT_WORKFLOW_PYTHON" in (ROOT / "tools" / "gui_export_config.py").read_text(encoding="utf-8")
+    assert "def render_script_py" in helper
+    assert "SCRIPPS_VIEWER_OUTPUT_DIR" in helper
+
+
+def test_measurement_code_is_split_from_3dmol_rendering():
+    js_root = ROOT / "src" / "scripps_workflow" / "output_viewers" / "static" / "ensemble" / "js"
+    math_js = (js_root / "91_measurement_math.js").read_text(encoding="utf-8")
+    shapes_js = (js_root / "94_measurement_shapes.js").read_text(encoding="utf-8")
+    render_js = (js_root / "99_3dmol_rendering.js").read_text(encoding="utf-8")
+
+    assert "function dihedral_abcd" in math_js
+    assert "function angle_abc" in math_js
+    assert "addCylinder" not in math_js
+    assert "function add_angle_wedge" in shapes_js
+    assert "function repaint_viewer" in render_js

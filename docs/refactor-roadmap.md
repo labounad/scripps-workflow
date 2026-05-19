@@ -78,9 +78,64 @@ makes reviews noisy and obscures the real source changes.
 ignored cache/generated outputs removed. Generated GUI node ZIPs should be
 created locally when needed and committed only by deliberate release policy.
 
+
+### 4. Unify script-backed Output/Layout node generators
+
+**Problem.** `tools/gen_output_node_ensemble_viewer.py` and
+`tools/gen_output_node_geometry_viewer.py` duplicated the same fragile manifest
+and `script.py` bootstrap logic.
+
+**Change.** Shared generation now lives in:
+
+```text
+tools/gui_export_config.py
+tools/output_node_bundle.py
+```
+
+The viewer-specific generator scripts are now small declarative wrappers that
+provide node names, entrypoints, output filenames, and input specs.
+
+### 5. Centralize HPC/bootstrap configuration
+
+**Problem.** Hardcoded interpreter paths, repo-source fallbacks, author metadata,
+and GUI host metadata were embedded directly in each generator.
+
+**Change.** These defaults now live in `tools/gui_export_config.py`. The shared
+bootstrap shim still emits a self-contained `script.py`, but changes to the
+workflow Python path or fallback repo locations now happen in one file.
+
+### 6. Separate measurement math/state from 3Dmol rendering
+
+**Problem.** The ensemble viewer's measurement feature mixed vector math,
+selection state, shape generation, DOM labels, and 3Dmol callbacks in one source
+file.
+
+**Change.** The measurement/viewer code is now split into:
+
+```text
+91_measurement_math.js      # vector math, distance, angle, dihedral
+92_measurement_state.js     # active atoms, labels, radii, selection state
+94_measurement_shapes.js    # 3D shape/wedge/bond rendering primitives
+96_measurement_ui.js        # measurement label HTML and click-selection actions
+99_3dmol_rendering.js       # 3Dmol hover/click callbacks and repaint pass
+```
+
+This keeps pure-ish domain math out of the 3Dmol adapter layer and makes the
+angle/wedge/dihedral code easier to test and modify.
+
+### 7. Add optional browser-level viewer smoke test
+
+**Problem.** The Python bundle tests verified ZIP creation but did not execute
+`index.html` in a browser context.
+
+**Change.** `tests/test_output_viewer_browser_smoke.py` adds an optional
+Playwright smoke test marked `browser`. It stubs CDN-loaded 3Dmol/RDKit scripts
+so the test checks bundle bootstrap without requiring public internet access.
+It is skipped automatically when Playwright or a browser binary is unavailable.
+
 ## Remaining refactor candidates
 
-### 4. Remove stale GUI-viewer/inport-era artifacts
+### 8. Remove stale GUI-viewer/inport-era artifacts
 
 The current viewer strategy is a script-backed standalone ZIP bundle. Any older
 fixture output or experimental node bundle containing `opaat`,
@@ -95,71 +150,6 @@ tests/fixtures/deprecated_gui_inport_viewer/
 ```
 
 for anything kept only as historical/debug context.
-
-### 5. Unify output-node generators
-
-`tools/gen_output_node_ensemble_viewer.py` and
-`tools/gen_output_node_geometry_viewer.py` share fragile bootstrap-shim logic.
-Create a shared helper such as:
-
-```python
-write_layout_viewer_node(
-    node_name="ensemble_viewer",
-    entrypoint="scripps_workflow.output_viewers.ensemble_bundle:main",
-    output_zip="ensemble_viewer_bundle.zip",
-    inputs=[...],
-)
-```
-
-Then each generator becomes a small config file instead of duplicating shim
-internals.
-
-### 6. Centralize hardcoded HPC paths and GUI export metadata
-
-Paths such as:
-
-```text
-/gpfs/group/shenvi/envs/workflow312/bin/python
-/gpfs/group/shenvi/Users/labounader/scripps-workflow/src
-```
-
-are currently embedded in generated shims because the GUI executes Layout nodes
-under a system Python. Put these in one module or config file so future path
-changes require only one edit.
-
-Candidate locations:
-
-```text
-src/scripps_workflow/hpc_profile.py
-tools/gui_export_config.py
-```
-
-### 7. Separate domain math from 3Dmol rendering
-
-The ensemble viewer measurement/alignment implementation still mixes pure math
-with DOM/3Dmol rendering. Pull pure functions into a testable layer:
-
-- vector operations
-- distance / angle / torsion
-- Kabsch alignment
-- two-atom alignment
-- angle-sector geometry
-
-Then keep 3Dmol-specific code as a thin rendering adapter.
-
-### 8. Add browser-level smoke tests for viewer bundles
-
-The Python tests verify that ZIP bundles are created and contain expected files,
-but they do not execute the browser JavaScript. Add a lightweight Playwright
-smoke test or a Node/JSDOM test for pure viewer functions.
-
-Minimum smoke-test assertions:
-
-- `index.html` loads without throwing
-- embedded payload is parsed
-- `viewer.js` contains no stale `opaat` / `workflow_backend` paths
-- measurement functions exist
-- atom maps are embedded when available
 
 ### 9. Refactor large node modules along internal boundaries
 
@@ -281,6 +271,5 @@ Also clarify when GUI node re-import is required:
 
 1. Verify that the static-asset refactor produces identical viewer bundles.
 2. Decide whether to commit any generated node ZIPs or keep them entirely local.
-3. Add a browser-level smoke test before making major measurement/UI changes.
-4. Start the output-node generator unification once the static-asset split has
-   settled.
+3. Remove or quarantine deprecated GUI-inport-era fixtures.
+4. Start splitting large chemistry node modules along their internal boundaries.
