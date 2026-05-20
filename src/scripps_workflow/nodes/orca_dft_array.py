@@ -710,8 +710,18 @@ class OrcaDftArray(Node):
 
         # v6.6 cache check — fires before any input staging or SLURM
         # work. On hit, the manifest is populated from the parent
-        # ensemble's central tree and we return.
-        if self._maybe_emit_cached_manifest_dft(ctx, cfg):
+        # ensemble's central tree and we return. Cache infrastructure is
+        # deliberately best-effort: a down/offline database is treated
+        # exactly like a cache miss so calculations can proceed.
+        try:
+            cache_hit = self._maybe_emit_cached_manifest_dft(ctx, cfg)
+        except Exception as e:
+            logging_utils.log_warn(
+                "orca-dft cache: lookup unavailable/raised; treating as "
+                f"cache miss and continuing: {type(e).__name__}: {e}"
+            )
+            cache_hit = False
+        if cache_hit:
             return
 
         if ctx.upstream_manifest is None:

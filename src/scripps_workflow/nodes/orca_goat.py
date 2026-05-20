@@ -655,8 +655,19 @@ class OrcaGoat(Node):
 
         # v6.7 ensemble cache check — same shape as CREST's
         # (build a typed key from inputs, look up via nmr_data.cache,
-        # on hit emit a manifest pointing at central-tree xyzs).
-        if self._maybe_emit_cached_manifest_goat(ctx, cfg):
+        # on hit emit a manifest pointing at central-tree xyzs). Cache
+        # infrastructure is deliberately best-effort: a down/offline
+        # database is treated exactly like a cache miss so calculations
+        # can proceed.
+        try:
+            cache_hit = self._maybe_emit_cached_manifest_goat(ctx, cfg)
+        except Exception as e:
+            logging_utils.log_warn(
+                "orca-goat cache: lookup unavailable/raised; treating as "
+                f"cache miss and continuing: {type(e).__name__}: {e}"
+            )
+            cache_hit = False
+        if cache_hit:
             return
 
         orca_exe = shutil.which("orca")

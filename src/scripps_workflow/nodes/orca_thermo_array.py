@@ -899,10 +899,21 @@ class OrcaThermoArray(Node):
         # v6.5b cache check fires BEFORE any compute work (input
         # staging, SLURM array build, sbatch). On hit, the manifest
         # is fully populated from central-tree .gz files and we
-        # return; the whole SLURM round-trip is skipped. On miss
-        # (or failure), we already have set_inputs() above for a
-        # self-describing manifest.
-        if self._maybe_emit_cached_manifest_thermo(ctx, cfg, multiplicity):
+        # return; the whole SLURM round-trip is skipped. Cache
+        # infrastructure is deliberately best-effort: a down/offline
+        # database is treated exactly like a cache miss so calculations
+        # can proceed.
+        try:
+            cache_hit = self._maybe_emit_cached_manifest_thermo(
+                ctx, cfg, multiplicity
+            )
+        except Exception as e:
+            logging_utils.log_warn(
+                "orca-thermo cache: lookup unavailable/raised; treating as "
+                f"cache miss and continuing: {type(e).__name__}: {e}"
+            )
+            cache_hit = False
+        if cache_hit:
             return
 
         if ctx.upstream_manifest is None:
