@@ -574,28 +574,29 @@ class TestHappyPath:
         assert m["inputs"]["nprocs"] == 8
 
     def test_default_singlepoint_keywords_in_input(self, tmp_path, cluster_stub):
-        # Default behavior: composite freq + high-level SP separated by
-        # ``$new_job``. The rendered orca_thermo.inp contains BOTH the
-        # low-level freq keywords AND the wB97M-V/def2-TZVPP SP block.
-        # DEFGRID3 is required for wB97M-V's VV10 nonlocal kernel to
-        # get the thermo right (commit 99f8f85). RIJCOSX is OFF by
-        # default — ORCA 6.0.0 rejects it under conventional integral
-        # handling. Users who want the speedup add ``DIRECT``
-        # explicitly to the keywords.
+        # Default behavior: low-level freq and high-level SP are staged
+        # as separate ORCA input files. This avoids ORCA method-state
+        # leakage across a ``$new_job`` boundary while the SLURM wrapper
+        # still appends the SP output into orca_thermo.out for the legacy
+        # thermo parser.
         m = _run_node(tmp_path)
         assert (
             m["inputs"]["singlepoint_keywords"]
             == "wB97M-V def2-TZVPP TightSCF DEFGRID3"
         )
         arr = m["artifacts"]["array"]
-        task1_inp = (
-            Path(arr["tasks_root_abs"]) / "task_0001" / "orca_thermo.inp"
-        )
-        text = task1_inp.read_text()
-        assert "$new_job" in text
-        assert "! wB97M-V def2-TZVPP TightSCF DEFGRID3" in text
-        # Both jobs share the staged xyz geometry.
-        assert text.count("* xyzfile 0 1 input.xyz") == 2
+        task_dir = Path(arr["tasks_root_abs"]) / "task_0001"
+        thermo_text = (task_dir / "orca_thermo.inp").read_text()
+        sp_text = (task_dir / "orca_thermo_sp.inp").read_text()
+        assert "$new_job" not in thermo_text
+        assert "! r2scan-3c TightSCF Freq" in thermo_text
+        assert "! wB97M-V def2-TZVPP TightSCF DEFGRID3" in sp_text
+        assert thermo_text.count("* xyzfile 0 1 input.xyz") == 1
+        assert sp_text.count("* xyzfile 0 1 input.xyz") == 1
+        submit = Path(arr["submit_slurm_abs"]).read_text()
+        assert 'run_orca_job 2 ' in submit
+        assert 'orca_thermo_sp.inp' in submit
+        assert 'WF CONCATENATED ORCA OUTPUT: orca_thermo_sp.out' in submit
 
     def test_singlepoint_keywords_disabled(self, tmp_path, cluster_stub):
         # ``singlepoint_keywords=none`` collapses the compound input to
@@ -610,6 +611,7 @@ class TestHappyPath:
         text = task1_inp.read_text()
         assert "$new_job" not in text
         assert "wB97M-V" not in text
+        assert not (Path(arr["tasks_root_abs"]) / "task_0001" / "orca_thermo_sp.inp").exists()
         # Only ONE xyzfile line in the single-job form.
         assert text.count("* xyzfile 0 1 input.xyz") == 1
 
@@ -624,12 +626,12 @@ class TestHappyPath:
             == "B3LYP D4 def2-TZVP TightSCF"
         )
         arr = m["artifacts"]["array"]
-        text = (
-            Path(arr["tasks_root_abs"]) / "task_0001" / "orca_thermo.inp"
-        ).read_text()
-        assert "$new_job" in text
-        assert "! B3LYP D4 def2-TZVP TightSCF" in text
-        assert "wB97M-V" not in text
+        task_dir = Path(arr["tasks_root_abs"]) / "task_0001"
+        thermo_text = (task_dir / "orca_thermo.inp").read_text()
+        sp_text = (task_dir / "orca_thermo_sp.inp").read_text()
+        assert "$new_job" not in thermo_text
+        assert "! B3LYP D4 def2-TZVP TightSCF" in sp_text
+        assert "wB97M-V" not in sp_text
 
     def test_explicit_multiplicity_wins(self, tmp_path, cluster_stub):
         m = _run_node(tmp_path, "unpaired_electrons=1", "multiplicity=4")
@@ -901,12 +903,9 @@ class TestNodeWiring:
 
     def test_default_singlepoint_keywords_constant(self):
         # The composite Gibbs protocol pairs the r2scan-3c freq with a
-        # wB97M-V/def2-TZVPP single point on the same geometry.
-        # DEFGRID3 makes the SCF convergence + thermochemistry
-        # numerically stable (commit 99f8f85). RIJCOSX is deliberately
-        # OFF — ORCA 6.0.0 rejects RIJCOSX under default conventional
-        # integral handling; users who want the speedup add ``DIRECT``
-        # to the keywords explicitly.
+        # wB97M-V/def2-TZVPP single point on the same geometry. The node
+        # now runs the SP as a separate ORCA process to avoid method-state
+        # leakage across ORCA ``$new_job`` boundaries.
         assert (
             ota.DEFAULT_SINGLEPOINT_KEYWORDS
             == "wB97M-V def2-TZVPP TightSCF DEFGRID3"

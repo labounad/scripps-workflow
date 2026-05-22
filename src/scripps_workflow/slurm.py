@@ -572,6 +572,8 @@ def standard_orca_per_task_body(
 def multi_orca_per_task_body(
     *,
     jobs: list[tuple[str, str]],
+    append_outputs_to: str | None = None,
+    append_output_names: list[str] | None = None,
 ) -> str:
     """Run multiple ORCA invocations sequentially in one SLURM task.
 
@@ -603,6 +605,14 @@ def multi_orca_per_task_body(
 
     :param jobs: Ordered list of ``(inp, out)`` filename pairs
         (relative to the task dir). Must contain at least one entry.
+    :param append_outputs_to: Optional output filename to append selected
+        downstream ORCA outputs into after they terminate normally. This is
+        used by ``wf-orca-thermo-array`` when the high-level single-point
+        is run as a separate ORCA process but the legacy parser still expects
+        the high-level final energy to appear in the primary thermo output.
+    :param append_output_names: Output filenames, drawn from ``jobs``, that
+        should be appended into ``append_outputs_to``. Ignored when
+        ``append_outputs_to`` is unset.
     """
     if not jobs:
         raise ValueError("multi_orca_per_task_body: jobs must be non-empty")
@@ -638,8 +648,15 @@ def multi_orca_per_task_body(
 
     parts: list[str] = [helper]
     total = len(jobs)
+    append_set = set(append_output_names or [])
     for i, (inp, out) in enumerate(jobs, start=1):
         parts.append(f'run_orca_job {i} {total} "{inp}" "{out}"')
+        if append_outputs_to and out in append_set:
+            parts.append(
+                f'{{ echo ""; '
+                f'echo "================ WF CONCATENATED ORCA OUTPUT: {out} ================"; '
+                f'cat "{out}"; }} >> "{append_outputs_to}"'
+            )
     parts.append("mark_success\n")
     return "\n".join(parts)
 

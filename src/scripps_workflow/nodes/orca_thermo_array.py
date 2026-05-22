@@ -307,6 +307,14 @@ DEFAULT_TEMPERATURE_K: float = 298.15
 ORCA_INP_NAME: str = "orca_thermo.inp"
 ORCA_OUT_NAME: str = "orca_thermo.out"
 
+#: Optional high-level single-point input/output filenames. The SP is
+#: run as a separate ORCA process and appended into ``orca_thermo.out``
+#: after successful completion, so downstream parsers still see the
+#: composite high-level final energy without exposing ORCA to ``$new_job``
+#: method-state leakage between r2scan-3c and wB97M-V.
+ORCA_SP_INP_NAME: str = "orca_thermo_sp.inp"
+ORCA_SP_OUT_NAME: str = "orca_thermo_sp.out"
+
 #: Per-task NMR input/output filenames. Each NMR job runs as a SEPARATE
 #: ORCA invocation (not via ``$new_job``) so that method-state flags
 #: like VV10/NL, D3/D4, gCP, etc. cannot leak from the freq+SP compound
@@ -973,18 +981,19 @@ class OrcaThermoArray(Node):
         tasks_root.mkdir(parents=True, exist_ok=True)
         slurm_logs.mkdir(parents=True, exist_ok=True)
 
-        # The freq+SP compound stays as ONE ORCA invocation (the
-        # r2scan-3c → wB97M-V transition is well-covered by the
-        # auto-injected DFTDOPT/DoGCP reset block). The NMR jobs,
-        # however, are emitted as SEPARATE standalone ORCA inputs —
-        # one ``orca_nmr_*.inp`` each — so method-state flags like
-        # VV10/NL can't leak from the wB97M-V SP into the chemically
-        # unrelated WP04/wB97X-D3/mPW1PW91 NMR functionals. Each NMR
-        # job runs as a fresh ORCA process, paying ~5–10 s of init
-        # overhead for bulletproof state isolation.
+        # Run each method family as a separate ORCA process. Earlier
+        # versions kept the r2scan-3c freq and wB97M-V single point in
+        # one ``$new_job`` compound input, but ORCA 6.0.0 can leak
+        # method-state / exchange-algorithm flags across that boundary
+        # (for example RIJONX + RIJCOSX both set when the SP includes
+        # ``DIRECT``). Keeping the SP as a fresh process is slightly more
+        # expensive but much more robust. The SLURM body appends the SP
+        # output into ``orca_thermo.out`` after successful completion so
+        # downstream parsers still find the high-level final energy by
+        # reading the primary thermo output.
         inp_text = make_orca_compound_input(
             keywords=cfg["keywords"],
-            singlepoint_keywords=cfg["singlepoint_keywords"],
+            singlepoint_keywords=None,
             post_jobs=None,
             nprocs=cfg["nprocs"],
             maxcore=cfg["maxcore"],
@@ -1000,29 +1009,48 @@ class OrcaThermoArray(Node):
             # affected the downstream math, not the freq calc itself.
             freq_temperature_k=cfg["temperature_k"],
         )
+        extra_inputs: dict[str, str] = {}
+        if cfg["singlepoint_keywords"] is not None:
+            extra_inputs[ORCA_SP_INP_NAME] = make_orca_simple_input(
+                keywords=cfg["singlepoint_keywords"],
+                nprocs=cfg["nprocs"],
+                maxcore=cfg["maxcore"],
+                charge=cfg["charge"],
+                multiplicity=multiplicity,
+                solvent=cfg["solvent"],
+                smd_solvent_override=cfg["smd_solvent"],
+                xyz_filename="input.xyz",
+            )
+
         nmr_inputs = build_nmr_input_files(
             cfg=cfg, multiplicity=multiplicity, xyz_filename="input.xyz",
         )
+        extra_inputs.update(nmr_inputs)
         build_thermo_task_dirs(
             staged_paths=staged_paths,
             tasks_root=tasks_root,
             inp_text=inp_text,
             inp_name=ORCA_INP_NAME,
-            extra_inputs=nmr_inputs,
+            extra_inputs=extra_inputs,
         )
 
         # ----- 3) Render SLURM array script -----
         job_name = cfg["job_name"] or f"orca_thermo_array_{n_tasks}"
-        # Build the (inp, out) sequence: freq+SP first, then each
-        # enabled NMR job as its own ORCA call. mapping is locked to
-        # ORCA_NMR_*_INP_NAME / ORCA_NMR_*_OUT_NAME constants so
-        # nmr_aggregate can find them by name without rummaging.
+        # Build the (inp, out) sequence: freq first, optional high-level
+        # SP second, then each enabled NMR job. The SP output is appended
+        # into ``orca_thermo.out`` by ``multi_orca_per_task_body`` so the
+        # thermo aggregator's legacy single-file parser still sees both
+        # the low-level thermal corrections and high-level final energy.
         nmr_out_map = {
             ORCA_NMR_H_INP_NAME: ORCA_NMR_H_OUT_NAME,
             ORCA_NMR_C_INP_NAME: ORCA_NMR_C_OUT_NAME,
             ORCA_NMR_J_INP_NAME: ORCA_NMR_J_OUT_NAME,
         }
         orca_jobs: list[tuple[str, str]] = [(ORCA_INP_NAME, ORCA_OUT_NAME)]
+        sp_outputs_to_append: list[str] = []
+        if cfg["singlepoint_keywords"] is not None:
+            orca_jobs.append((ORCA_SP_INP_NAME, ORCA_SP_OUT_NAME))
+            sp_outputs_to_append.append(ORCA_SP_OUT_NAME)
         for inp_name in nmr_inputs:
             orca_jobs.append((inp_name, nmr_out_map[inp_name]))
         if len(orca_jobs) == 1:
@@ -1032,7 +1060,11 @@ class OrcaThermoArray(Node):
             )
         else:
             from ..slurm import multi_orca_per_task_body
-            per_task_body = multi_orca_per_task_body(jobs=orca_jobs)
+            per_task_body = multi_orca_per_task_body(
+                jobs=orca_jobs,
+                append_outputs_to=ORCA_OUT_NAME,
+                append_output_names=sp_outputs_to_append,
+            )
         slurm_text = make_array_slurm_text(
             job_name=job_name,
             n_tasks=n_tasks,
