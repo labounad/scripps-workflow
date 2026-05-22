@@ -9,53 +9,43 @@ singlets that smear into a broad blob).
 
 We use a **three-tier classification**:
 
-* **HARD** — homotopic AND magnetically equivalent. All class members
-  have identical J-vectors to every other atom (within a small Hz
-  tolerance, since DFT-noise-level differences are unavoidable). These
-  collapse into ONE group with ``number=N``. Their shifts and J's are
-  averaged across the class. Example: a methyl group's three protons.
+* **HARD** — chemically and magnetically equivalent for rendering.
+  Members collapse into ONE group with ``number=N``; shifts and J's to
+  other groups are averaged. Examples: methyl CH₃, equivalent
+  gem-dimethyl 6H, tert-butyl 9H, benzene-like fully symmetric Aₙ
+  classes, and equivalent 13C intensity groups.
 
-* **SOFT** — homotopic (same chemical shift) but magnetically
-  inequivalent (different J-vectors to some other atom). Classic
-  AA'BB' / AA'XX' patterns: 1,2-disubstituted aromatics, vinyl
-  groups, monosubstituted alkenes. These emit as N separate groups
-  with identical shifts but distinct J's preserved.
+* **SOFT** — chemically equivalent but deliberately kept as separate
+  spin groups with one common averaged shift. This preserves magnetic
+  inequivalence / second-order topology for cases such as methylene
+  H₂, AA′BB′ aromatic patterns, vinyl groups, and mirrored ring
+  protons.
 
-* **NONE** — topologically distinct. No averaging. Each atom emits as
-  its own group. Catches diastereotopic CH₂ in chiral environments,
-  isolated CH protons, and so on.
+* **NONE** — topologically or stereochemically distinct. No averaging.
+  Each atom emits as its own group. Catches diastereotopic CH₂ in
+  chiral environments, isolated CH protons, and so on.
 
 The dispatch is mechanical:
 
 1. Compute topological classes from RDKit's chirality-aware
    ``CanonicalRankAtoms`` — atoms with the same rank are in one class.
-   This catches "homotopic" cleanly even when the symmetry operation
-   is a non-trivial rotation/reflection.
+   This catches chemical equivalence cleanly even when the symmetry
+   operation is a non-trivial rotation/reflection.
 
-2. **Data-aware refinement (gated on stereo).** RDKit's
-   ``includeChirality=True`` only propagates atom-level CIP flags
-   (``@`` tags) — it does NOT split prochiral H's attached to a
-   carbon adjacent to a chiral center. Diastereotopic CH₂ pairs in
-   chiral environments therefore look topologically identical to
-   RDKit even though they're chemically distinct. When the molecule
-   has stereo info (chiral centers, stereo bonds), we compensate by
-   inspecting the DFT-computed shifts: if class members spread more
-   than ``tol_shift_ppm``, the class gets split into singletons.
+2. **Narrow data-aware refinement.** RDKit's ``includeChirality=True``
+   only propagates atom-level CIP flags (``@`` tags); it does not
+   reliably split prochiral H's attached to a carbon adjacent to a
+   chiral center. We therefore allow DFT shift spread to split only
+   same-parent H₂ classes in molecules with stereochemical information.
+   Complete methyl-like classes and non-H classes are protected from
+   shift-spread splitting because finite conformer ensembles often
+   break their symmetry numerically.
 
-   When the molecule has NO stereo info, the refinement is skipped
-   entirely. Same-rank atoms are then chemically equivalent under
-   fast rotation / NMR timescale by symmetry, and any within-class
-   shift variation is sampling noise from a finite-conformer
-   Boltzmann ensemble (a 2-conformer run on ethanol doesn't sample
-   methyl C₃ rotation uniformly, leaving 0.1-0.3 ppm artifactual
-   spread on what should be a single methyl peak). Skipping the
-   refinement in the achiral case prevents false-splitting that
-   would emit 3 separate "A/B/C" groups for one methyl.
-
-3. Within each (refined) class of size ≥ 2, test whether every
-   member's J-coupling vector to every other atom matches (within
-   ``tol_jcoupling_hz``). If yes → HARD. If no → SOFT. Class size 1
-   is trivially NONE.
+3. Classify refined classes structurally rather than trusting noisy
+   J-vectors for the collapse decision: rotational methyl-like classes
+   and all-of-nucleus symmetric classes become HARD; other multi-proton
+   classes become SOFT; singletons become NONE. The parsed/averaged J's
+   are still retained in the emitted groups.
 
 This module is a pure helper. RDKit is imported lazily inside the
 functions that need it so the module can be imported without RDKit
@@ -421,40 +411,53 @@ def _mol_has_stereo(mol: Any) -> bool:
     return False
 
 
-def _is_force_hard_class(
-    class_atoms: list[int],
-    mol: Any,
-    stereo_present: bool,
-) -> bool:
-    """True if a class is structurally guaranteed to be magnetically
-    equivalent regardless of J asymmetry from frozen-geometry DFT.
+def _same_parent_hydrogen_class(class_atoms: list[int], mol: Any) -> Optional[int]:
+    """Return the shared parent index for a pure H class, else ``None``."""
+    if not class_atoms:
+        return None
 
-    Two cases:
+    parents: set[int] = set()
+    for a in class_atoms:
+        atom = mol.GetAtomWithIdx(a)
+        if atom.GetSymbol() != "H":
+            return None
+        neighbors = atom.GetNeighbors()
+        if len(neighbors) != 1:
+            return None
+        parents.add(neighbors[0].GetIdx())
 
-    * **Methyl-style (size ≥ 3, same parent C, single-bond
-      connectivity).** C₃ rotation exchanges all 3 H's on the NMR
-      timescale; equivalence holds in any molecule, chiral or
-      achiral. (Methyls in 2-bromobutane (S) included.)
+    if len(parents) != 1:
+        return None
+    return next(iter(parents))
 
-    * **Achiral methylene-style (size 2, same parent C, single-bond
-      connectivity, no stereo in the molecule).** The two H's
-      exchange under C₂ rotation of the parent C, and in an achiral
-      surrounding they see the same environment from both positions.
-      In a chiral molecule the H's may be diastereotopic — falls
-      through to the normal mag-equiv path, where the data-aware
-      refinement can still split them via shift spread.
 
-    Note: this is structurally restrictive on purpose. We're NOT
-    saying "any same-parent class is HARD" — that would wrongly
-    collapse diastereotopic CH₂ in chiral molecules. We're saying
-    "same-parent classes that are structurally rotation-symmetric
-    are HARD even when DFT data looks asymmetric."
+def _hydrogen_neighbors(parent: Any) -> list[int]:
+    """Hydrogen-neighbor indices for ``parent``, sorted for stability."""
+    return sorted(
+        n.GetIdx() for n in parent.GetNeighbors() if n.GetSymbol() == "H"
+    )
+
+
+def _is_rotationally_hard_hydrogen_class(class_atoms: list[int], mol: Any) -> bool:
+    """True for proton classes that should be collapsed structurally.
+
+    This deliberately targets *rapid local rotation / full symmetry*
+    cases rather than using noisy DFT J-vectors:
+
+    * one or more complete methyl groups in the same RDKit equivalence
+      class: CH₃, gem-dimethyl 6H, tert-butyl 9H, neopentane 12H, …;
+    * methane's four equivalent protons.
+
+    The key guard is "complete local set": if a methyl carbon contributes
+    to the class, all three of its hydrogens must be in the class. This
+    prevents accidental collapsing of partial / prochiral H sets while
+    still handling tBu-like multi-methyl classes naturally.
     """
-    if len(class_atoms) < 2:
+    if len(class_atoms) < 3:
         return False
 
-    # All members must be H atoms attached to the same parent atom.
-    parents: set[int] = set()
+    class_set = set(class_atoms)
+    parent_to_hs: dict[int, list[int]] = {}
     for a in class_atoms:
         atom = mol.GetAtomWithIdx(a)
         if atom.GetSymbol() != "H":
@@ -462,35 +465,131 @@ def _is_force_hard_class(
         neighbors = atom.GetNeighbors()
         if len(neighbors) != 1:
             return False
-        parents.add(neighbors[0].GetIdx())
-    if len(parents) != 1:
+        parent = neighbors[0]
+        if parent.GetSymbol() != "C":
+            return False
+        parent_to_hs.setdefault(parent.GetIdx(), []).append(a)
+
+    # Methane: one carbon with exactly four hydrogens and no heavy-atom
+    # neighbors. It is an uncommon workflow input, but chemically this is
+    # the same "all protons equivalent" case and keeps the classifier sane.
+    if len(parent_to_hs) == 1:
+        parent_idx = next(iter(parent_to_hs))
+        parent = mol.GetAtomWithIdx(parent_idx)
+        parent_hs = _hydrogen_neighbors(parent)
+        heavy_neighbors = [
+            n for n in parent.GetNeighbors() if n.GetSymbol() != "H"
+        ]
+        if (
+            len(parent_hs) == 4
+            and not heavy_neighbors
+            and set(parent_hs) == class_set
+        ):
+            return True
+
+    # Methyl / multi-methyl classes. Every parent must be a complete CH3
+    # unit, and the topological class must contain an integer number of
+    # complete methyl units. This covers isolated CH3, equivalent geminal
+    # methyls, tert-butyl, neopentane, p-xylene's two methyl groups, etc.
+    if len(class_atoms) % 3 != 0:
         return False
 
-    # Parent must be a carbon with at least one single-bond
-    # non-hydrogen connection to the rest of the molecule (so it's
-    # genuinely rotatable, not a bare CH4 / CH3 anion).
-    from rdkit import Chem  # type: ignore[import-not-found]
+    for parent_idx, hs_from_class in parent_to_hs.items():
+        parent = mol.GetAtomWithIdx(parent_idx)
+        parent_hs = _hydrogen_neighbors(parent)
+        if len(parent_hs) != 3:
+            return False
+        if set(parent_hs) != set(hs_from_class):
+            return False
 
-    parent_idx = parents.pop()
-    parent = mol.GetAtomWithIdx(parent_idx)
-    if parent.GetSymbol() != "C":
+    return True
+
+
+def _should_split_class_by_shift(
+    *,
+    cls: list[int],
+    mol: Any,
+    element: str,
+    stereo_present: bool,
+    shifts_by_atom: dict[int, float],
+    tol_shift_ppm: float,
+) -> bool:
+    """Whether shift spread should override RDKit's topology.
+
+    The old logic split *any* same-rank class in a stereochemical
+    molecule when DFT shifts differed by more than ``tol_shift_ppm``.
+    That was too broad: it split methyls in patchouli alcohol and could
+    split equivalent 13C atoms just because a finite conformer ensemble
+    did not preserve symmetry exactly.
+
+    The robust use case for data-aware splitting is narrow: same-parent
+    H₂ classes in molecules with stereochemical information. Those are
+    the classic RDKit blind spot for diastereotopic methylene protons.
+    Complete methyl-like classes are explicitly protected because methyl
+    rotation makes them HARD even in chiral molecules.
+    """
+    if not stereo_present or len(cls) <= 1:
         return False
-    has_single_to_heavy = any(
-        b.GetBondType() == Chem.BondType.SINGLE
-        and b.GetOtherAtom(parent).GetSymbol() != "H"
-        for b in parent.GetBonds()
-    )
-    if not has_single_to_heavy:
+    if element != "H":
+        return False
+    if _is_rotationally_hard_hydrogen_class(cls, mol):
+        return False
+    if len(cls) != 2:
+        return False
+    if _same_parent_hydrogen_class(cls, mol) is None:
         return False
 
-    # Methyl-style: always force HARD (C₃ rotation universal).
-    if len(class_atoms) >= 3:
-        return True
+    vals = [shifts_by_atom.get(a) for a in cls]
+    finite = [v for v in vals if isinstance(v, (int, float))]
+    if len(finite) < 2:
+        return False
+    return (max(finite) - min(finite)) > float(tol_shift_ppm)
 
-    # Methylene-style: force HARD only when the molecule lacks stereo.
-    # In chiral environments the two H's may be diastereotopic; let
-    # the data-aware refinement decide via shift spread.
-    return not stereo_present
+
+def _classify_structural_tier(
+    *,
+    cls: list[int],
+    all_elem_atoms: list[int],
+    mol: Any,
+    element: str,
+) -> Tier:
+    """Classify a refined chemical-equivalence class.
+
+    This is intentionally more structural than the older J-vector-only
+    approach. DFT J values from one/few frozen conformers are excellent
+    for populating couplings, but they are a poor source of truth for
+    deciding whether fast-rotating methyl / tBu protons should be
+    collapsed. Conversely, non-methyl topological equivalences are safer
+    as SOFT groups: they keep one common shift while preserving possible
+    AA′BB′ / methylene / ring-coupling topology.
+
+    Policy:
+
+    * singleton → NONE;
+    * 13C / other non-proton equivalent atoms → HARD/intensity group;
+    * rotational methyl-like H classes → HARD;
+    * a class containing every atom of that nucleus in the spin system
+      → HARD (benzene, ethene, methane-like fully symmetric cases);
+    * all remaining multi-proton classes → SOFT.
+    """
+    if len(cls) == 0:
+        raise ValueError("_classify_structural_tier: cls must be non-empty")
+    if len(cls) == 1:
+        return Tier.NONE
+
+    elem = str(element).strip()
+    if elem != "H":
+        return Tier.HARD
+
+    if _is_rotationally_hard_hydrogen_class(cls, mol):
+        return Tier.HARD
+
+    cls_set = set(cls)
+    all_set = set(all_elem_atoms)
+    if cls_set == all_set:
+        return Tier.HARD
+
+    return Tier.SOFT
 
 
 def _avg_or_none(vals: list[Optional[float]]) -> Optional[float]:
@@ -543,21 +642,15 @@ def compute_equivalence_groups(
 
     1. Compute topological classes for atoms of the requested ``element``
        (via :func:`topological_classes`).
-    2. **Data-aware refinement.** RDKit's ``CanonicalRankAtoms``
+    2. **Narrow data-aware refinement.** RDKit's ``CanonicalRankAtoms``
        propagates chirality only through atom-level CIP flags (the ``@``
-       tag) — it does NOT split prochiral H's whose parent C is next to
-       a chiral center. Diastereotopic CH₂ pairs in chiral environments
-       therefore appear as one topological class of size 2 even though
-       they're chemically distinct. We compensate by splitting any
-       class whose *DFT-computed* shifts span more than
-       ``tol_shift_ppm`` into singletons. The DFT calculation already
-       respects 3D geometry, so the shift spread is a reliable signal
-       that the class members are NOT truly equivalent. Genuinely
-       homotopic / enantiotopic classes (methyls, achiral CH₂) have
-       sub-tolerance shift spread after Boltzmann averaging, so this
-       refinement leaves them alone.
-    3. Within each (refined) class, classify the tier
-       (:func:`classify_class_tier`).
+       tag) and does not reliably split prochiral H₂ classes next to a
+       chiral center. If a same-parent H₂ class in a stereochemical
+       molecule spans more than ``tol_shift_ppm``, split it into NONE
+       singletons. Do not split methyl-like classes or non-H atoms by
+       shift spread.
+    3. Classify each refined class with the structural HARD/SOFT/NONE
+       policy in :func:`_classify_structural_tier`.
     4. Materialize the per-tier groups:
 
        * **HARD** → one group with ``atom_indices = tuple(class)``,
@@ -589,64 +682,52 @@ def compute_equivalence_groups(
 
     # Data-aware refinement (see step 2 in docstring above).
     #
-    # The refinement only matters when the molecule has stereo info
-    # that could create rank-indistinguishable diastereotopic atoms
-    # (chiral centers, stereo bonds). For purely achiral molecules,
-    # same-rank atoms ARE chemically equivalent under fast rotation
-    # / NMR timescale by symmetry — any shift variation within a
-    # class is DFT noise from a finite-conformer Boltzmann ensemble
-    # (e.g., 2-conformer methyl groups don't sample C3 rotation
-    # uniformly), not a real diastereotopic signal. Skipping the
-    # refinement in the achiral case prevents false-splitting of
-    # methyls / methylenes when sampling is incomplete.
-    if _mol_has_stereo(mol):
-        refined: list[list[int]] = []
-        for cls in classes:
-            if len(cls) <= 1:
-                refined.append(cls)
-                continue
-            vals = [shifts_by_atom.get(a) for a in cls]
-            finite = [v for v in vals if isinstance(v, (int, float))]
-            if len(finite) < 2 or (max(finite) - min(finite)) <= tol_shift_ppm:
-                refined.append(cls)
-            else:
-                # Class members have meaningfully different DFT shifts —
-                # they're really distinct (e.g., diastereotopic CH₂ in a
-                # chiral environment). Split into singletons; each will
-                # later classify as Tier.NONE.
-                for a in cls:
-                    refined.append([a])
-        classes = refined
+    # Keep this deliberately narrow. RDKit's practical blind spot here
+    # is same-parent H₂ classes in a molecule with stereochemical
+    # information (diastereotopic methylene protons). We do NOT split
+    # methyl-like classes or non-H atoms by shift spread: those spreads
+    # are usually finite-conformer / non-symmetrized-geometry artifacts,
+    # and splitting them caused the patchouli alcohol methyl failure.
+    stereo_present = _mol_has_stereo(mol)
+    refined: list[list[int]] = []
+    for cls in classes:
+        if _should_split_class_by_shift(
+            cls=cls,
+            mol=mol,
+            element=elem,
+            stereo_present=stereo_present,
+            shifts_by_atom=shifts_by_atom,
+            tol_shift_ppm=tol_shift_ppm,
+        ):
+            # Same-parent H₂ class in a stereochemical molecule with
+            # meaningfully different predicted shifts: treat as genuine
+            # diastereotopic / NONE singletons.
+            refined.extend([a] for a in cls)
+        else:
+            refined.append(cls)
+    classes = refined
 
-    # All atoms of this element across every class. Used as the universe
-    # for the magnetic-equivalence test ("J-vector to other atoms").
+    # All atoms of this element across every class. Used to decide whether
+    # a class is the only spin class for that nucleus (e.g., benzene A6).
     all_elem_atoms: list[int] = sorted(
         idx for cls in classes for idx in cls
     )
 
     # Stage 1: classify each class + collect its atoms.
     #
-    # Structural force-HARD shortcut: H atoms sharing a parent C with
-    # rotatable single-bond connectivity are equivalent by molecular
-    # symmetry (C₃ rotation for methyls, C₂ for symmetric methylenes)
-    # regardless of how asymmetric the DFT-computed J's look across
-    # frozen conformer geometries. The mag-equiv test fails for these
-    # in practice — real ethanol methyl J's vary 5–15 Hz across H
-    # atoms in a 2-conformer ensemble because rotation isn't sampled.
-    # Bypass the test for the cases where chemistry is unambiguous:
-    # methyls always, methylenes when the molecule is achiral.
-    stereo_present = _mol_has_stereo(mol)
+    # Classification is structural-first. J values are still carried
+    # into the final groups, but are no longer allowed to split methyl /
+    # tert-butyl classes simply because a finite conformer ensemble did
+    # not rotationally average them. Non-methyl multi-proton classes are
+    # emitted SOFT by default, which preserves AA′BB′ / ring / methylene
+    # coupling topology while giving the class one averaged shift.
     classified: list[tuple[Tier, list[int]]] = []
     for cls in classes:
-        if _is_force_hard_class(cls, mol, stereo_present):
-            classified.append((Tier.HARD, cls))
-            continue
-        others = [a for a in all_elem_atoms if a not in cls]
-        tier = classify_class_tier(
-            class_atoms=cls,
-            other_atoms=others,
-            j_matrix=j_matrix,
-            tol_hz=tol_jcoupling_hz,
+        tier = _classify_structural_tier(
+            cls=cls,
+            all_elem_atoms=all_elem_atoms,
+            mol=mol,
+            element=elem,
         )
         classified.append((tier, cls))
 

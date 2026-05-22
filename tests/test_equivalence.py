@@ -354,10 +354,11 @@ class TestComputeEquivalenceGroups:
     def _h_indices(self, mol):
         return [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
 
-    def test_ethanol_collapses_methyl_and_methylene(self, rdkit):
-        # CCO: methyl 3H (HARD), methylene 2H (HARD in achiral env), OH (NONE).
-        # We construct synthetic shifts + symmetric J's so the dispatch
-        # has clean inputs.
+    def test_ethanol_methyl_hard_methylene_soft(self, rdkit):
+        # CCO: methyl 3H (HARD), methylene 2H (SOFT), OH (NONE).
+        # The methylene protons share one averaged shift but remain as
+        # separate spin groups so any geminal / AA′ topology can be
+        # preserved downstream.
         from rdkit import Chem  # noqa: WPS433
         mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
         h_atoms = self._h_indices(mol)
@@ -406,20 +407,24 @@ class TestComputeEquivalenceGroups:
             j_matrix=j_matrix,
             tol_jcoupling_hz=0.5,
         )
-        # 3 groups: A (methyl, number=3, 1.2 ppm), B (methylene, number=2,
-        # 3.7 ppm), C (OH, number=1, 2.5 ppm). Order by min atom index.
-        assert len(groups) == 3
+        # 4 groups: A (methyl, number=3, 1.2 ppm), B/C (methylene
+        # SOFT groups, same averaged 3.7 ppm), D (OH, number=1, 2.5 ppm).
+        assert len(groups) == 4
         ch3 = next(g for g in groups if g.shift_avg_ppm == pytest.approx(1.20))
-        ch2 = next(g for g in groups if g.shift_avg_ppm == pytest.approx(3.70))
+        ch2_groups = [g for g in groups if g.shift_avg_ppm == pytest.approx(3.70)]
         oh = next(g for g in groups if g.shift_avg_ppm == pytest.approx(2.50))
         assert ch3.tier == Tier.HARD and ch3.number == 3
-        assert ch2.tier == Tier.HARD and ch2.number == 2
+        assert len(ch2_groups) == 2
+        assert all(g.tier == Tier.SOFT and g.number == 1 for g in ch2_groups)
         assert oh.tier == Tier.NONE and oh.number == 1
-        # Methyl-to-methylene J should be 7.0 (averaged over 6 pairs, all 7.0).
-        assert ch3.j_couplings[ch2.name] == pytest.approx(7.0)
+        # Methyl-to-each-methylene-soft-group J should be 7.0, averaged
+        # over the three methyl H's for each destination proton.
+        for ch2 in ch2_groups:
+            assert ch3.j_couplings[ch2.name] == pytest.approx(7.0)
         # No J from methyl-or-methylene to OH (we didn't put any in).
         assert oh.name not in ch3.j_couplings
-        assert oh.name not in ch2.j_couplings
+        for ch2 in ch2_groups:
+            assert oh.name not in ch2.j_couplings
 
     def test_aa_xx_aromatic_emits_soft_groups(self, rdkit):
         # 1,2-dichlorobenzene. Pre-stage synthetic J's that mimic the
@@ -539,15 +544,26 @@ class TestComputeEquivalenceGroups:
         assert any(abs(s - 1.75) < 1e-6 for s in none_shifts)
         assert any(abs(s - 4.00) < 1e-6 for s in none_shifts)
 
-    def test_diastereotopic_ch2_collapses_when_shifts_close(self, rdkit):
+    def test_diastereotopic_ch2_stays_soft_when_shifts_close(self, rdkit):
         # Same molecule but with shifts within tol_shift_ppm: the
-        # data-aware refinement leaves the topological class alone
-        # (since DFT didn't actually distinguish the H's), and the
-        # downstream J-vector test decides between HARD and SOFT.
-        # With no J's, the methylene pair would test as HARD.
+        # data-aware refinement leaves the topological class together,
+        # but the structural classifier does NOT hard-collapse a
+        # same-parent H₂ class in a stereochemical molecule. It is safer
+        # as SOFT: one averaged shift, separate spin groups.
         from rdkit import Chem  # noqa: WPS433
         mol = Chem.AddHs(Chem.MolFromSmiles("C[C@H](Br)CC"))
         h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
+        methylene_pair: list[int] = []
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() != "C":
+                continue
+            h_neighbors = sorted(
+                n.GetIdx() for n in atom.GetNeighbors() if n.GetSymbol() == "H"
+            )
+            if len(h_neighbors) == 2:
+                methylene_pair = h_neighbors
+        assert len(methylene_pair) == 2
+
         # Uniform shifts across the methylene pair (well within tol).
         shifts = {h: 1.0 for h in h_atoms}
         groups = compute_equivalence_groups(
@@ -558,12 +574,12 @@ class TestComputeEquivalenceGroups:
             tol_jcoupling_hz=0.5,
             tol_shift_ppm=0.05,
         )
-        # 4 groups: 2 HARD methyls (3 each) + 1 NONE methine + 1 HARD
-        # methylene-as-pair. Total atoms covered = 9.
-        hard = [g for g in groups if g.tier == Tier.HARD]
         assert sum(g.number for g in groups) == 9
-        # The methylene H's stayed as one HARD group of 2.
-        assert any(g.number == 2 and g.tier == Tier.HARD for g in hard)
+        methylene_groups = [
+            g for g in groups if set(g.atom_indices).issubset(set(methylene_pair))
+        ]
+        assert len(methylene_groups) == 2
+        assert all(g.tier == Tier.SOFT and g.number == 1 for g in methylene_groups)
 
     def test_force_hard_methyl_despite_asymmetric_js(self, rdkit):
         # Regression for the live ethanol run: real DFT on 2 conformers
@@ -621,10 +637,10 @@ class TestComputeEquivalenceGroups:
         # uniformly, so DFT gave the 3 methyl H's σ values spread by
         # ~0.14 ppm (> tol_shift_ppm=0.05). Pre-fix, the data-aware
         # refinement split the methyl class into 3 NONE singletons,
-        # producing 6 H groups (A/B/C/D/E/F) instead of 3 (methyl+
-        # methylene+OH). Post-fix, refinement is gated on stereo
-        # presence; ethanol has no chiral center → refinement skipped
-        # → topology rules → methyl + methylene collapse correctly.
+        # producing 6 H groups (A/B/C/D/E/F). Post-fix, refinement is
+        # gated on stereo presence; ethanol has no chiral center →
+        # refinement skipped → topology rules preserve methyl HARD and
+        # methylene SOFT equivalence without raw singleton splitting.
         from rdkit import Chem  # noqa: WPS433
         mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
         h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
@@ -667,12 +683,68 @@ class TestComputeEquivalenceGroups:
             tol_jcoupling_hz=0.5,
             tol_shift_ppm=0.05,
         )
-        # 3 groups: methyl (HARD, number=3), methylene (HARD,
-        # number=2), OH (NONE, number=1). NOT 6.
-        assert len(groups) == 3
+        # 4 groups: methyl (HARD, number=3), methylene as two SOFT
+        # groups with the same averaged shift, OH (NONE, number=1).
+        # NOT 6 raw singletons from shift-spread false splitting.
+        assert len(groups) == 4
         hard = [g for g in groups if g.tier == Tier.HARD]
+        soft = [g for g in groups if g.tier == Tier.SOFT]
         none = [g for g in groups if g.tier == Tier.NONE]
-        assert len(hard) == 2
+        assert len(hard) == 1 and hard[0].number == 3
+        assert len(soft) == 2 and all(g.number == 1 for g in soft)
         assert len(none) == 1
-        # Sizes match the chemistry.
-        assert sorted(g.number for g in groups) == [1, 2, 3]
+        assert all(g.shift_avg_ppm == pytest.approx(3.775) for g in soft)
+        # Sizes match the emitted spin groups.
+        assert sorted(g.number for g in groups) == [1, 1, 1, 3]
+    def test_tbutyl_nine_protons_force_hard_despite_shift_spread(self, rdkit):
+        # tert-butanol: all nine tBu protons are one RDKit class spanning
+        # three complete methyl groups. Even wildly asymmetric predicted
+        # shifts from a non-rotationally averaged geometry should collapse
+        # to one HARD 9H group.
+        from rdkit import Chem  # noqa: WPS433
+        mol = Chem.AddHs(Chem.MolFromSmiles("CC(C)(C)O"))
+        h_classes = topological_classes(mol, element="H")
+        tbu_class = next(c for c in h_classes if len(c) == 9)
+        oh_class = next(c for c in h_classes if len(c) == 1)
+        shifts = {h: 0.5 + 0.1 * i for i, h in enumerate(tbu_class)}
+        shifts[oh_class[0]] = 2.0
+
+        groups = compute_equivalence_groups(
+            mol=mol,
+            element="H",
+            shifts_by_atom=shifts,
+            j_matrix={},
+            tol_jcoupling_hz=0.5,
+            tol_shift_ppm=0.05,
+        )
+        tbu = next(g for g in groups if set(g.atom_indices) == set(tbu_class))
+        assert tbu.tier == Tier.HARD
+        assert tbu.number == 9
+        assert tbu.shift_avg_ppm == pytest.approx(sum(shifts[h] for h in tbu_class) / 9)
+
+    def test_patchouli_methyl_classes_survive_stereo_shift_refinement(self, rdkit):
+        # Regression for patchouli alcohol: the molecule is stereochemically
+        # rich, so the old broad shift-spread refinement split methyl H's
+        # into A/B/C singletons. The corrected logic protects complete
+        # methyl classes: two isolated 3H methyl classes and one equivalent
+        # gem-dimethyl 6H class.
+        from rdkit import Chem  # noqa: WPS433
+        smi = "C[C@H]1CC[C@@]2([C@@]3([C@H]1C[C@H](C2(C)C)CC3)C)O"
+        mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+        h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
+        # Deliberately give large within-methyl spreads; HARD rotational
+        # classes should still average them rather than split.
+        shifts = {h: 0.2 * (i % 7) for i, h in enumerate(h_atoms)}
+
+        groups = compute_equivalence_groups(
+            mol=mol,
+            element="H",
+            shifts_by_atom=shifts,
+            j_matrix={},
+            tol_jcoupling_hz=0.5,
+            tol_shift_ppm=0.05,
+        )
+        hard_sizes = sorted(g.number for g in groups if g.tier == Tier.HARD)
+        assert hard_sizes == [3, 3, 6]
+        assert all(g.number != 1 for g in groups if g.tier == Tier.HARD)
+
