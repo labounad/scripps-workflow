@@ -129,6 +129,8 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "browser: optional browser-level smoke tests for generated viewer bundles",
+    "hpc: integration tests that SSH to a real HPC; gated by SCRIPPS_WORKFLOW_HPC_HOST env var",
+    "hpc_compute: HPC tests that submit real SLURM jobs; additionally gated by SCRIPPS_WORKFLOW_HPC_ALLOW_SUBMIT env var",
 ]
 filterwarnings = [
     "error",
