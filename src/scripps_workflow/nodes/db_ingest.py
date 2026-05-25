@@ -1,14 +1,26 @@
-"""``wf-db-ingest`` — persist nmr_aggregate results into the nmr-data database.
+"""``wf-db-ingest`` — backstop populator for the nmr-data database.
 
 Sits at the end of the NMR Predictor pipeline, after ``wf-nmr-aggregate``.
-Reads the upstream nmr_aggregate manifest to locate the predicted_shifts.csv
-and predicted_couplings.csv, walks one level further up to reach the
-thermo_aggregate manifest for per-conformer energy data, then writes
-everything to the nmr-data PostgreSQL database via ``nmr_data.ingest``.
+As of the registry refactor, each compute stage self-registers its own
+DB row + central-tree copy via :mod:`nmr_data.registry` (see
+``scripps-workflow/docs/registry-design.md``). This node is no longer
+the SOLE writer — it's the *backstop*: it calls
+``ingest_nmr_aggregate_result`` (which delegates to the same
+``register_*`` functions the producing nodes used), so any stage whose
+self-registration was skipped (DB outage, missing env, etc.) lands
+here instead.
 
-The node is intentionally a thin orchestration wrapper — all DB logic lives
-in ``nmr_data.ingest`` so it can be called directly from Python without
-going through the pipeline.
+Every ``register_*`` call is idempotent on its cache fingerprint:
+when the producing nodes already wrote everything, this node's
+``ingest_nmr_aggregate_result`` returns ``is_new_predicted_run=False``
+plus zero file copies across every stage — a fast no-op. The
+``[INFO]`` lines below distinguish "fresh write" from "backstop
+no-op" so an operator can see at a glance whether anything had been
+missed upstream.
+
+All DB logic still lives in ``nmr_data.ingest`` /
+``nmr_data.registry`` so it can be called directly from Python
+without going through the pipeline.
 
 Config keys (``key=value`` tokens or one JSON object)::
 
@@ -291,7 +303,7 @@ class DbIngest(Node):
     def run(self, ctx: NodeContext) -> None:  # noqa: C901
         cfg = ctx.config
 
-        log_info("db_ingest starting")
+        log_info("db_ingest backstop starting")
 
         # ---- 0) Dependency check ----
         if not _HAS_NMR_DATA:
@@ -574,7 +586,12 @@ class DbIngest(Node):
                 os.environ["NMR_DATABASE_URL"] = _orig_url
 
         # ---- 8) Record summary ----
-        # is_new_* tell us which rows were created vs reused (idempotency).
+        # is_new_* tell us which rows were created vs reused — with the
+        # registry refactor, "reused" is now the EXPECTED state for a
+        # pipeline whose producing nodes self-registered successfully.
+        # "NEW" here means the backstop actually had to write the row,
+        # which usually points at a transient producing-node failure
+        # worth investigating.
         mol_state = "NEW" if summary.get("is_new_molecule") else "existing"
         run_state = "NEW" if summary.get("is_new_predicted_run") else "existing"
         log_info(
@@ -583,8 +600,8 @@ class DbIngest(Node):
         )
         if not summary.get("is_new_predicted_run"):
             log_info(
-                "      idempotent re-ingest — child rows already present, "
-                "no inserts performed"
+                "      backstop no-op — predicted_run was already registered "
+                "by wf-nmr-aggregate"
             )
         log_info(
             f"      rows: n_conformers={summary.get('n_conformers')}, "
