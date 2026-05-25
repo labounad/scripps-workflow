@@ -154,6 +154,92 @@ from ..orca import (
     pick_orca_outputs,
 )
 from ..parsing import normalize_optional_str, parse_bool, parse_float, parse_int
+from ..schema import Manifest
+
+# --------------------------------------------------------------------
+# Optional nmr_data + rdkit imports for predicted_run self-registration.
+# Same fail-open shape as the cache-aware compute nodes.
+# --------------------------------------------------------------------
+
+_NMR_DATA_IMPORT_ERROR: str | None = None
+_RDKIT_IMPORT_ERROR: str | None = None
+
+try:
+    from nmr_data.cache import (  # noqa: F401
+        build_crest_ensemble_key,
+        build_dft_run_key,
+        build_goat_ensemble_key,
+        build_thermo_run_key,
+        fingerprint as _cache_fingerprint,
+    )
+    _HAS_NMR_DATA = True
+except Exception as _e:
+    _HAS_NMR_DATA = False
+    _NMR_DATA_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    from rdkit import Chem  # noqa: F401
+    _HAS_RDKIT = True
+except Exception as _e:
+    _HAS_RDKIT = False
+    _RDKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+
+def _walk_upstream_for_step(ctx: NodeContext, step_name: str) -> dict | None:
+    """Walk back through ``upstream.manifest_path`` references for a
+    manifest whose ``step`` matches. Bounded to a handful of hops.
+
+    Duplicates the helper in orca_dft_array / orca_thermo_array. Will
+    consolidate once the planned conformers/ shared util module exists.
+    """
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        if (current.get("step") or "") == step_name:
+            return current
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
+
+
+def _walk_upstream_for_smiles(ctx: NodeContext) -> str | None:
+    """Walk back for the first ``inputs.smiles`` in the upstream chain.
+
+    Mirrors the helper in CREST / orca_dft_array / orca_thermo_array.
+    """
+    visited: set[str] = set()
+    current = ctx.upstream_manifest.to_dict() if ctx.upstream_manifest else None
+    for _ in range(12):
+        if current is None:
+            return None
+        s = (current.get("inputs") or {}).get("smiles")
+        if isinstance(s, str) and s:
+            return s
+        upstream = current.get("upstream") or {}
+        mp = upstream.get("manifest_path")
+        if not mp or mp in visited:
+            return None
+        visited.add(mp)
+        p = Path(mp)
+        if not p.exists():
+            return None
+        try:
+            current = Manifest.read(p).to_dict()
+        except Exception:
+            return None
+    return None
 
 
 DEFAULT_SOLVENT: str = "CHCl3"
@@ -1804,6 +1890,154 @@ class NmrAggregate(Node):
                 cal_c=cal_c,
                 cal_jhh=cal_jhh,
             )
+
+        # ---- predicted_run self-registration to nmr-data -----------------
+        # Writes the PredictedRun row, ingests shifts+couplings CSVs, and
+        # copies NMR artifacts (CSVs, mnova XMLs, diagrams, per-task
+        # orca_nmr_*.out.gz) into the central tree. The nmr_aggregate's
+        # OWN manifest is not yet written at this point (the framework
+        # writes it after run() returns), so it's not copied here — that
+        # follow-up populator lives in wf-db-ingest after this PR.
+        if ctx.manifest.ok:
+            self._maybe_register_predicted_run(
+                ctx=ctx, cfg=cfg, confs=confs,
+                shifts_path=shifts_path,
+                couplings_path=(
+                    couplings_path if not cfg["skip_couplings"] else None
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # Producer-side self-registration
+    # ------------------------------------------------------------------
+
+    def _maybe_register_predicted_run(
+        self,
+        *,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        confs: list[dict[str, Any]],
+        shifts_path: Path,
+        couplings_path: Path | None,
+    ) -> None:
+        """Self-register this NMR aggregate run to nmr-data, best-effort.
+
+        Walks the upstream chain to compute the parent thermo_run's
+        fingerprint (ens → dft → thermo, same derivation as the
+        thermo-array reader/writer), then delegates to the base-class
+        helper. The thermo_run fingerprint lets the registry FK the
+        inserted Conformer rows back to the parent DftRun via the
+        thermo_run.dft_run_id pointer.
+
+        If the upstream chain isn't fully available (e.g. ad-hoc local
+        test without crest/dft/thermo manifests), the helper still
+        registers a molecule-scoped predicted_run — just without the
+        per-conformer dft-run FK. That's a graceful degradation.
+        """
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"nmr-aggregate registry: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"nmr-aggregate registry: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping registration"
+            )
+            return
+
+        smiles = cfg.get("smiles") or _walk_upstream_for_smiles(ctx)
+        if not smiles:
+            logging_utils.log_info(
+                "nmr-aggregate registry: no SMILES (cfg or upstream), "
+                "skipping registration"
+            )
+            return
+        if not shifts_path.exists():
+            logging_utils.log_warn(
+                f"nmr-aggregate registry: shifts CSV missing at "
+                f"{shifts_path}, skipping registration"
+            )
+            return
+
+        # Resolve parent thermo_run fingerprint by walking the chain:
+        #   crest|orca_goat → orca_dft_array → orca_thermo_array
+        # Same key-derivation as orca_thermo_array's writer side.
+        parent_thermo_fp: str | None = None
+        try:
+            thermo_array_dict = _walk_upstream_for_step(ctx, "orca_thermo_array")
+            dft_dict = _walk_upstream_for_step(ctx, "orca_dft_array")
+            crest_dict = _walk_upstream_for_step(ctx, "crest")
+            goat_dict = _walk_upstream_for_step(ctx, "orca_goat")
+            if thermo_array_dict and dft_dict and (crest_dict or goat_dict):
+                ens_inputs = (
+                    (crest_dict or {}).get("inputs")
+                    or (goat_dict or {}).get("inputs")
+                    or {}
+                )
+                if crest_dict is not None:
+                    ens_key = build_crest_ensemble_key(ens_inputs, smiles)
+                else:
+                    ens_key = build_goat_ensemble_key(ens_inputs, smiles)
+                if ens_key is not None:
+                    ens_fp = _cache_fingerprint(ens_key)
+                    dft_inputs = dft_dict.get("inputs") or {}
+                    dft_key = build_dft_run_key(
+                        dft_inputs, ensemble_fingerprint=ens_fp,
+                    )
+                    dft_fp = _cache_fingerprint(dft_key)
+                    thermo_inputs = thermo_array_dict.get("inputs") or {}
+                    thermo_key = build_thermo_run_key(
+                        thermo_inputs,
+                        dft_run_fingerprint=dft_fp,
+                        thermo_aggregate_inputs={
+                            "temperature_k": cfg.get("temperature_k"),
+                        },
+                    )
+                    parent_thermo_fp = _cache_fingerprint(thermo_key)
+        except Exception as e:
+            logging_utils.log_warn(
+                f"nmr-aggregate registry: parent thermo_run fingerprint "
+                f"derivation raised, degrading to molecule-scoped "
+                f"registration: {type(e).__name__}: {e}"
+            )
+            parent_thermo_fp = None
+
+        # Build the NMR method tuple for the predicted_run UNIQUE.
+        nmr_run_params = {
+            "shielding_method_h": cfg.get("shielding_method_h"),
+            "shielding_basis_h": cfg.get("shielding_basis_h"),
+            "shielding_method_c": cfg.get("shielding_method_c"),
+            "shielding_basis_c": cfg.get("shielding_basis_c"),
+            "coupling_method": cfg.get("coupling_method"),
+            "coupling_basis": cfg.get("coupling_basis"),
+            "solvent": cfg.get("solvent"),
+            "temperature_k": cfg.get("temperature_k"),
+        }
+
+        # Build conformer_task_dirs from the conformer records (each
+        # rec's path_abs points at orca_thermo_array's task_dir, holding
+        # the per-task orca_nmr_*.out files that get gzip-copied).
+        conformer_task_dirs: dict[int, Path] = {}
+        for idx, rec in enumerate(confs, start=1):
+            xyz = rec.get("path_abs")
+            if xyz:
+                rec_idx = int(rec.get("index", idx))
+                conformer_task_dirs[rec_idx] = Path(xyz).parent
+
+        self._try_register_to_nmr_data(
+            "predicted_run",
+            ctx=ctx,
+            smiles=smiles,
+            nmr_run_params=nmr_run_params,
+            shifts_csv_path=shifts_path,
+            couplings_csv_path=couplings_path,
+            parent_thermo_run_fingerprint=parent_thermo_fp,
+            nmr_outputs_dir=ctx.outputs_dir,
+            conformer_records=list(confs),
+            conformer_task_dirs=conformer_task_dirs or None,
+        )
 
     # ------------------------------------------------------------------
     # Visualization emission (mnova XML + molecule diagrams)
