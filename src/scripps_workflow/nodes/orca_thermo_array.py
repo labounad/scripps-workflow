@@ -1144,6 +1144,119 @@ class OrcaThermoArray(Node):
                 execs=execs,
             )
 
+        # ----- 6) Self-register the thermo_run + central-tree copy -----
+        # Writes the ThermoRun row + copies per-task orca_thermo.out.gz
+        # into the central tree. The thermo_aggregate manifest + summary
+        # CSV don't exist yet (that node runs downstream); those land
+        # via wf-db-ingest as a follow-up populator. Same use_cache gating
+        # as the read-side check.
+        if ctx.manifest.ok and cfg.get("use_cache", True):
+            self._maybe_register_thermo_run(
+                ctx, cfg, multiplicity=multiplicity, tasks_root=tasks_root,
+            )
+
+    # ------------------------------------------------------------------
+    # Producer-side self-registration
+    # ------------------------------------------------------------------
+
+    def _maybe_register_thermo_run(
+        self,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        *,
+        multiplicity: int,
+        tasks_root: Path,
+    ) -> None:
+        """Self-register this thermo run to nmr-data, best-effort.
+
+        Mirrors the read-side ``_maybe_emit_cached_manifest_thermo`` key
+        derivation: walk upstream for SMILES + CREST + DFT inputs, build
+        the parent :class:`DftRunKey` fingerprint, then this node's
+        :class:`ThermoKey`. Delegates the registration + per-task log
+        copy to the Node base-class helper. Same caveats: GOAT upstreams
+        aren't supported here (the cache check is CREST-only too, see
+        ``_maybe_emit_cached_manifest_thermo`` line 1213).
+        """
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"orca-thermo registry: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"orca-thermo registry: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping registration"
+            )
+            return
+
+        smiles = _walk_upstream_for_smiles(ctx)
+        crest_dict = _walk_upstream_for_step(ctx, "crest")
+        dft_dict = _walk_upstream_for_step(ctx, "orca_dft_array")
+        if not smiles or not crest_dict:
+            logging_utils.log_info(
+                "orca-thermo registry: SMILES or wf_crest manifest not "
+                "found in upstream chain, skipping registration"
+            )
+            return
+
+        crest_inputs = crest_dict.get("inputs") or {}
+        dft_inputs = (dft_dict.get("inputs") if dft_dict else None) or {}
+
+        # Build inputs dict the same way the writer side will see it.
+        own_inputs: dict[str, Any] = dict(cfg)
+        own_inputs["multiplicity"] = multiplicity
+
+        try:
+            ens_key = build_crest_ensemble_key(crest_inputs, smiles)
+            if ens_key is None:
+                logging_utils.log_info(
+                    "orca-thermo registry: could not build EnsembleKey, "
+                    "skipping registration"
+                )
+                return
+            ens_fp = _cache_fingerprint(ens_key)
+            dft_key = build_dft_run_key(dft_inputs, ensemble_fingerprint=ens_fp)
+            dft_fp = _cache_fingerprint(dft_key)
+            thermo_key = build_thermo_run_key(
+                own_inputs,
+                dft_run_fingerprint=dft_fp,
+                thermo_aggregate_inputs={
+                    "temperature_k": cfg["temperature_k"],
+                },
+            )
+        except Exception as e:
+            logging_utils.log_warn(
+                f"orca-thermo registry: key build raised, "
+                f"skipping registration: {type(e).__name__}: {e}"
+            )
+            return
+
+        # Build conformer_task_dirs from the local tasks_root. Each
+        # conf_NNNN holds the orca_thermo.out that copy_thermo_run_artifacts
+        # gzip-copies into the central tree.
+        conformer_task_dirs: dict[int, Path] = {}
+        if tasks_root.is_dir():
+            for d in tasks_root.iterdir():
+                if d.is_dir() and d.name.startswith("conf_"):
+                    try:
+                        idx = int(d.name.removeprefix("conf_"))
+                        conformer_task_dirs[idx] = d
+                    except ValueError:
+                        continue
+
+        conformer_records = list(
+            ctx.manifest.artifacts.get("conformers", []) or []
+        )
+        self._try_register_to_nmr_data(
+            "thermo_run",
+            ctx=ctx,
+            parent_dft_run_fingerprint=dft_fp,
+            thermo_key=thermo_key,
+            conformer_records=conformer_records,
+            conformer_task_dirs=conformer_task_dirs or None,
+        )
+
     # ------------------------------------------------------------------
     # v6.5b cache hit path
     # ------------------------------------------------------------------
