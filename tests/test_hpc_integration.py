@@ -441,6 +441,9 @@ class TestRealPipelineDryRun:
 
     def test_chain_embed_through_prism(self):
         workdir = _make_remote_workdir()
+        # Track whether the test succeeded so we can leave the workdir
+        # in place on failure for post-mortem inspection.
+        succeeded = False
         try:
             # 1. wf-embed — RDKit ETKDG, no upstream.
             embed_ptr, embed_m = _run_pipeline_step(
@@ -450,6 +453,9 @@ class TestRealPipelineDryRun:
             assert embed_m["ok"] is True
             assert embed_m["step"] == "smiles_to_3d"
             assert embed_m["artifacts"].get("xyz"), embed_m
+            # Sanity: embed propagates the input SMILES into the
+            # manifest so downstream upstream-walkers can find it.
+            assert embed_m["inputs"].get("smiles") == self.SMILES, embed_m["inputs"]
 
             # 2. wf-xtb — xTB single-point/opt on the embedded geometry.
             xtb_ptr, xtb_m = _run_pipeline_step(
@@ -459,6 +465,12 @@ class TestRealPipelineDryRun:
             )
             assert xtb_m["ok"] is True
             assert xtb_m["step"] == "xtb_calc"
+            # xtb's manifest must reference embed's manifest as its
+            # upstream — otherwise the SMILES-walker can't reach it.
+            assert (
+                xtb_m.get("upstream", {}).get("manifest_path")
+                == embed_ptr.get("manifest_path")
+            ), xtb_m.get("upstream")
 
             # 3. wf-crest — conformer search in quick mode. The slow
             # step of this chain; ~30 s for a small molecule. Bump
@@ -471,27 +483,83 @@ class TestRealPipelineDryRun:
             assert crest_m["ok"] is True, crest_m.get("failures")
             assert crest_m["step"] == "crest"
             assert crest_m["artifacts"].get("conformers"), crest_m
+            # Same upstream-chain sanity for crest → xtb.
+            assert (
+                crest_m.get("upstream", {}).get("manifest_path")
+                == xtb_ptr.get("manifest_path")
+            ), crest_m.get("upstream")
 
-            # 4. wf-crest's registry stash — the ensemble row should
-            # have landed in the DB. Skipped silently if NMR_DATABASE_URL
-            # isn't reachable, so we assert on the ``ok`` field rather
-            # than requiring ``status="created"`` (the row may already
-            # exist from a prior run).
+            # 4. CREST cache + registry contract.
+            # Outcome depends on whether this SMILES was previously run:
+            #
+            #   * Cache MISS (first time this CREST recipe runs against
+            #     this SMILES): _maybe_register_ensemble fires after the
+            #     real CREST compute, stashing inputs.registry.ensemble
+            #     with status="created".
+            #   * Cache HIT (this SMILES has a prior ensemble row in the
+            #     DB): _maybe_emit_cached_manifest returns True and run()
+            #     early-returns BEFORE _maybe_register_ensemble. The
+            #     registry block is absent; cache_hit + cached_*
+            #     inputs are present instead.
+            #
+            # Both outcomes verify the contract we care about: the
+            # ensemble row + central-tree dir exist on the cluster.
+            # We just have to read the cache_hit vs registry side
+            # depending on which fired.
+            cache_hit = bool(crest_m["inputs"].get("cache_hit"))
             reg = crest_m["inputs"].get("registry", {}).get("ensemble")
-            assert reg is not None, (
-                "crest didn't stash a registry.ensemble block — check that "
-                "NMR_DATABASE_URL is set and nmr_data is importable on the cluster"
-            )
-            assert reg["ok"] is True, reg
-            assert reg["status"] in {"created", "reused"}, reg
-            assert reg.get("central_tree_path"), reg
+
+            if cache_hit:
+                ensemble_path_rel = crest_m["inputs"].get("cached_ensemble_path")
+                assert ensemble_path_rel, (
+                    f"cache_hit=true but cached_ensemble_path is missing: "
+                    f"{crest_m['inputs']}"
+                )
+            elif reg is not None:
+                assert reg["ok"] is True, reg
+                assert reg["status"] in {"created", "reused"}, reg
+                ensemble_path_rel = reg.get("central_tree_path")
+                assert ensemble_path_rel, reg
+            else:
+                # Neither cache hit nor registry stash — the contract
+                # is broken. Dump a diagnostic.
+                diag = {
+                    "crest_inputs_keys": sorted(crest_m["inputs"].keys()),
+                    "crest_use_cache": crest_m["inputs"].get("use_cache"),
+                    "crest_force_recompute": crest_m["inputs"].get("force_recompute"),
+                    "crest_smiles_in_inputs": crest_m["inputs"].get("smiles"),
+                    "crest_upstream_manifest_path": (
+                        crest_m.get("upstream", {}).get("manifest_path")
+                    ),
+                }
+                raise AssertionError(
+                    "crest neither cache-hit nor stashed a registry "
+                    "block. Likely causes (high → low):\n"
+                    "  1. `_find_upstream_smiles` returned None — "
+                    "SMILES walker couldn't reach embed's inputs.smiles "
+                    "via the upstream chain.\n"
+                    "  2. _HAS_NMR_DATA or _HAS_RDKIT is False on the "
+                    "cluster — run `python -c 'from scripps_workflow."
+                    "nodes import crest; print(crest._HAS_NMR_DATA, "
+                    "crest._HAS_RDKIT, crest._NMR_DATA_IMPORT_ERROR, "
+                    "crest._RDKIT_IMPORT_ERROR)'`.\n"
+                    "  3. `_build_ensemble_key` raised — check crest "
+                    "stderr from the run dir.\n"
+                    f"Inspect manifests at: {workdir}\n"
+                    f"Diagnostic snapshot: {json.dumps(diag, indent=2)}"
+                )
+
             # Ensemble dir exists on disk.
             _ssh_in_env(
-                f"test -d \"$NMR_HPC_DATA_ROOT/{reg['central_tree_path']}\"",
+                f"test -d \"$NMR_HPC_DATA_ROOT/{ensemble_path_rel}\"",
                 timeout=15,
             )
 
             # 5. wf-prism — RMSD/MoI pruning of the CREST output. Cheap.
+            # Surviving conformers land in artifacts.accepted (with
+            # rejected ones in artifacts.rejected); the `conformers`
+            # bucket is reserved for nodes that emit a single
+            # unfiltered list (CREST, orca_goat). Don't conflate.
             prism_ptr, prism_m = _run_pipeline_step(
                 workdir, "04_prism",
                 ["wf-prism", json.dumps(crest_ptr)],
@@ -499,10 +567,26 @@ class TestRealPipelineDryRun:
             )
             assert prism_m["ok"] is True, prism_m.get("failures")
             assert prism_m["step"] == "prism_screen"
-            assert prism_m["artifacts"].get("conformers"), prism_m
+            assert prism_m["artifacts"].get("accepted"), (
+                "prism emitted ok=True but no accepted conformers — "
+                "check that the upstream CREST output actually had "
+                "geometries to prune"
+            )
+
+            succeeded = True
 
         finally:
-            _remove_remote_workdir(workdir)
+            # Leave the workdir on disk if the test failed so we can
+            # SSH in and inspect the manifests.
+            if succeeded:
+                _remove_remote_workdir(workdir)
+            else:
+                # Print path to stderr (pytest -s shows it; -v alone
+                # doesn't); the assertion message above also references it.
+                print(
+                    f"\n[hpc-test] dry-run pipeline failed; workdir kept "
+                    f"for inspection at {workdir} on the cluster.",
+                )
 
 
 # ---------------------------------------------------------------------------
