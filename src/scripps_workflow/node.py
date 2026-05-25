@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from .logging_utils import log_error, log_info
+from .logging_utils import log_error, log_info, log_warn
 from .parsing import parse_kv_or_json
 from .pointer import Pointer, PointerError, load_pointer
 from .schema import (
@@ -158,6 +158,140 @@ class Node(ABC):
         bools coerced) and call ``ctx.set_inputs(**typed)`` from ``run``.
         """
         return dict(raw)
+
+    # ---------- producer-side self-registration to nmr-data ----------
+
+    #: Stages that producing nodes may self-register. Mirrors the four
+    #: cache-key tiers in :mod:`nmr_data.registry`. Keep in sync with the
+    #: registry module's public entry points.
+    _REGISTRY_STAGES: frozenset[str] = frozenset(
+        {"ensemble", "dft_run", "thermo_run", "predicted_run"}
+    )
+
+    def _try_register_to_nmr_data(
+        self,
+        stage: str,
+        *,
+        ctx: NodeContext,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Best-effort per-stage self-registration to nmr-data.
+
+        Calls ``nmr_data.registry.register_<stage>(**kwargs)`` after the
+        producing node's compute step succeeds. The result is normalized
+        to a dict and stashed under ``manifest.inputs["registry"][stage]``
+        so the operator (and downstream tooling) can see what landed in
+        the DB. The same dict is also returned for callers that want to
+        inspect it.
+
+        This method NEVER raises. Failure modes (env unset, nmr_data
+        unimportable, DB down, missing parent fingerprint) all map to a
+        result dict with ``ok=False`` and a ``reason`` field, plus a
+        warning on stderr. Matches the cache fail-open policy in
+        ``caf23ff``: a degraded data layer never breaks a running
+        pipeline.
+
+        :param stage: One of :data:`_REGISTRY_STAGES`. Determines which
+            ``register_*`` entry point to call.
+        :param ctx: Node context. Used only to stash the result into
+            the manifest.
+        :param kwargs: Forwarded verbatim to
+            ``nmr_data.registry.register_<stage>``. See that module for
+            per-stage required and optional kwargs. ``hpc_data_root`` is
+            auto-filled from ``NMR_HPC_DATA_ROOT`` if not provided.
+
+        :returns: Normalized result dict with keys
+            ``{stage, ok, status, row_id, fingerprint, central_tree_path,
+            n_files_copied, notes, extra, reason?}``. Always present;
+            never ``None``.
+        """
+        import os
+
+        if stage not in self._REGISTRY_STAGES:
+            raise ValueError(
+                f"Unknown registration stage {stage!r}; "
+                f"expected one of {sorted(self._REGISTRY_STAGES)}"
+            )
+
+        def _stash(result: dict[str, Any]) -> dict[str, Any]:
+            """Tuck the result under ``manifest.inputs.registry[stage]``."""
+            reg_bucket = ctx.manifest.inputs.setdefault("registry", {})
+            if not isinstance(reg_bucket, dict):
+                # Existing non-dict value at "registry" — leave it alone
+                # and return without stashing. Should not happen in
+                # normal use; defensive against external manipulation.
+                return result
+            reg_bucket[stage] = result
+            return result
+
+        database_url = os.environ.get("NMR_DATABASE_URL")
+        if not database_url:
+            log_info(
+                f"registry({stage}): NMR_DATABASE_URL unset; "
+                f"skipping registration"
+            )
+            return _stash({
+                "stage": stage,
+                "ok": False,
+                "status": "skipped",
+                "reason": "NMR_DATABASE_URL unset",
+            })
+
+        try:
+            from nmr_data import registry  # type: ignore[import-not-found]
+        except Exception as e:
+            log_warn(
+                f"registry({stage}): nmr_data import failed, "
+                f"skipping registration: {type(e).__name__}: {e}"
+            )
+            return _stash({
+                "stage": stage,
+                "ok": False,
+                "status": "failed",
+                "reason": f"import: {type(e).__name__}: {e}",
+            })
+
+        try:
+            fn = getattr(registry, f"register_{stage}")
+            result = fn(**kwargs)
+        except Exception as e:
+            log_warn(
+                f"registry({stage}): registration raised, "
+                f"treating as no-op: {type(e).__name__}: {e}"
+            )
+            return _stash({
+                "stage": stage,
+                "ok": False,
+                "status": "failed",
+                "reason": f"{type(e).__name__}: {e}",
+            })
+
+        # Normalize the RegistryResult dataclass → JSON-able dict for
+        # manifest stash. UUIDs become strings; everything else is
+        # already JSON-friendly per the registry module's contract.
+        normalized = {
+            "stage": stage,
+            "ok": bool(result.ok),
+            "status": str(result.status),
+            "row_id": str(result.row_id) if result.row_id is not None else None,
+            "fingerprint": result.fingerprint,
+            "central_tree_path": result.central_tree_path,
+            "n_files_copied": int(result.n_files_copied),
+            "notes": list(result.notes),
+            "extra": dict(result.extra),
+        }
+        if result.ok:
+            log_info(
+                f"registry({stage}): {result.status} "
+                f"row={normalized['row_id']} "
+                f"path={result.central_tree_path or '-'} "
+                f"files={result.n_files_copied}"
+            )
+        else:
+            log_warn(
+                f"registry({stage}): {result.status} — {'; '.join(result.notes) or '(no notes)'}"
+            )
+        return _stash(normalized)
 
     # ---------- engine entry ----------
 
