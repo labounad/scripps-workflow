@@ -36,6 +36,7 @@ from scripps_workflow.equivalence import (
     assign_group_labels,
     classify_class_tier,
     compute_equivalence_groups,
+    equivalence_classes_by_substitution,
     magnetic_equivalence_test,
     mol_from_smiles_or_xyz,
     topological_classes,
@@ -295,6 +296,113 @@ class TestTopologicalClasses:
 
 
 # --------------------------------------------------------------------
+# Substitution-test chemical classes (rdkit-required)
+# --------------------------------------------------------------------
+
+
+class TestSubstitutionEquivalenceClasses:
+    @pytest.fixture(scope="class")
+    def Chem(self):
+        rdkit = pytest.importorskip("rdkit")
+        from rdkit import Chem  # noqa: WPS433
+        return Chem
+
+    def _build(self, Chem, smiles: str):
+        return Chem.AddHs(Chem.MolFromSmiles(smiles))
+
+    def test_terminal_vinyl_ch2_hydrogens_are_distinct(self, Chem):
+        # Propene is the minimal R-CH=CH2 case. Replacing one terminal
+        # vinyl H gives the E isotopomer; replacing the other gives the Z
+        # isotopomer. They are diastereotopic and must be NONE singletons
+        # downstream, not a chemically-equivalent 2H class.
+        mol = self._build(Chem, "C=CC")
+        h_classes = equivalence_classes_by_substitution(mol, element="H")
+        sizes = sorted(len(c) for c in h_classes)
+        assert sizes == [1, 1, 1, 3]
+
+        terminal_vinyl_hs = sorted(
+            h.GetIdx()
+            for h in mol.GetAtoms()
+            if h.GetSymbol() == "H"
+            and h.GetNeighbors()[0].GetSymbol() == "C"
+            and sum(
+                1 for n in h.GetNeighbors()[0].GetNeighbors()
+                if n.GetSymbol() == "H"
+            ) == 2
+            and any(
+                bond.GetBondType() == Chem.BondType.DOUBLE
+                for bond in h.GetNeighbors()[0].GetBonds()
+            )
+        )
+        assert len(terminal_vinyl_hs) == 2
+        assert all([h] in h_classes for h in terminal_vinyl_hs)
+
+    def test_ethene_and_symmetric_11_disubstituted_vinyl_ch2_merge(self, Chem):
+        # Ethene has no differentiating substituent, and isobutylene's
+        # two alkene substituents are identical. In both cases the =CH2
+        # hydrogens remain chemically equivalent.
+        ethene = self._build(Chem, "C=C")
+        ethene_h = equivalence_classes_by_substitution(ethene, element="H")
+        assert sorted(len(c) for c in ethene_h) == [4]
+
+        isobutylene = self._build(Chem, "C=C(C)C")
+        h_classes = equivalence_classes_by_substitution(
+            isobutylene,
+            element="H",
+        )
+        sizes = sorted(len(c) for c in h_classes)
+        assert sizes == [2, 6]
+
+    def test_oxetane_methylene_hydrogens_are_aa_bb_not_four_equivalent(self, Chem):
+        smi = "O=C(C1(COC1)C=C)NCC2=CC=CC=N2"
+        mol = self._build(Chem, smi)
+        h_classes = equivalence_classes_by_substitution(mol, element="H")
+
+        oxetane_hs = []
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() != "C":
+                continue
+            if not atom.IsInRingSize(4):
+                continue
+            h_neighbors = sorted(
+                n.GetIdx() for n in atom.GetNeighbors() if n.GetSymbol() == "H"
+            )
+            if len(h_neighbors) == 2:
+                oxetane_hs.extend(h_neighbors)
+
+        assert len(oxetane_hs) == 4
+        oxetane_classes = [
+            sorted(set(cls) & set(oxetane_hs))
+            for cls in h_classes
+            if set(cls) & set(oxetane_hs)
+        ]
+        assert sorted(len(c) for c in oxetane_classes) == [2, 2]
+
+        # Each class spans the two symmetry-related CH2 carbons; the two
+        # classes correspond to the two diastereotopic ring faces.
+        for cls in oxetane_classes:
+            parents = sorted(
+                mol.GetAtomWithIdx(h).GetNeighbors()[0].GetIdx()
+                for h in cls
+            )
+            assert len(set(parents)) == 2
+
+    def test_oxetane_ch2_carbons_remain_equivalent_for_13c(self, Chem):
+        smi = "O=C(C1(COC1)C=C)NCC2=CC=CC=N2"
+        mol = self._build(Chem, smi)
+        c_classes = equivalence_classes_by_substitution(mol, element="C")
+        oxetane_ch2_carbons = sorted(
+            atom.GetIdx()
+            for atom in mol.GetAtoms()
+            if atom.GetSymbol() == "C"
+            and atom.IsInRingSize(4)
+            and sum(1 for n in atom.GetNeighbors() if n.GetSymbol() == "H") == 2
+        )
+        assert len(oxetane_ch2_carbons) == 2
+        assert any(set(cls) == set(oxetane_ch2_carbons) for cls in c_classes)
+
+
+# --------------------------------------------------------------------
 # Mol construction (rdkit-required)
 # --------------------------------------------------------------------
 
@@ -544,12 +652,11 @@ class TestComputeEquivalenceGroups:
         assert any(abs(s - 1.75) < 1e-6 for s in none_shifts)
         assert any(abs(s - 4.00) < 1e-6 for s in none_shifts)
 
-    def test_diastereotopic_ch2_stays_soft_when_shifts_close(self, rdkit):
-        # Same molecule but with shifts within tol_shift_ppm: the
-        # data-aware refinement leaves the topological class together,
-        # but the structural classifier does NOT hard-collapse a
-        # same-parent H₂ class in a stereochemical molecule. It is safer
-        # as SOFT: one averaged shift, separate spin groups.
+    def test_diastereotopic_ch2_splits_even_when_shifts_close(self, rdkit):
+        # Same molecule but with shifts within tol_shift_ppm: chemical
+        # inequivalence is now decided by the substitution test, not DFT
+        # shift spread. The diastereotopic CH2 protons are therefore NONE
+        # singletons even when their predicted shifts happen to be close.
         from rdkit import Chem  # noqa: WPS433
         mol = Chem.AddHs(Chem.MolFromSmiles("C[C@H](Br)CC"))
         h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == "H"]
@@ -579,7 +686,7 @@ class TestComputeEquivalenceGroups:
             g for g in groups if set(g.atom_indices).issubset(set(methylene_pair))
         ]
         assert len(methylene_groups) == 2
-        assert all(g.tier == Tier.SOFT and g.number == 1 for g in methylene_groups)
+        assert all(g.tier == Tier.NONE and g.number == 1 for g in methylene_groups)
 
     def test_force_hard_methyl_despite_asymmetric_js(self, rdkit):
         # Regression for the live ethanol run: real DFT on 2 conformers
@@ -726,8 +833,9 @@ class TestComputeEquivalenceGroups:
         # Regression for patchouli alcohol: the molecule is stereochemically
         # rich, so the old broad shift-spread refinement split methyl H's
         # into A/B/C singletons. The corrected logic protects complete
-        # methyl classes: two isolated 3H methyl classes and one equivalent
-        # gem-dimethyl 6H class.
+        # methyl classes, while the substitution test is allowed to split
+        # diastereotopic methyl substituents that the old topology-only
+        # logic incorrectly folded into one gem-dimethyl 6H class.
         from rdkit import Chem  # noqa: WPS433
         smi = "C[C@H]1CC[C@@]2([C@@]3([C@H]1C[C@H](C2(C)C)CC3)C)O"
         mol = Chem.AddHs(Chem.MolFromSmiles(smi))
@@ -745,6 +853,6 @@ class TestComputeEquivalenceGroups:
             tol_shift_ppm=0.05,
         )
         hard_sizes = sorted(g.number for g in groups if g.tier == Tier.HARD)
-        assert hard_sizes == [3, 3, 6]
+        assert hard_sizes == [3, 3, 3, 3]
         assert all(g.number != 1 for g in groups if g.tier == Tier.HARD)
 

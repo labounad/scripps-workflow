@@ -18,30 +18,22 @@ We use a **three-tier classification**:
 * **SOFT** — chemically equivalent but deliberately kept as separate
   spin groups with one common averaged shift. This preserves magnetic
   inequivalence / second-order topology for cases such as methylene
-  H₂, AA′BB′ aromatic patterns, vinyl groups, and mirrored ring
-  protons.
+  H₂, AA′BB′ aromatic patterns, and mirrored ring protons.
 
-* **NONE** — topologically or stereochemically distinct. No averaging.
-  Each atom emits as its own group. Catches diastereotopic CH₂ in
-  chiral environments, isolated CH protons, and so on.
+* **NONE** — chemically distinct under the substitution test. No
+  averaging. Each atom emits as its own group. Catches diastereotopic
+  CH₂, terminal vinyl H_cis/H_trans pairs, isolated CH protons, and so on.
 
 The dispatch is mechanical:
 
-1. Compute topological classes from RDKit's chirality-aware
-   ``CanonicalRankAtoms`` — atoms with the same rank are in one class.
-   This catches chemical equivalence cleanly even when the symmetry
-   operation is a non-trivial rotation/reflection.
+1. Compute chemical-equivalence classes directly by the substitution
+   test: isotope-label one candidate atom at a time, assign stereochemistry
+   from 3D when available, canonicalize the substituted structure, and
+   group atoms whose substituted structures are identical. Enantiomeric
+   substituted structures are also merged, matching normal achiral-solvent
+   NMR behavior for enantiotopic nuclei.
 
-2. **Narrow data-aware refinement.** RDKit's ``includeChirality=True``
-   only propagates atom-level CIP flags (``@`` tags); it does not
-   reliably split prochiral H's attached to a carbon adjacent to a
-   chiral center. We therefore allow DFT shift spread to split only
-   same-parent H₂ classes in molecules with stereochemical information.
-   Complete methyl-like classes and non-H classes are protected from
-   shift-spread splitting because finite conformer ensembles often
-   break their symmetry numerically.
-
-3. Classify refined classes structurally rather than trusting noisy
+2. Classify each chemical class structurally rather than trusting noisy
    J-vectors for the collapse decision: rotational methyl-like classes
    and all-of-nucleus symmetric classes become HARD; other multi-proton
    classes become SOFT; singletons become NONE. The parsed/averaged J's
@@ -51,8 +43,9 @@ This module is a pure helper. RDKit is imported lazily inside the
 functions that need it so the module can be imported without RDKit
 installed (e.g., for code-loading in the node base class). Functions
 that operate on already-built RDKit ``Mol`` objects don't need RDKit
-imported here at all — only :func:`mol_from_smiles_or_xyz` and
-:func:`topological_classes` invoke it.
+imported here at all — only :func:`mol_from_smiles_or_xyz`,
+:func:`topological_classes`, and
+:func:`equivalence_classes_by_substitution` invoke it.
 
 Atom-index alignment: this module assumes the caller's atom indices
 match :class:`rdkit.Chem.Mol` indices after ``AddHs``. ORCA outputs
@@ -278,10 +271,11 @@ def topological_classes(
     molecule (so chirality propagates correctly), but classes
     containing zero atoms of the requested element are dropped.
 
-    Why ``includeChirality=True``: the diastereotopic CH₂ pair in a
-    chiral environment gets distinct ranks only when chirality is
-    propagated. Without it, the two methylene H's get the same rank
-    and we'd erroneously collapse them into one HARD group.
+    This function is retained for debugging and for tests that pin RDKit
+    behavior. Production NMR grouping uses
+    :func:`equivalence_classes_by_substitution`, because canonical ranks
+    alone miss prochiral/diastereotopic relationships such as terminal
+    vinyl H_cis/H_trans and AA′BB′ oxetane methylene protons.
     """
     from rdkit import Chem  # type: ignore[import-not-found]
 
@@ -297,6 +291,244 @@ def topological_classes(
 
     return sorted(
         (sorted(atoms) for atoms in by_rank.values()),
+        key=lambda lst: lst[0],
+    )
+
+
+# --------------------------------------------------------------------
+# Chemical classes by substitution test
+# --------------------------------------------------------------------
+
+
+_SUBSTITUTION_ISOTOPE_BY_ELEMENT: dict[str, int] = {
+    "H": 2,
+    "C": 13,
+    "N": 15,
+    "O": 17,
+    "F": 19,
+    "P": 31,
+    "S": 34,
+    "Cl": 37,
+    "Br": 81,
+    "I": 127,
+}
+
+
+def _replacement_isotope_for_atom(atom: Any) -> int:
+    """Return an isotope mass that distinguishes ``atom`` from default atoms."""
+    isotope = _SUBSTITUTION_ISOTOPE_BY_ELEMENT.get(atom.GetSymbol())
+    if isotope is None:
+        from rdkit import Chem  # type: ignore[import-not-found]
+
+        table = Chem.GetPeriodicTable()
+        isotope = int(table.GetMostCommonIsotope(atom.GetAtomicNum()))
+        if isotope <= 0:
+            isotope = max(1, int(atom.GetMass()))
+
+    if atom.GetIsotope() == isotope:
+        return isotope + 1
+    return isotope
+
+
+def _mol_with_3d_for_substitution_test(mol: Any) -> tuple[Any, bool]:
+    """Return a copy of ``mol`` with a 3D conformer when one can be made.
+
+    The substitution test needs stereochemistry perceived after replacing
+    H by D, or C by ¹³C, etc. If the caller's molecule already carries a
+    3D conformer, use it. Otherwise make a deterministic ETKDG conformer.
+    When embedding fails, return the graph-only molecule and mark the 3D
+    flag false; the canonical-isotope test still handles ordinary graph
+    symmetry, but prochiral stereochemical distinctions may be unavailable.
+    """
+    from rdkit import Chem  # type: ignore[import-not-found]
+    from rdkit.Chem import AllChem  # type: ignore[import-not-found]
+
+    work = Chem.Mol(mol)
+    has_usable_3d = False
+    if work.GetNumConformers() > 0:
+        try:
+            has_usable_3d = bool(work.GetConformer(0).Is3D())
+        except Exception:
+            has_usable_3d = True
+
+    if has_usable_3d:
+        return work, True
+
+    work.RemoveAllConformers()
+    try:
+        params = AllChem.ETKDGv3()
+        params.randomSeed = 0xC0FFEE
+        params.useRandomCoords = True
+        status = AllChem.EmbedMolecule(work, params)
+    except Exception:
+        return work, False
+
+    if status != 0 or work.GetNumConformers() == 0:
+        return work, False
+
+    try:
+        mmff_status = AllChem.MMFFOptimizeMolecule(work, maxIters=200)
+        if mmff_status < 0:
+            AllChem.UFFOptimizeMolecule(work, maxIters=200)
+    except Exception:
+        try:
+            AllChem.UFFOptimizeMolecule(work, maxIters=200)
+        except Exception:
+            pass
+
+    return work, True
+
+
+def _assign_stereochemistry_for_substitution(mol: Any, *, use_3d: bool) -> None:
+    """Assign stereochemistry on a substituted copy in-place."""
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    if use_3d and mol.GetNumConformers() > 0:
+        conf_id = mol.GetConformer(0).GetId()
+        try:
+            Chem.AssignStereochemistryFrom3D(
+                mol,
+                confId=conf_id,
+                replaceExistingTags=True,
+            )
+        except TypeError:
+            Chem.AssignStereochemistryFrom3D(
+                mol,
+                conf_id,
+                replaceExistingTags=True,
+            )
+        except Exception:
+            pass
+
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+
+def _invert_tetrahedral_stereochemistry(mol: Any) -> Any:
+    """Return a copy with every tetrahedral chiral tag inverted."""
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    inverted = Chem.Mol(mol)
+    for atom in inverted.GetAtoms():
+        tag = atom.GetChiralTag()
+        if tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW:
+            atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+        elif tag == Chem.ChiralType.CHI_TETRAHEDRAL_CCW:
+            atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW)
+
+    Chem.AssignStereochemistry(inverted, cleanIt=True, force=True)
+    return inverted
+
+
+def _substitution_signature(
+    *,
+    base_mol: Any,
+    atom_idx: int,
+    use_3d: bool,
+) -> tuple[str, str]:
+    """Canonical substituted SMILES and its enantiomer-signature partner."""
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    substituted = Chem.Mol(base_mol)
+    atom = substituted.GetAtomWithIdx(atom_idx)
+    atom.SetIsotope(_replacement_isotope_for_atom(atom))
+    _assign_stereochemistry_for_substitution(substituted, use_3d=use_3d)
+
+    signature = Chem.MolToSmiles(
+        substituted,
+        canonical=True,
+        isomericSmiles=True,
+    )
+    enantiomer = _invert_tetrahedral_stereochemistry(substituted)
+    enantiomer_signature = Chem.MolToSmiles(
+        enantiomer,
+        canonical=True,
+        isomericSmiles=True,
+    )
+    return signature, enantiomer_signature
+
+
+def equivalence_classes_by_substitution(
+    mol: Any,
+    *,
+    element: Optional[str] = None,
+    merge_enantiotopic: bool = True,
+) -> list[list[int]]:
+    """Group atoms by the NMR substitution test.
+
+    For each candidate atom, a molecule copy is made in which that atom is
+    isotope-labelled: H→D, C→¹³C, N→¹⁵N, etc. Stereochemistry is then
+    assigned from a 3D conformer when available or embeddable, and the
+    substituted molecule is canonicalized as isomeric SMILES.
+
+    Identical substituted structures are homotopic and therefore grouped.
+    With ``merge_enantiotopic=True`` (the default), substituted structures
+    that differ only as enantiomers are also grouped, matching ordinary
+    achiral-solvent NMR where enantiotopic nuclei are isochronous.
+    Diastereotopic substitutions remain in separate classes.
+
+    This direct test fixes cases canonical ranking cannot infer from the
+    parent graph alone, including terminal R-CH=CH₂ protons and prochiral
+    ring methylenes such as AA′BB′ oxetanes.
+    """
+    from rdkit import Chem  # type: ignore[import-not-found]
+
+    base_mol, use_3d = _mol_with_3d_for_substitution_test(mol)
+    candidate_atoms = [
+        atom.GetIdx()
+        for atom in base_mol.GetAtoms()
+        if element is None or atom.GetSymbol() == element
+    ]
+    if not candidate_atoms:
+        return []
+
+    signatures: dict[int, str] = {}
+    enantiomer_signatures: dict[int, str] = {}
+    for atom_idx in candidate_atoms:
+        signature, enantiomer_signature = _substitution_signature(
+            base_mol=base_mol,
+            atom_idx=atom_idx,
+            use_3d=use_3d,
+        )
+        signatures[atom_idx] = signature
+        enantiomer_signatures[atom_idx] = enantiomer_signature
+
+    parent = {atom_idx: atom_idx for atom_idx in candidate_atoms}
+
+    def find(atom_idx: int) -> int:
+        root = atom_idx
+        while parent[root] != root:
+            root = parent[root]
+        while parent[atom_idx] != atom_idx:
+            next_idx = parent[atom_idx]
+            parent[atom_idx] = root
+            atom_idx = next_idx
+        return root
+
+    def union(a: int, b: int) -> None:
+        root_a = find(a)
+        root_b = find(b)
+        if root_a == root_b:
+            return
+        if root_b < root_a:
+            root_a, root_b = root_b, root_a
+        parent[root_b] = root_a
+
+    for i, atom_a in enumerate(candidate_atoms):
+        for atom_b in candidate_atoms[i + 1:]:
+            same_substitution = signatures[atom_a] == signatures[atom_b]
+            enantiomeric_substitution = (
+                signatures[atom_a] == enantiomer_signatures[atom_b]
+                or enantiomer_signatures[atom_a] == signatures[atom_b]
+            )
+            if same_substitution or (merge_enantiotopic and enantiomeric_substitution):
+                union(atom_a, atom_b)
+
+    by_root: dict[int, list[int]] = {}
+    for atom_idx in candidate_atoms:
+        by_root.setdefault(find(atom_idx), []).append(atom_idx)
+
+    return sorted(
+        (sorted(atoms) for atoms in by_root.values()),
         key=lambda lst: lst[0],
     )
 
@@ -383,53 +615,6 @@ def classify_class_tier(
 # --------------------------------------------------------------------
 
 
-def _mol_has_stereo(mol: Any) -> bool:
-    """True if ``mol`` carries any stereochemistry that could create
-    rank-indistinguishable diastereotopic atoms.
-
-    Checks for atom-level chirality tags (``@``-bearing centers in the
-    SMILES) and stereo bonds (E/Z designations). A molecule with
-    neither has no diastereotopicity that would be invisible to
-    :func:`topological_classes` — same-rank atoms are then chemically
-    equivalent, and any shift variation within a class is sampling
-    noise that the equivalence detector should not interpret as a
-    splitting signal.
-
-    Lazy RDKit import: this function is only called from
-    :func:`compute_equivalence_groups` (which already needs RDKit),
-    so the import is inside the function body to keep the module
-    loadable without RDKit.
-    """
-    from rdkit import Chem  # type: ignore[import-not-found]
-
-    for atom in mol.GetAtoms():
-        if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
-            return True
-    for bond in mol.GetBonds():
-        if bond.GetStereo() != Chem.BondStereo.STEREONONE:
-            return True
-    return False
-
-
-def _same_parent_hydrogen_class(class_atoms: list[int], mol: Any) -> Optional[int]:
-    """Return the shared parent index for a pure H class, else ``None``."""
-    if not class_atoms:
-        return None
-
-    parents: set[int] = set()
-    for a in class_atoms:
-        atom = mol.GetAtomWithIdx(a)
-        if atom.GetSymbol() != "H":
-            return None
-        neighbors = atom.GetNeighbors()
-        if len(neighbors) != 1:
-            return None
-        parents.add(neighbors[0].GetIdx())
-
-    if len(parents) != 1:
-        return None
-    return next(iter(parents))
-
 
 def _hydrogen_neighbors(parent: Any) -> list[int]:
     """Hydrogen-neighbor indices for ``parent``, sorted for stability."""
@@ -505,46 +690,6 @@ def _is_rotationally_hard_hydrogen_class(class_atoms: list[int], mol: Any) -> bo
     return True
 
 
-def _should_split_class_by_shift(
-    *,
-    cls: list[int],
-    mol: Any,
-    element: str,
-    stereo_present: bool,
-    shifts_by_atom: dict[int, float],
-    tol_shift_ppm: float,
-) -> bool:
-    """Whether shift spread should override RDKit's topology.
-
-    The old logic split *any* same-rank class in a stereochemical
-    molecule when DFT shifts differed by more than ``tol_shift_ppm``.
-    That was too broad: it split methyls in patchouli alcohol and could
-    split equivalent 13C atoms just because a finite conformer ensemble
-    did not preserve symmetry exactly.
-
-    The robust use case for data-aware splitting is narrow: same-parent
-    H₂ classes in molecules with stereochemical information. Those are
-    the classic RDKit blind spot for diastereotopic methylene protons.
-    Complete methyl-like classes are explicitly protected because methyl
-    rotation makes them HARD even in chiral molecules.
-    """
-    if not stereo_present or len(cls) <= 1:
-        return False
-    if element != "H":
-        return False
-    if _is_rotationally_hard_hydrogen_class(cls, mol):
-        return False
-    if len(cls) != 2:
-        return False
-    if _same_parent_hydrogen_class(cls, mol) is None:
-        return False
-
-    vals = [shifts_by_atom.get(a) for a in cls]
-    finite = [v for v in vals if isinstance(v, (int, float))]
-    if len(finite) < 2:
-        return False
-    return (max(finite) - min(finite)) > float(tol_shift_ppm)
-
 
 def _classify_structural_tier(
     *,
@@ -559,8 +704,8 @@ def _classify_structural_tier(
     approach. DFT J values from one/few frozen conformers are excellent
     for populating couplings, but they are a poor source of truth for
     deciding whether fast-rotating methyl / tBu protons should be
-    collapsed. Conversely, non-methyl topological equivalences are safer
-    as SOFT groups: they keep one common shift while preserving possible
+    collapsed. Conversely, non-methyl chemical equivalences are safer as
+    SOFT groups: they keep one common shift while preserving possible
     AA′BB′ / methylene / ring-coupling topology.
 
     Policy:
@@ -640,18 +785,13 @@ def compute_equivalence_groups(
 
     Pipeline:
 
-    1. Compute topological classes for atoms of the requested ``element``
-       (via :func:`topological_classes`).
-    2. **Narrow data-aware refinement.** RDKit's ``CanonicalRankAtoms``
-       propagates chirality only through atom-level CIP flags (the ``@``
-       tag) and does not reliably split prochiral H₂ classes next to a
-       chiral center. If a same-parent H₂ class in a stereochemical
-       molecule spans more than ``tol_shift_ppm``, split it into NONE
-       singletons. Do not split methyl-like classes or non-H atoms by
-       shift spread.
-    3. Classify each refined class with the structural HARD/SOFT/NONE
+    1. Compute chemical-equivalence classes for atoms of the requested
+       ``element`` using :func:`equivalence_classes_by_substitution`.
+       This is the literal isotope-substitution test, with enantiomeric
+       substituted structures merged for ordinary achiral-solvent NMR.
+    2. Classify each chemical class with the structural HARD/SOFT/NONE
        policy in :func:`_classify_structural_tier`.
-    4. Materialize the per-tier groups:
+    3. Materialize the per-tier groups:
 
        * **HARD** → one group with ``atom_indices = tuple(class)``,
          ``shift = ⟨σᵢ⟩`` over class members.
@@ -662,9 +802,12 @@ def compute_equivalence_groups(
        * **NONE** → one group with the single atom; shift is its raw
          per-atom value.
 
-    5. Sort groups by their lowest atom index, assign Excel-style names.
-    6. Compute pairwise J couplings between distinct groups (averaged
+    4. Sort groups by their lowest atom index, assign Excel-style names.
+    5. Compute pairwise J couplings between distinct groups (averaged
        over the involved atoms via :func:`_avg_pairwise_j`).
+
+    ``tol_shift_ppm`` is retained for API compatibility with older
+    callers. Shift spread no longer decides chemical inequivalence.
 
     Returned groups are immutable dataclasses ready for the mnova XML
     emitter. Caller is responsible for converting ``shift_avg_ppm``
@@ -676,36 +819,11 @@ def compute_equivalence_groups(
     if not elem:
         raise ValueError("compute_equivalence_groups: element must be non-empty")
 
-    classes = topological_classes(mol, element=elem)
+    _ = tol_shift_ppm  # API compatibility: substitution test replaces shift splitting.
+
+    classes = equivalence_classes_by_substitution(mol, element=elem)
     if not classes:
         return []
-
-    # Data-aware refinement (see step 2 in docstring above).
-    #
-    # Keep this deliberately narrow. RDKit's practical blind spot here
-    # is same-parent H₂ classes in a molecule with stereochemical
-    # information (diastereotopic methylene protons). We do NOT split
-    # methyl-like classes or non-H atoms by shift spread: those spreads
-    # are usually finite-conformer / non-symmetrized-geometry artifacts,
-    # and splitting them caused the patchouli alcohol methyl failure.
-    stereo_present = _mol_has_stereo(mol)
-    refined: list[list[int]] = []
-    for cls in classes:
-        if _should_split_class_by_shift(
-            cls=cls,
-            mol=mol,
-            element=elem,
-            stereo_present=stereo_present,
-            shifts_by_atom=shifts_by_atom,
-            tol_shift_ppm=tol_shift_ppm,
-        ):
-            # Same-parent H₂ class in a stereochemical molecule with
-            # meaningfully different predicted shifts: treat as genuine
-            # diastereotopic / NONE singletons.
-            refined.extend([a] for a in cls)
-        else:
-            refined.append(cls)
-    classes = refined
 
     # All atoms of this element across every class. Used to decide whether
     # a class is the only spin class for that nucleus (e.g., benzene A6).
@@ -760,7 +878,7 @@ def compute_equivalence_groups(
         # Shift averaging:
         # * HARD: average over class members (== atoms here, since the
         #   whole class collapsed into one group).
-        # * SOFT: average over the topological CLASS even though this
+        # * SOFT: average over the chemical CLASS even though this
         #   group only owns one atom — class members are equal under
         #   the equivalence by definition; averaging removes DFT noise.
         # * NONE: just the single atom's value.
@@ -810,6 +928,7 @@ __all__ = [
     "assign_group_labels",
     "classify_class_tier",
     "compute_equivalence_groups",
+    "equivalence_classes_by_substitution",
     "magnetic_equivalence_test",
     "mol_from_smiles_or_xyz",
     "topological_classes",
