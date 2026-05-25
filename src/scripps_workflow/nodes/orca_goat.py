@@ -796,7 +796,66 @@ class OrcaGoat(Node):
         if not ctx.manifest.artifacts.get("xyz"):
             ctx.fail("no_best_xyz_artifact_produced")
 
+        # ---- ensemble self-registration to nmr-data ------------------
+        # Mirrors CREST's writer-side path. GOAT and CREST register into
+        # the SAME ConformerEnsemble table but with different fingerprints
+        # (``conformer_search="goat"`` vs ``"crest"``), so the two engines
+        # never collide on the same row.
+        if ctx.manifest.ok and cfg.get("use_cache", True):
+            self._maybe_register_ensemble_goat(ctx, cfg)
+
     # -------------------- helpers --------------------
+
+    def _maybe_register_ensemble_goat(
+        self, ctx: NodeContext, cfg: dict[str, Any]
+    ) -> None:
+        """Self-register this GOAT ensemble to nmr-data, best-effort.
+
+        Build the cache key with :func:`build_goat_ensemble_key`, pull the
+        conformer records back out of the manifest, and delegate to the
+        Node base-class helper. Fail-open across all degraded states
+        (no nmr_data, no rdkit, no SMILES, key-build error).
+        """
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"goat registry: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"goat registry: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        smiles = _walk_upstream_for_smiles(ctx)
+        if not smiles:
+            logging_utils.log_info(
+                "goat registry: no SMILES in upstream chain, "
+                "skipping registration"
+            )
+            return
+        try:
+            ensemble_key = build_goat_ensemble_key(cfg, smiles)
+        except Exception as e:
+            logging_utils.log_warn(
+                f"goat registry: ensemble-key build failed, "
+                f"skipping registration: {type(e).__name__}: {e}"
+            )
+            return
+        if ensemble_key is None:
+            return
+
+        conformer_records = list(
+            ctx.manifest.artifacts.get("conformers", []) or []
+        )
+        self._try_register_to_nmr_data(
+            "ensemble",
+            ctx=ctx,
+            smiles=smiles,
+            ensemble_key=ensemble_key,
+            conformer_records=conformer_records,
+        )
 
     def _maybe_emit_cached_manifest_goat(
         self, ctx: NodeContext, cfg: dict[str, Any]
