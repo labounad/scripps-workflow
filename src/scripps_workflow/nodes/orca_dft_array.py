@@ -868,9 +868,111 @@ class OrcaDftArray(Node):
                 execs=execs,
             )
 
+        # ----- 6) Self-register the dft_run + central-tree copy -----
+        # Same gating as the read-side cache check: use_cache=False
+        # disables both read and write. We never register a failed run
+        # (partial success is fine — at least one optimized geometry
+        # made it into the conformers bucket).
+        if ctx.manifest.ok and cfg.get("use_cache", True):
+            self._maybe_register_dft_run(ctx, cfg, tasks_root=tasks_root)
+
     # ------------------------------------------------------------------
     # Step handlers
     # ------------------------------------------------------------------
+
+    def _maybe_register_dft_run(
+        self,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        *,
+        tasks_root: Path,
+    ) -> None:
+        """Self-register this DFT-opt run to nmr-data, best-effort.
+
+        Mirrors the read-side ``_maybe_emit_cached_manifest_dft`` key
+        derivation: walk upstream for SMILES + CREST/GOAT inputs, build
+        the parent :class:`EnsembleKey`, compute its fingerprint, then
+        build this node's :class:`DftRunKey` from cfg. Delegates the
+        actual registration + central-tree copy to the Node base-class
+        helper, which handles env / import / DB failure modes uniformly.
+
+        :param tasks_root: ``outputs/array/tasks/`` for this call.
+            Forwarded to ``register_dft_run`` as ``conformer_task_dirs``
+            so each task's ``orca_opt.out`` gets gzip-copied alongside
+            its optimized xyz in the central tree.
+        """
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"orca-dft registry: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"orca-dft registry: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping registration"
+            )
+            return
+
+        smiles = _walk_upstream_for_smiles(ctx)
+        crest_dict = _walk_upstream_for_step(ctx, "crest")
+        goat_dict = _walk_upstream_for_step(ctx, "orca_goat")
+        if not smiles or (crest_dict is None and goat_dict is None):
+            logging_utils.log_info(
+                "orca-dft registry: SMILES or upstream conformer-search "
+                "manifest not found, skipping registration"
+            )
+            return
+
+        try:
+            if crest_dict is not None:
+                ens_key = build_crest_ensemble_key(
+                    crest_dict.get("inputs") or {}, smiles
+                )
+            else:
+                ens_key = build_goat_ensemble_key(
+                    goat_dict.get("inputs") or {}, smiles
+                )
+            if ens_key is None:
+                logging_utils.log_info(
+                    "orca-dft registry: could not build EnsembleKey, "
+                    "skipping registration"
+                )
+                return
+            ens_fp = _cache_fingerprint(ens_key)
+            dft_key = build_dft_run_key(dict(cfg), ensemble_fingerprint=ens_fp)
+        except Exception as e:
+            logging_utils.log_warn(
+                f"orca-dft registry: key build raised, "
+                f"skipping registration: {type(e).__name__}: {e}"
+            )
+            return
+
+        # Build the conformer_task_dirs map from the local tasks_root.
+        # Each conf_NNNN dir holds the original orca_opt.out that
+        # copy_dft_run_artifacts gzip-copies into the central tree.
+        conformer_task_dirs: dict[int, Path] = {}
+        if tasks_root.is_dir():
+            for d in tasks_root.iterdir():
+                if d.is_dir() and d.name.startswith("conf_"):
+                    try:
+                        idx = int(d.name.removeprefix("conf_"))
+                        conformer_task_dirs[idx] = d
+                    except ValueError:
+                        continue
+
+        conformer_records = list(
+            ctx.manifest.artifacts.get("conformers", []) or []
+        )
+        self._try_register_to_nmr_data(
+            "dft_run",
+            ctx=ctx,
+            parent_ensemble_fingerprint=ens_fp,
+            dft_key=dft_key,
+            conformer_records=conformer_records,
+            conformer_task_dirs=conformer_task_dirs or None,
+            dft_array_inputs=dict(cfg),
+        )
 
     # ------------------------------------------------------------------
     # v6.6 cache hit path
