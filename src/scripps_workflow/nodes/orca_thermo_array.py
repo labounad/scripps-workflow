@@ -427,6 +427,83 @@ _PROFILE_ELEMENT_TRIGGERS: dict[str, frozenset[str]] = {
 }
 
 
+# --------------------------------------------------------------------
+# Heteronuclear J-coupling auto-expansion (¹⁹F, ³¹P)
+# --------------------------------------------------------------------
+#
+# Default coupling_pairs is ["all H"], which gets ORCA to compute every
+# ¹H-¹H J within the SpinSpinRThresh cutoff. For molecules containing
+# ¹⁹F or ³¹P, we typically want the ¹H/¹³C spectrum to show splitting
+# from those nuclei — i.e. a "coupled" spectrum rather than the
+# {¹⁹F}-decoupled version. To make this work, ORCA's J-coupling job
+# needs the partner nuclei in its ``Nuclei =`` list so cross-couplings
+# (H-F, H-P, C-F, C-P) come out.
+#
+# ``auto_heteronuclear=true`` (the default) auto-detects ¹⁹F / ³¹P in
+# the upstream geometry and appends ``"all F"`` / ``"all P"`` to
+# coupling_pairs accordingly. Operators who want the decoupled spectrum
+# can set ``auto_heteronuclear=false``; their explicit coupling_pairs
+# value is then used unchanged.
+
+#: Element symbols that get auto-added to ``coupling_pairs`` as
+#: ``"all <symbol>"`` selectors when the auto-heteronuclear knob is
+#: on. Limited to the two nuclei that commonly show real coupling
+#: in routine organic / organometallic ¹H and ¹³C spectra. Add new
+#: entries here when new heteronuclear use cases land (e.g. ¹¹B,
+#: ²⁹Si). Pd and other quadrupolar/heavy metals are deliberately
+#: excluded — their coupling treatment requires a different J-coupling
+#: methodology than mPW1PW91/pcJ-2.
+HETERONUCLEAR_J_PARTNERS: tuple[str, ...] = ("F", "P")
+
+
+def detect_nmr_j_partners(xyz_paths: list[Path]) -> list[str]:
+    """Scan input geometries for heteronuclear J partner symbols.
+
+    Returns the subset of :data:`HETERONUCLEAR_J_PARTNERS` actually
+    present in the molecule (sorted for deterministic ordering).
+    Caps at the first few xyz files since element composition is
+    invariant across conformers of one molecule.
+
+    Empty list if no triggers are found; caller leaves coupling_pairs
+    at the operator's setting in that case.
+    """
+    elements_seen: set[str] = set()
+    for xyz in xyz_paths[:3]:
+        try:
+            text = xyz.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            tokens = line.split()
+            if tokens:
+                elements_seen.add(tokens[0])
+    return sorted(elements_seen & set(HETERONUCLEAR_J_PARTNERS))
+
+
+def _expand_coupling_pairs_for_heteronuclear(
+    coupling_pairs: list[str],
+    *,
+    detected_partners: list[str],
+) -> list[str]:
+    """Append ``"all <X>"`` selectors for detected heteronuclear
+    partners that aren't already in ``coupling_pairs``.
+
+    Operator-set selectors pass through untouched; we only ADD entries.
+    Duplicate-detection is case-insensitive on the bare element symbol
+    so a manual ``"all f"`` doesn't trigger a duplicate ``"all F"``.
+    """
+    existing_partners: set[str] = set()
+    for sel in coupling_pairs:
+        sel_str = str(sel).strip().lower()
+        if sel_str.startswith("all "):
+            existing_partners.add(sel_str.split()[1].upper())
+    out = list(coupling_pairs)
+    for partner in detected_partners:
+        if partner.upper() not in existing_partners:
+            out.append(f"all {partner}")
+    return out
+
+
 def detect_system_class(xyz_paths: list[Path]) -> str:
     """Scan input geometries for heavy-element triggers; return the
     matching :data:`SYSTEM_CLASS_PROFILES` key.
@@ -944,6 +1021,23 @@ SCHEMA = NodeSchema(
             ),
         ),
         ConfigField(
+            name="auto_heteronuclear",
+            type="bool",
+            default=True,
+            section="nmr",
+            coercer=parse_bool,
+            description=(
+                "When true (default), scan the upstream geometry for "
+                "¹⁹F and ³¹P; append ``\"all F\"`` / ``\"all P\"`` to "
+                "``coupling_pairs`` so the ORCA J-coupling job computes "
+                "the cross-element couplings needed for the H/C "
+                "simulated spectra to show realistic heteronuclear "
+                "splitting (¹H-¹⁹F, ¹³C-³¹P, etc.). Set to false to "
+                "force decoupled-spectrum semantics: only the "
+                "operator-supplied ``coupling_pairs`` entries are used."
+            ),
+        ),
+        ConfigField(
             name="system_class",
             type="str",
             default="auto",
@@ -1061,6 +1155,27 @@ class OrcaThermoArray(Node):
             ctx.fail(f"bad_system_class: {e}")
             return
 
+        # Auto-expand coupling_pairs for heteronuclear J's (¹⁹F / ³¹P).
+        # Same upstream xyz scan as system_class detection — both look
+        # for elements in the geometry. Skipped silently when no F/P is
+        # found OR when the operator explicitly disabled the auto knob
+        # (in which case their coupling_pairs setting is final).
+        if cfg.get("auto_heteronuclear", True) and cfg.get("run_couplings"):
+            detected_partners = detect_nmr_j_partners(_upstream_xyz_paths(ctx))
+            if detected_partners:
+                before = list(cfg["coupling_pairs"])
+                expanded = _expand_coupling_pairs_for_heteronuclear(
+                    before, detected_partners=detected_partners,
+                )
+                if expanded != before:
+                    cfg["coupling_pairs"] = expanded
+                    logging_utils.log_info(
+                        f"orca-thermo: detected {detected_partners} in "
+                        f"upstream geometry; expanded coupling_pairs "
+                        f"from {before!r} to {expanded!r} for "
+                        f"heteronuclear J's"
+                    )
+
         # Record resolved config in manifest.inputs FIRST — before
         # any cache check or compute. Anything that fails later (cache
         # helper raises, sbatch errors, ORCA crashes mid-array) still
@@ -1097,6 +1212,7 @@ class OrcaThermoArray(Node):
             coupling_method=cfg["coupling_method"],
             coupling_basis=cfg["coupling_basis"],
             coupling_pairs=list(cfg["coupling_pairs"]),
+            auto_heteronuclear=bool(cfg.get("auto_heteronuclear", True)),
             coupling_thresh_angstrom=cfg["coupling_thresh_angstrom"],
             nmr_aux_keywords=cfg["nmr_aux_keywords"],
             system_class=cfg["system_class"],
@@ -1987,6 +2103,7 @@ __all__ = [
     "DEFAULT_SHIELDING_METHOD_C",
     "DEFAULT_SHIELDING_METHOD_H",
     "DEFAULT_SINGLEPOINT_KEYWORDS",
+    "HETERONUCLEAR_J_PARTNERS",
     "ORCA_INP_NAME",
     "ORCA_OUT_NAME",
     "OrcaThermoArray",
@@ -1999,6 +2116,8 @@ __all__ = [
     "ORCA_NMR_J_OUT_NAME",
     "build_thermo_task_dirs",
     "collect_thermo_outputs",
+    "detect_nmr_j_partners",
+    "detect_system_class",
     "main",
 ]
 

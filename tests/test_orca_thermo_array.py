@@ -624,6 +624,95 @@ class TestBuildNmrInputFilesZora:
             assert "def2-ZORA-TZVPP" in first
 
 
+# --------------------------------------------------------------------
+# Heteronuclear J auto-expansion (¹⁹F / ³¹P)
+# --------------------------------------------------------------------
+
+
+class TestDetectNmrJPartners:
+    """``detect_nmr_j_partners`` scans xyz files for ¹⁹F / ³¹P element
+    symbols and returns the subset present, sorted. Empty when neither
+    is found."""
+
+    def _write_xyz(self, path: Path, atoms: list[tuple[str, float, float, float]]) -> None:
+        lines = [str(len(atoms)), "comment"]
+        for sym, x, y, z in atoms:
+            lines.append(f"{sym} {x:.4f} {y:.4f} {z:.4f}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_pure_organic_returns_empty(self, tmp_path):
+        xyz = tmp_path / "ethane.xyz"
+        self._write_xyz(xyz, [("C", 0, 0, 0), ("C", 1.5, 0, 0), ("H", -0.5, 0, 0)])
+        assert ota.detect_nmr_j_partners([xyz]) == []
+
+    def test_fluorine_present_returns_f(self, tmp_path):
+        xyz = tmp_path / "fluorobenzene.xyz"
+        self._write_xyz(xyz, [("C", 0, 0, 0), ("F", 1.3, 0, 0)])
+        assert ota.detect_nmr_j_partners([xyz]) == ["F"]
+
+    def test_phosphorus_present_returns_p(self, tmp_path):
+        xyz = tmp_path / "pme3.xyz"
+        self._write_xyz(xyz, [("P", 0, 0, 0), ("C", 1.8, 0, 0)])
+        assert ota.detect_nmr_j_partners([xyz]) == ["P"]
+
+    def test_both_returns_sorted(self, tmp_path):
+        xyz = tmp_path / "fluorophos.xyz"
+        self._write_xyz(xyz, [("P", 0, 0, 0), ("F", 1.6, 0, 0)])
+        # Sorted alphabetically: F before P.
+        assert ota.detect_nmr_j_partners([xyz]) == ["F", "P"]
+
+    def test_pd_present_does_not_trigger(self, tmp_path):
+        """Pd is intentionally NOT a J partner here — quadrupolar nuclei
+        need different J-coupling methodology than mPW1PW91/pcJ-2."""
+        xyz = tmp_path / "pd_complex.xyz"
+        self._write_xyz(xyz, [("Pd", 0, 0, 0), ("C", 1.8, 0, 0)])
+        assert ota.detect_nmr_j_partners([xyz]) == []
+
+
+class TestExpandCouplingPairsForHeteronuclear:
+    """``_expand_coupling_pairs_for_heteronuclear`` appends ``\"all
+    <X>\"`` selectors for detected partners, leaving operator-set
+    entries (and any existing entry for the same partner) alone."""
+
+    def test_appends_F_when_not_present(self):
+        out = ota._expand_coupling_pairs_for_heteronuclear(
+            ["all H"], detected_partners=["F"],
+        )
+        assert out == ["all H", "all F"]
+
+    def test_appends_both_when_neither_present(self):
+        out = ota._expand_coupling_pairs_for_heteronuclear(
+            ["all H"], detected_partners=["F", "P"],
+        )
+        assert out == ["all H", "all F", "all P"]
+
+    def test_skips_existing_partner(self):
+        """Operator-set ``\"all F\"`` is not duplicated."""
+        out = ota._expand_coupling_pairs_for_heteronuclear(
+            ["all H", "all F"], detected_partners=["F"],
+        )
+        assert out == ["all H", "all F"]
+
+    def test_case_insensitive_dedup(self):
+        out = ota._expand_coupling_pairs_for_heteronuclear(
+            ["all h", "all f"], detected_partners=["F"],
+        )
+        assert out == ["all h", "all f"]
+
+    def test_preserves_atom_index_selectors(self):
+        """Non-``\"all\"`` selectors (e.g., ``\"1, 3, 5\"``) pass through."""
+        out = ota._expand_coupling_pairs_for_heteronuclear(
+            ["1, 3, 5", "all H"], detected_partners=["F"],
+        )
+        assert out == ["1, 3, 5", "all H", "all F"]
+
+    def test_empty_detected_returns_unchanged(self):
+        out = ota._expand_coupling_pairs_for_heteronuclear(
+            ["all H"], detected_partners=[],
+        )
+        assert out == ["all H"]
+
+
 @pytest.fixture
 def cluster_stub(monkeypatch):
     """Make sbatch / squeue / sacct discoverable AND provide

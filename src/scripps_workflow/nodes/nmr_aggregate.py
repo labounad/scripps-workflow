@@ -214,6 +214,49 @@ def _walk_upstream_for_step(ctx: NodeContext, step_name: str) -> dict | None:
     return None
 
 
+# --------------------------------------------------------------------
+# Heteronuclear partner auto-detection (matches orca_thermo_array's
+# coupling_pairs auto-expansion). Mirrored here so the mnova XML
+# emitter picks up the SAME partners ORCA was asked to compute J's
+# for — operator never has to keep the two configs in sync manually.
+# --------------------------------------------------------------------
+
+#: Symbols that auto-add as mnova heteronuclear partners. Limited to
+#: F and P for the same reason orca_thermo_array's
+#: ``HETERONUCLEAR_J_PARTNERS`` is — these are the two nuclei with
+#: real coupling visible in routine ¹H/¹³C spectra. Keep in sync.
+HETERONUCLEAR_PARTNERS: tuple[str, ...] = ("F", "P")
+
+
+def _detect_partner_elements_from_confs(
+    confs: list[dict[str, Any]],
+) -> list[str]:
+    """Scan upstream conformer xyz files for ``F`` / ``P`` element
+    symbols. Returns the subset of :data:`HETERONUCLEAR_PARTNERS`
+    found (sorted). Empty list if neither is present.
+
+    Mirrors ``orca_thermo_array.detect_nmr_j_partners`` but reads
+    from the thermo_aggregate upstream's conformer records instead
+    of the dft_array upstream, since nmr_aggregate's immediate
+    upstream is thermo_aggregate. Element composition is invariant
+    across conformers, so we cap at the first few.
+    """
+    elements_seen: set[str] = set()
+    for c in confs[:3]:
+        path = c.get("path_abs")
+        if not isinstance(path, str):
+            continue
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            tokens = line.split()
+            if tokens:
+                elements_seen.add(tokens[0])
+    return sorted(elements_seen & set(HETERONUCLEAR_PARTNERS))
+
+
 def _walk_upstream_for_smiles(ctx: NodeContext) -> str | None:
     """Walk back for the first ``inputs.smiles`` in the upstream chain.
 
@@ -340,6 +383,20 @@ SHIFT_CSV_COLUMNS: tuple[str, ...] = (
     "calibration_basis",
     "calibration_solvent",
     "n_conformers_used",
+    # Equivalence-group view of the same atoms. ``group_label`` is
+    # shared across all atoms in a HARD or SOFT group, so collapsing
+    # rows by ``group_label`` gives a spectrum-comparison view (one row
+    # per spectroscopic peak). Per-atom σ/δ columns above remain
+    # populated independently for atom-level analysis. When the
+    # equivalence detector can't run (no SMILES, no parseable xyz, no
+    # RDKit), each atom lands in its own NONE-tier singleton group
+    # labelled ``atom_<idx>`` so the columns are always present.
+    "group_label",
+    "group_tier",
+    "group_n_atoms",
+    "group_atom_indices",
+    "group_sigma_iso_avg_ppm",
+    "group_delta_predicted_ppm",
 )
 
 COUPLING_CSV_COLUMNS: tuple[str, ...] = (
@@ -354,6 +411,16 @@ COUPLING_CSV_COLUMNS: tuple[str, ...] = (
     "calibration_basis",
     "calibration_solvent",
     "n_conformers_used",
+    # Group-pair view of the same atom pair. ``group_i_label`` /
+    # ``group_j_label`` identify which equivalence group each spin
+    # belongs to (matching the labels in the shifts CSV).
+    # ``group_pair_J_*`` is averaged over all atom pairs (a, b) with
+    # a in group_i, b in group_j — the right value to plug into a
+    # spin-system simulator that treats the group as one entity.
+    "group_i_label",
+    "group_j_label",
+    "group_pair_J_total_avg_hz",
+    "group_pair_J_predicted_hz",
 )
 
 
@@ -533,10 +600,183 @@ def boltzmann_average_couplings(
     return by_pair, len(contributing)
 
 
+def build_aggregate_groups(
+    *,
+    mol: Optional[Any],
+    by_atom: dict[int, dict[str, Any]],
+    by_pair: dict[tuple[int, int], dict[str, Any]],
+    cal_h: Optional[dict[str, Any]],
+    cal_c: Optional[dict[str, Any]],
+    cal_jhh: Optional[dict[str, Any]],
+    tol_jcoupling_hz: float = 0.5,
+    tol_shift_ppm: float = 0.05,
+) -> list[EquivalenceGroup]:
+    """Compute equivalence groups across every element in ``by_atom``.
+
+    When ``mol`` is available, runs the existing multi-nucleus group
+    builder (same dispatch as the mnova XML emitter), producing
+    HARD/SOFT/NONE-tier groups labelled A/B/C/… in min-atom-index
+    order. When ``mol`` is ``None`` (no SMILES, no parseable xyz, no
+    RDKit), falls back to a singleton group per atom labelled
+    ``atom_<idx>`` so the CSV's group columns are always populated.
+
+    The fallback is intentionally NONE-tier — without a topology we
+    can't distinguish chemically equivalent atoms from accidentally
+    similar ones, and surfacing every atom as its own group is the
+    only correct answer in that uncertainty regime.
+    """
+    if mol is None:
+        return _singleton_groups_from_by_atom(by_atom, cal_h=cal_h, cal_c=cal_c)
+
+    elements = sorted({entry["element"] for entry in by_atom.values()})
+    if not elements:
+        return []
+
+    cal_by_elem: dict[str, Optional[dict[str, Any]]] = {
+        "H": cal_h, "C": cal_c,
+    }
+    primary = elements[0]
+    primary_cal = cal_by_elem.get(primary)
+    if primary_cal is None:
+        # No calibration → no δ scale → equivalence detector can't run
+        # its data-aware refinement step. Fall back to singletons.
+        return _singleton_groups_from_by_atom(by_atom, cal_h=cal_h, cal_c=cal_c)
+
+    primary_shifts = _shifts_by_atom_from_by_atom(
+        by_atom=by_atom, element=primary, cal=primary_cal,
+    )
+
+    partners = [e for e in elements[1:] if cal_by_elem.get(e) is not None]
+    partner_shifts: dict[int, float] = {}
+    for elem in partners:
+        partner_shifts.update(
+            _shifts_by_atom_from_by_atom(
+                by_atom=by_atom, element=elem, cal=cal_by_elem[elem],
+            )
+        )
+
+    # H-H J's get the Bally-Rablen calibration; other pairs pass raw.
+    # The equivalence detector reads J's in its data-aware refinement
+    # step but only uses same-element pairs (see ``_build_multinucleus_groups``
+    # docstring for the AA'XX' iteration-1 caveat).
+    pair_set = {("H", "H")} if cal_jhh else None
+    cals_by_label = {"1H-1H_J": cal_jhh}
+    j_matrix = _calibrated_j_matrix_from_by_pair(
+        by_pair,
+        allowed_element_pairs=pair_set,
+        cals_by_label=cals_by_label,
+    )
+
+    groups = _build_multinucleus_groups(
+        mol=mol,
+        primary_element=primary,
+        partner_elements=partners,
+        primary_shifts=primary_shifts,
+        partner_shifts=partner_shifts,
+        j_matrix=j_matrix,
+        tol_jcoupling_hz=tol_jcoupling_hz,
+        tol_shift_ppm=tol_shift_ppm,
+    )
+    # Defensive — if the detector returned nothing, fall back to singletons
+    # rather than emitting a CSV with empty group columns.
+    return groups or _singleton_groups_from_by_atom(
+        by_atom, cal_h=cal_h, cal_c=cal_c,
+    )
+
+
+def _singleton_groups_from_by_atom(
+    by_atom: dict[int, dict[str, Any]],
+    *,
+    cal_h: Optional[dict[str, Any]],
+    cal_c: Optional[dict[str, Any]],
+) -> list[EquivalenceGroup]:
+    """Build one NONE-tier singleton group per atom.
+
+    Used as the no-mol fallback for :func:`build_aggregate_groups`.
+    Each atom's group carries the atom's calibrated δ (or raw σ when
+    no calibration exists for that element) so downstream consumers
+    can read ``group_delta_predicted_ppm`` uniformly.
+    """
+    from ..equivalence import Tier
+    groups: list[EquivalenceGroup] = []
+    for idx in sorted(by_atom):
+        entry = by_atom[idx]
+        elem = entry["element"]
+        sigma = float(entry.get("sigma_iso_avg_ppm", 0.0))
+        if elem == "H" and cal_h is not None:
+            cal = cal_h
+        elif elem == "C" and cal_c is not None:
+            cal = cal_c
+        else:
+            cal = None
+        if cal is not None:
+            shift = predict_chemical_shift(
+                sigma, slope=cal["slope"], intercept=cal["intercept"],
+            )
+        else:
+            shift = sigma  # raw σ when no cal — better than NaN
+        groups.append(
+            EquivalenceGroup(
+                name=f"atom_{idx}",
+                element=elem,
+                atom_indices=(idx,),
+                shift_avg_ppm=shift,
+                tier=Tier.NONE,
+                j_couplings={},
+            )
+        )
+    return groups
+
+
+def build_atom_to_group_map(
+    groups: list[EquivalenceGroup],
+) -> dict[int, EquivalenceGroup]:
+    """Index ``groups`` by member atom index → group, for O(1) lookup
+    during CSV writes. Atoms not in any group (shouldn't happen given
+    the singleton fallback) get omitted; the writer falls back to
+    treating them as ungrouped."""
+    out: dict[int, EquivalenceGroup] = {}
+    for g in groups:
+        for idx in g.atom_indices:
+            out[int(idx)] = g
+    return out
+
+
+def _group_avg_sigma(
+    group: EquivalenceGroup, by_atom: dict[int, dict[str, Any]],
+) -> Optional[float]:
+    """Mean of ``sigma_iso_avg_ppm`` over the group's member atoms.
+
+    Returns ``None`` if no member atom has a parseable σ — but that
+    should be impossible since the group was built from by_atom in
+    the first place.
+    """
+    vals: list[float] = []
+    for idx in group.atom_indices:
+        entry = by_atom.get(int(idx))
+        if entry is None:
+            continue
+        sigma = entry.get("sigma_iso_avg_ppm")
+        if isinstance(sigma, (int, float)):
+            vals.append(float(sigma))
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _tier_value(tier: Any) -> str:
+    """Render the :class:`~scripps_workflow.equivalence.Tier` enum (or
+    plain string) as a stable CSV token (``"hard"`` / ``"soft"`` /
+    ``"none"``). Tolerant of either shape since ``Tier`` inherits from
+    ``str`` and may already come through as the bare value."""
+    return getattr(tier, "value", str(tier))
+
+
 def write_shifts_csv(
     *,
     out_path: Path,
     by_atom: dict[int, dict[str, Any]],
+    atom_to_group: dict[int, EquivalenceGroup],
     n_used: int,
     cal_h: Optional[dict[str, Any]],
     cal_c: Optional[dict[str, Any]],
@@ -544,11 +784,19 @@ def write_shifts_csv(
 ) -> None:
     """Write the per-atom predicted-shifts CSV.
 
-    For each atom, look up the appropriate calibration (H vs C). When
-    no calibration is available for the element, ``delta_predicted_ppm``
-    is left empty and the calibration provenance columns are blank —
-    the raw ``sigma_iso_avg_ppm`` is still emitted so downstream
-    consumers can apply their own scaling.
+    Each row is one atom. Per-atom columns (``sigma_iso_avg_ppm``,
+    ``delta_predicted_ppm``) carry the atom's individual averaged
+    values; group columns (``group_label``, ``group_n_atoms``,
+    ``group_sigma_iso_avg_ppm``, ``group_delta_predicted_ppm``)
+    carry the equivalence-group's collective values shared across
+    all rows that belong to the same group. Collapse rows by
+    ``group_label`` to get the spectrum view.
+
+    When no calibration is available for an element, the per-atom
+    ``delta_predicted_ppm`` and the group's calibrated δ are both
+    left empty and the calibration provenance columns are blank —
+    raw σ values are still emitted so downstream consumers can apply
+    their own scaling.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -581,6 +829,38 @@ def write_shifts_csv(
                 delta = None
                 source = ""
 
+            # Group columns. Every atom should be in a group thanks to
+            # the singleton fallback in :func:`build_aggregate_groups`,
+            # but if for some reason the map doesn't cover this idx,
+            # fall back to a per-atom "atom_<idx>" pseudo-group with
+            # NONE tier so the CSV shape is invariant.
+            group = atom_to_group.get(idx)
+            if group is not None:
+                group_label = group.name
+                group_tier = _tier_value(group.tier)
+                group_n_atoms = len(group.atom_indices)
+                group_atom_indices = ",".join(
+                    str(a) for a in sorted(group.atom_indices)
+                )
+                group_sigma = _group_avg_sigma(group, by_atom)
+                if group_sigma is not None and cal is not None:
+                    group_delta = predict_chemical_shift(
+                        group_sigma,
+                        slope=cal["slope"], intercept=cal["intercept"],
+                    )
+                elif group_sigma is not None:
+                    group_delta = None
+                else:
+                    group_sigma = sigma
+                    group_delta = delta
+            else:
+                group_label = f"atom_{idx}"
+                group_tier = "none"
+                group_n_atoms = 1
+                group_atom_indices = str(idx)
+                group_sigma = sigma
+                group_delta = delta
+
             w.writerow(
                 [
                     idx,
@@ -592,29 +872,79 @@ def write_shifts_csv(
                     basis,
                     cfg["solvent"],
                     n_used,
+                    group_label,
+                    group_tier,
+                    group_n_atoms,
+                    group_atom_indices,
+                    group_sigma,
+                    group_delta,
                 ]
             )
+
+
+def _group_pair_avg_j(
+    *,
+    group_i: EquivalenceGroup,
+    group_j: EquivalenceGroup,
+    by_pair: dict[tuple[int, int], dict[str, Any]],
+) -> Optional[float]:
+    """Average raw J over all atom pairs (a, b) with a in group_i,
+    b in group_j (skipping a == b for the diagonal). Returns ``None``
+    if no atom pair from the cross-product has a parseable J.
+
+    This is the right value to plug into a spin-system simulator that
+    treats the two groups as single spins — operationally what mnova's
+    ``<j>`` entries between groups already use.
+    """
+    vals: list[float] = []
+    for a in group_i.atom_indices:
+        for b in group_j.atom_indices:
+            if a == b:
+                continue
+            entry = by_pair.get((min(a, b), max(a, b)))
+            if entry is None:
+                continue
+            j = entry.get("J_total_avg_hz")
+            if isinstance(j, (int, float)):
+                vals.append(float(j))
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
 
 
 def write_couplings_csv(
     *,
     out_path: Path,
     by_pair: dict[tuple[int, int], dict[str, Any]],
+    atom_to_group: dict[int, EquivalenceGroup],
     n_used: int,
     cal_jhh: Optional[dict[str, Any]],
     cfg: dict[str, Any],
 ) -> None:
     """Write the per-pair predicted-couplings CSV.
 
+    Each row is one atom pair. Per-pair columns (``J_total_avg_hz``,
+    ``J_predicted_hz``) carry the atom-pair's own averaged J; group
+    columns (``group_i_label``, ``group_j_label``,
+    ``group_pair_J_*``) carry the equivalence-group-pair's averaged
+    J — useful when comparing to a measured multiplet treated as a
+    coupling between two collective spin systems. Collapse rows by
+    ``(group_i_label, group_j_label)`` to get the group-pair view.
+
     Currently only ¹H-¹H pairs are linearly scaled (the Bally/Rablen
     calibration in the default table is for H-H J's). Heteronuclear
     pairs are emitted with raw ``J_total_avg_hz`` and an empty
-    ``J_predicted_hz``.
+    ``J_predicted_hz`` — same for the group_pair_J_predicted column.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(COUPLING_CSV_COLUMNS)
+        # Cache group-pair averaged J's so we compute each (g_i, g_j)
+        # once even when 6+ atom pairs share it (e.g. methyl-to-CH₂).
+        group_pair_cache: dict[
+            tuple[str, str], tuple[Optional[float], Optional[float]]
+        ] = {}
         for (i, j) in sorted(by_pair):
             entry = by_pair[(i, j)]
             ei, ej = entry["elem_i"], entry["elem_j"]
@@ -636,6 +966,32 @@ def write_couplings_csv(
                 method = ""
                 basis = ""
 
+            # Group identities for this atom pair.
+            g_i = atom_to_group.get(i)
+            g_j = atom_to_group.get(j)
+            if g_i is not None and g_j is not None:
+                g_i_label, g_j_label = g_i.name, g_j.name
+                cache_key = (g_i_label, g_j_label)
+                if cache_key not in group_pair_cache:
+                    gp_j_avg = _group_pair_avg_j(
+                        group_i=g_i, group_j=g_j, by_pair=by_pair,
+                    )
+                    if gp_j_avg is not None and is_hh and cal_jhh is not None:
+                        gp_j_pred = predict_coupling_constant(
+                            gp_j_avg,
+                            slope=cal_jhh["slope"],
+                            intercept=cal_jhh["intercept"],
+                        )
+                    else:
+                        gp_j_pred = None
+                    group_pair_cache[cache_key] = (gp_j_avg, gp_j_pred)
+                gp_j_avg, gp_j_pred = group_pair_cache[cache_key]
+            else:
+                g_i_label = f"atom_{i}"
+                g_j_label = f"atom_{j}"
+                gp_j_avg = j_avg
+                gp_j_pred = j_pred
+
             w.writerow(
                 [
                     i,
@@ -649,6 +1005,10 @@ def write_couplings_csv(
                     basis,
                     cfg["solvent"],
                     n_used,
+                    g_i_label,
+                    g_j_label,
+                    gp_j_avg,
+                    gp_j_pred,
                 ]
             )
 
@@ -1475,6 +1835,24 @@ SCHEMA = NodeSchema(
                 "the primary spectrum is what shows."
             ),
         ),
+        ConfigField(
+            name="auto_heteronuclear",
+            type="bool",
+            default=True,
+            section="mnova",
+            coercer=parse_bool,
+            description=(
+                "When true (default), scan upstream conformer xyz "
+                "files for ¹⁹F and ³¹P and auto-add the matching "
+                "symbols to ``mnova_heteronuclear_partners`` if they "
+                "aren't already there. Pairs with the same-named "
+                "knob on ``orca_thermo_array`` so the ORCA J's and "
+                "the mnova XML stay in sync without operator action. "
+                "Set to false to force the {¹⁹F} / {³¹P} decoupled-"
+                "spectrum view: only operator-supplied partners are "
+                "emitted."
+            ),
+        ),
         # ----- Molecule diagrams -----
         ConfigField(
             name="diagrams_enabled",
@@ -1543,6 +1921,39 @@ class NmrAggregate(Node):
         if not confs:
             ctx.fail("upstream_missing_conformers_bucket")
             return
+
+        # ---- Auto-expand mnova_heteronuclear_partners ----
+        # Pairs with the same-named knob on orca_thermo_array. If the
+        # upstream geometry contains ¹⁹F or ³¹P, append those to the
+        # partner list so the mnova XML emits the cross-element J's
+        # that ORCA was asked (by the same auto knob over there) to
+        # compute. Operator-supplied partners are preserved; we only
+        # ADD entries when missing.
+        if cfg.get("auto_heteronuclear", True):
+            detected_partners = _detect_partner_elements_from_confs(confs)
+            if detected_partners:
+                existing = {
+                    str(p).strip().upper()
+                    for p in cfg.get("mnova_heteronuclear_partners") or []
+                }
+                added: list[str] = []
+                expanded = list(cfg.get("mnova_heteronuclear_partners") or [])
+                for elem in detected_partners:
+                    if elem.upper() not in existing:
+                        expanded.append(elem)
+                        added.append(elem)
+                if added:
+                    cfg["mnova_heteronuclear_partners"] = expanded
+                    ctx.set_input(
+                        "mnova_heteronuclear_partners", list(expanded),
+                    )
+                    logging_utils.log_info(
+                        f"nmr-aggregate: detected {detected_partners} in "
+                        f"upstream geometry; added {added!r} to "
+                        f"mnova_heteronuclear_partners (now {expanded!r}) "
+                        f"so H/C simulated spectra show heteronuclear "
+                        f"splitting"
+                    )
 
         # ---- Walk conformers + parse ----
         weights: list[Optional[float]] = []
@@ -1721,6 +2132,54 @@ class NmrAggregate(Node):
                     solvent=cfg["solvent"],
                 )
 
+        # ---- Build by_pair BEFORE CSV writes ----
+        # The equivalence detector wants J's for its data-aware
+        # refinement step, so we need by_pair available when we build
+        # groups for the shifts CSV (not just the couplings CSV).
+        # Defensive against skip_couplings: an empty by_pair just makes
+        # the detector fall back to topology-only classification.
+        n_used_cp = 0
+        n_hh_pairs = 0
+        n_hh_pairs_scaled = 0
+        by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+        if not cfg["skip_couplings"]:
+            by_pair, n_used_cp = boltzmann_average_couplings(
+                per_conformer=per_conformer_couplings,
+                weights=norm_weights,
+            )
+
+        # ---- Build equivalence groups for the CSV's group columns ----
+        # Try smiles → mol → fall back to per-conformer xyz → mol →
+        # fall back to singleton groups (one NONE-tier group per atom).
+        # Either way the CSVs always carry group columns; downstream
+        # consumers can collapse rows by ``group_label`` to get a
+        # spectrum-comparison view. ``_build_mnova_mol`` lazy-imports
+        # RDKit; wrap in try/except so a stripped env that has no RDKit
+        # falls cleanly to singleton groups instead of crashing the run.
+        try:
+            groups_mol = self._build_mnova_mol(cfg, confs)
+        except Exception as e:
+            logging_utils.log_info(
+                f"nmr-aggregate: mol build raised "
+                f"({type(e).__name__}: {e}); CSV group columns will be "
+                "per-atom singletons"
+            )
+            groups_mol = None
+        if groups_mol is None:
+            logging_utils.log_info(
+                "nmr-aggregate: no SMILES + no parseable xyz; CSV group "
+                "columns will be per-atom singletons (NONE tier)"
+            )
+        groups_for_csv = build_aggregate_groups(
+            mol=groups_mol,
+            by_atom=by_atom,
+            by_pair=by_pair,
+            cal_h=cal_h,
+            cal_c=cal_c,
+            cal_jhh=cal_jhh,
+        )
+        atom_to_group = build_atom_to_group_map(groups_for_csv)
+
         # ---- Write CSVs + summary ----
         outputs_dir = ctx.outputs_dir
         outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -1729,6 +2188,7 @@ class NmrAggregate(Node):
         write_shifts_csv(
             out_path=shifts_path,
             by_atom=by_atom,
+            atom_to_group=atom_to_group,
             n_used=n_used_sh,
             cal_h=cal_h,
             cal_c=cal_c,
@@ -1766,15 +2226,10 @@ class NmrAggregate(Node):
             },
         )
 
-        n_used_cp = 0
-        n_hh_pairs = 0
-        n_hh_pairs_scaled = 0
-        by_pair: dict[tuple[int, int], dict[str, Any]] = {}
         if not cfg["skip_couplings"]:
-            by_pair, n_used_cp = boltzmann_average_couplings(
-                per_conformer=per_conformer_couplings,
-                weights=norm_weights,
-            )
+            # by_pair was already built above (so the equivalence
+            # detector could see J's for its data-aware refinement);
+            # just compute the H-H summary counts + write the CSV here.
             hh_pairs = {
                 k: v for k, v in by_pair.items()
                 if v["elem_i"] == "H" and v["elem_j"] == "H"
@@ -1786,6 +2241,7 @@ class NmrAggregate(Node):
             write_couplings_csv(
                 out_path=couplings_path,
                 by_pair=by_pair,
+                atom_to_group=atom_to_group,
                 n_used=n_used_cp,
                 cal_jhh=cal_jhh,
                 cfg=cfg,
@@ -2602,10 +3058,13 @@ __all__ = [
     "DEFAULT_SHIELDING_METHOD_C",
     "DEFAULT_SHIELDING_METHOD_H",
     "DEFAULT_SOLVENT",
+    "HETERONUCLEAR_PARTNERS",
     "NmrAggregate",
     "SHIFT_CSV_COLUMNS",
     "boltzmann_average_couplings",
     "boltzmann_average_shieldings",
+    "build_aggregate_groups",
+    "build_atom_to_group_map",
     "collect_conformer_records",
     "main",
     "renormalize_weights",

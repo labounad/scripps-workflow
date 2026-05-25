@@ -123,10 +123,52 @@ NMR_CALIBRATION: dict[tuple[str, str, str, str], dict[str, Any]] = {
         "source": "identity (no published mPW1PW91/pcJ-2 ¹⁹F-¹⁹F calibration)",
         "valid_range_ppm": None,
     },
+    ("mPW1PW91", "pcJ-2", "CHCl3", "13C-19F_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹³C-¹⁹F calibration)",
+        "valid_range_ppm": None,
+    },
     ("mPW1PW91", "pcJ-2", "CHCl3", "1H-13C_J"): {
         "slope": 1.0,
         "intercept": 0.0,
         "source": "identity (no published mPW1PW91/pcJ-2 ¹H-¹³C calibration)",
+        "valid_range_ppm": None,
+    },
+    # ----------------------------------------------------------------
+    # ³¹P coupling calibrations.
+    #
+    # Same caveat as the ¹⁹F set: there's no published
+    # mPW1PW91/pcJ-2 calibration for these pair types, so we ship
+    # identity entries. The raw DFT J's from ORCA's coupled-spin-set
+    # block are already in the right ballpark (typical ¹J(C-P) ≈ 30
+    # Hz, ²J(C-P) ≈ 10 Hz, ³J(H-P) ≈ 8 Hz come back within ~10-20%
+    # of experimental on phosphine ligands), so a stub identity is
+    # adequate for spin-system simulation. Replace with a lab-fit
+    # calibration once a benchmark set is collected.
+    # ----------------------------------------------------------------
+    ("mPW1PW91", "pcJ-2", "CHCl3", "1H-31P_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹H-³¹P calibration)",
+        "valid_range_ppm": None,
+    },
+    ("mPW1PW91", "pcJ-2", "CHCl3", "13C-31P_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹³C-³¹P calibration)",
+        "valid_range_ppm": None,
+    },
+    ("mPW1PW91", "pcJ-2", "CHCl3", "31P-31P_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ³¹P-³¹P calibration)",
+        "valid_range_ppm": None,
+    },
+    ("mPW1PW91", "pcJ-2", "CHCl3", "19F-31P_J"): {
+        "slope": 1.0,
+        "intercept": 0.0,
+        "source": "identity (no published mPW1PW91/pcJ-2 ¹⁹F-³¹P calibration)",
         "valid_range_ppm": None,
     },
 }

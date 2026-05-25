@@ -40,7 +40,9 @@ from scripps_workflow.nmr_calibration import (
     predict_coupling_constant,
 )
 from scripps_workflow.nodes.nmr_aggregate import (
+    HETERONUCLEAR_PARTNERS,
     NmrAggregate,
+    _detect_partner_elements_from_confs,
     build_aggregate_groups,
     build_atom_to_group_map,
 )
@@ -611,6 +613,56 @@ class TestBuildAggregateGroups:
         )
         # δ = (30.0 − 32.0) / -1.0 = 2.0
         assert groups[0].shift_avg_ppm == pytest.approx(2.0)
+
+
+class TestDetectPartnerElementsFromConfs:
+    """``_detect_partner_elements_from_confs`` reads conformer xyz
+    files and returns ¹⁹F / ³¹P presence as a sorted symbol list.
+    Mirrors the same-element detector in orca_thermo_array so the
+    auto-expanded ``coupling_pairs`` and ``mnova_heteronuclear_partners``
+    stay in sync."""
+
+    def _conf(self, tmp_path: Path, atoms: list[str], idx: int = 1) -> dict:
+        xyz = tmp_path / f"conf_{idx}.xyz"
+        lines = [str(len(atoms)), "comment"]
+        for i, sym in enumerate(atoms):
+            lines.append(f"{sym} {i * 1.5:.4f} 0.0 0.0")
+        xyz.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return {"path_abs": str(xyz), "index": idx}
+
+    def test_organic_returns_empty(self, tmp_path):
+        confs = [self._conf(tmp_path, ["C", "C", "H", "H"])]
+        assert _detect_partner_elements_from_confs(confs) == []
+
+    def test_fluorobenzene_returns_f(self, tmp_path):
+        confs = [self._conf(tmp_path, ["C", "C", "F", "H"])]
+        assert _detect_partner_elements_from_confs(confs) == ["F"]
+
+    def test_phosphine_returns_p(self, tmp_path):
+        confs = [self._conf(tmp_path, ["P", "C", "C", "C", "H"])]
+        assert _detect_partner_elements_from_confs(confs) == ["P"]
+
+    def test_both_returns_sorted(self, tmp_path):
+        # PF3 — has both F and P; sorted alphabetically: F before P.
+        confs = [self._conf(tmp_path, ["P", "F", "F", "F"])]
+        assert _detect_partner_elements_from_confs(confs) == ["F", "P"]
+
+    def test_missing_path_silently_skipped(self, tmp_path):
+        """Conformer records with no path_abs / unreadable files don't
+        crash the detector — they just contribute nothing."""
+        present = self._conf(tmp_path, ["P", "C"], idx=1)
+        absent = {"path_abs": "/nope/missing.xyz", "index": 2}
+        # Both files scanned; only the present one contributes.
+        assert _detect_partner_elements_from_confs([absent, present]) == ["P"]
+
+    def test_partners_constant_matches_orca_side(self):
+        """The aggregator's HETERONUCLEAR_PARTNERS must match the
+        orca_thermo_array HETERONUCLEAR_J_PARTNERS so the two nodes
+        auto-detect the same set of nuclei."""
+        from scripps_workflow.nodes.orca_thermo_array import (
+            HETERONUCLEAR_J_PARTNERS,
+        )
+        assert set(HETERONUCLEAR_PARTNERS) == set(HETERONUCLEAR_J_PARTNERS)
 
 
 class TestNmrAggregateHHContract:
