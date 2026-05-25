@@ -39,7 +39,11 @@ from scripps_workflow.nmr_calibration import (
     predict_chemical_shift,
     predict_coupling_constant,
 )
-from scripps_workflow.nodes.nmr_aggregate import NmrAggregate
+from scripps_workflow.nodes.nmr_aggregate import (
+    NmrAggregate,
+    build_aggregate_groups,
+    build_atom_to_group_map,
+)
 from scripps_workflow.orca import (
     parse_orca_couplings,
     parse_orca_shieldings,
@@ -502,6 +506,24 @@ class TestNmrAggregateHappyPath:
         # δ = (80.298 − 197.67) / -0.9781 ≈ 120.0 (labounad 2026 ¹³C cal)
         assert float(c0["delta_predicted_ppm"]) == pytest.approx(120.0, abs=1e-2)
 
+        # ---- Group columns ----
+        # No SMILES passed; equivalence detector falls back to singleton
+        # groups (one NONE-tier group per atom). Each row's group_label
+        # must therefore be unique and match its atom_index.
+        for row in rows:
+            assert row["group_label"] == f"atom_{row['atom_index']}"
+            assert row["group_tier"] == "none"
+            assert int(row["group_n_atoms"]) == 1
+            assert row["group_atom_indices"] == row["atom_index"]
+            # Group σ/δ match the per-atom values for singletons.
+            assert float(row["group_sigma_iso_avg_ppm"]) == pytest.approx(
+                float(row["sigma_iso_avg_ppm"]), rel=1e-9,
+            )
+            if row["delta_predicted_ppm"]:
+                assert float(row["group_delta_predicted_ppm"]) == pytest.approx(
+                    float(row["delta_predicted_ppm"]), rel=1e-9,
+                )
+
         # Couplings CSV: one H-H pair, scaled with mPW1PW91 / pcJ-2.
         cps_path = next(
             Path(a["path_abs"])
@@ -524,6 +546,71 @@ class TestNmrAggregateHappyPath:
         assert artifacts_by_label["predicted_shifts_csv"]["h_row_count"] == 2
         assert artifacts_by_label["predicted_shifts_csv"]["c_row_count"] == 1
         assert artifacts_by_label["predicted_couplings_csv"]["hh_row_count"] == 1
+
+
+class TestBuildAggregateGroups:
+    """``build_aggregate_groups`` returns equivalence groups across all
+    elements present in by_atom. With mol=None the result is one NONE-
+    tier singleton per atom; with a real Mol it runs the multinucleus
+    detector (which is already covered exhaustively in
+    test_equivalence.py)."""
+
+    def _by_atom(self, *entries: tuple[int, str, float]) -> dict[int, dict[str, Any]]:
+        return {
+            idx: {"element": elem, "sigma_iso_avg_ppm": sigma}
+            for idx, elem, sigma in entries
+        }
+
+    def test_no_mol_returns_singletons(self):
+        """Fallback path — every atom becomes its own NONE-tier group."""
+        by_atom = self._by_atom(
+            (0, "C", 61.0), (1, "H", 30.0), (2, "H", 30.0),
+        )
+        groups = build_aggregate_groups(
+            mol=None, by_atom=by_atom, by_pair={},
+            cal_h=None, cal_c=None, cal_jhh=None,
+        )
+        assert len(groups) == 3
+        labels = [g.name for g in groups]
+        assert labels == ["atom_0", "atom_1", "atom_2"]
+        for g in groups:
+            assert g.tier.value == "none"
+            assert len(g.atom_indices) == 1
+
+    def test_empty_by_atom_returns_empty(self):
+        """No atoms to group → empty list."""
+        groups = build_aggregate_groups(
+            mol=None, by_atom={}, by_pair={},
+            cal_h=None, cal_c=None, cal_jhh=None,
+        )
+        assert groups == []
+
+    def test_atom_to_group_map_covers_all_members(self):
+        """Atom-to-group lookup includes every member of every group."""
+        by_atom = self._by_atom(
+            (0, "C", 61.0), (1, "H", 30.0), (2, "H", 30.0),
+        )
+        groups = build_aggregate_groups(
+            mol=None, by_atom=by_atom, by_pair={},
+            cal_h=None, cal_c=None, cal_jhh=None,
+        )
+        atom_map = build_atom_to_group_map(groups)
+        assert set(atom_map.keys()) == {0, 1, 2}
+        # Each atom maps to its own singleton group.
+        assert atom_map[0].name == "atom_0"
+        assert atom_map[1].name == "atom_1"
+
+    def test_singleton_uses_calibration_for_shift(self):
+        """When cal is available, group.shift_avg_ppm is calibrated δ;
+        without cal, it's raw σ (better than NaN)."""
+        by_atom = self._by_atom((0, "H", 30.0))
+        cal_h = {"slope": -1.0, "intercept": 32.0}
+        groups = build_aggregate_groups(
+            mol=None, by_atom=by_atom, by_pair={},
+            cal_h=cal_h, cal_c=None, cal_jhh=None,
+        )
+        # δ = (30.0 − 32.0) / -1.0 = 2.0
+        assert groups[0].shift_avg_ppm == pytest.approx(2.0)
 
 
 class TestNmrAggregateHHContract:
