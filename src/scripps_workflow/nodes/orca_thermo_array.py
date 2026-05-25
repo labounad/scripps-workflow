@@ -363,6 +363,181 @@ DEFAULT_COUPLING_PAIRS: tuple[str, ...] = ("all H",)
 DEFAULT_COUPLING_THRESH_ANGSTROM: float = 8.0
 
 
+# --------------------------------------------------------------------
+# System-class profiles for the NMR shielding + coupling jobs
+# --------------------------------------------------------------------
+#
+# The geometry-opt + freq + high-level SP steps don't change between
+# system classes — the def2 family of basis sets ships with Stuttgart
+# ECPs for all elements Z >= 37 (Rb–Rn), so r2scan-3c (which builds on
+# def2-mTZVPP) and wB97M-V/def2-TZVPP both handle Pd correctly out of
+# the box for energies and geometries.
+#
+# What does change is the *NMR* step. ECPs capture scalar relativistic
+# contraction of the core but DO NOT capture spin-orbit. For ¹H and
+# ¹³C shieldings on atoms near a heavy metal, the spin-orbit-driven
+# HALA effect contributes ~0.5–2 ppm on ¹H and ~5–20 ppm on ¹³C —
+# above noise, sometimes well above. Capturing it requires a
+# relativistic Hamiltonian (ZORA or DKH) plus a basis recontracted
+# for that Hamiltonian (def2-ZORA-TZVPP for ORCA's ZORA path).
+#
+# Profiles encode this choice:
+#
+#   organic   — current default. Organic basis sets (6-311++G(2d,p)
+#               on H, 6-31G(d,p) on C, pcJ-2 for J). No relativistic
+#               Hamiltonian. Matches the cheshire + Bally/Rablen
+#               calibration tuples.
+#   organopd  — for Pd-containing molecules. Switches all three NMR
+#               bases to def2-ZORA-TZVPP and prepends ``ZORA`` to the
+#               NMR job's ``!`` line so ORCA enables scalar
+#               relativistic with HALA contributions.
+#
+# Adding more profiles (organotm_3d, organotm_4d, etc.) is purely
+# additive — register a new entry in this dict + extend
+# :func:`detect_system_class` if you want auto-detection for that
+# element class. The cache fingerprint for PredictedRun naturally
+# diverges between profiles because shielding_basis_* are part of
+# the PredictedRunKey payload — no schema change required.
+
+SYSTEM_CLASS_PROFILES: dict[str, dict[str, Any]] = {
+    "organic": {
+        "nmr_keywords_prefix": "",
+        "shielding_basis_h": DEFAULT_SHIELDING_BASIS_H,
+        "shielding_basis_c": DEFAULT_SHIELDING_BASIS_C,
+        "coupling_basis": DEFAULT_COUPLING_BASIS,
+    },
+    "organopd": {
+        "nmr_keywords_prefix": "ZORA",
+        "shielding_basis_h": "def2-ZORA-TZVPP",
+        "shielding_basis_c": "def2-ZORA-TZVPP",
+        "coupling_basis": "def2-ZORA-TZVPP",
+    },
+}
+
+#: Recognized profile names. ``"auto"`` triggers detection; anything
+#: else must match a key in :data:`SYSTEM_CLASS_PROFILES`.
+SYSTEM_CLASSES_KNOWN: frozenset[str] = frozenset(SYSTEM_CLASS_PROFILES.keys())
+
+#: Element symbols that map to each non-organic profile. Used by
+#: :func:`detect_system_class` to pick a profile from input geometry.
+#: First match wins, in dict-iteration order — keep more specific /
+#: heavier profiles first as new ones land.
+_PROFILE_ELEMENT_TRIGGERS: dict[str, frozenset[str]] = {
+    "organopd": frozenset({"Pd"}),
+}
+
+
+def detect_system_class(xyz_paths: list[Path]) -> str:
+    """Scan input geometries for heavy-element triggers; return the
+    matching :data:`SYSTEM_CLASS_PROFILES` key.
+
+    First-match-wins on the trigger dict. Returns ``"organic"`` when
+    no triggers fire. Reads at most the first few xyz files — the
+    element composition is the same across all conformers of one
+    molecule, so we don't need to scan a 50-conformer ensemble.
+
+    Robust to per-file read errors: a single unreadable xyz just gets
+    skipped, the rest of the scan continues.
+    """
+    elements_seen: set[str] = set()
+    for xyz in xyz_paths[:3]:
+        try:
+            text = xyz.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # XYZ format: line 1 = atom count, line 2 = comment, lines 3+
+        # are ``Elem  x  y  z`` rows. We accept any whitespace-leading
+        # token as the element symbol; numbers / blank lines get
+        # filtered out naturally because they don't appear as keys in
+        # any trigger set.
+        for line in text.splitlines():
+            tokens = line.split()
+            if tokens:
+                elements_seen.add(tokens[0])
+    for profile_name, triggers in _PROFILE_ELEMENT_TRIGGERS.items():
+        if elements_seen & triggers:
+            return profile_name
+    return "organic"
+
+
+def _upstream_xyz_paths(ctx: NodeContext) -> list[Path]:
+    """Pull conformer xyz paths from the upstream manifest.
+
+    Used by :func:`detect_system_class` before staging — element
+    composition is the same on the upstream's xyzs as on whatever
+    we'd stage locally, so we can resolve system_class before the
+    cache check fires (which depends on the resolved profile).
+
+    Returns an empty list if no upstream manifest is present (the
+    node will fail later via the existing ``no_upstream_manifest``
+    failure path; this helper just falls through cleanly).
+    """
+    if ctx.upstream_manifest is None:
+        return []
+    confs = ctx.upstream_manifest.artifacts.get("conformers") or []
+    paths: list[Path] = []
+    for rec in confs:
+        if not isinstance(rec, dict):
+            continue
+        p = rec.get("path_abs")
+        if isinstance(p, str) and p:
+            paths.append(Path(p))
+    return paths
+
+
+def _resolve_system_class_profile(
+    cfg: dict[str, Any], *, ctx: NodeContext,
+) -> str:
+    """Resolve ``cfg['system_class']`` against the profile registry.
+
+    Mutates ``cfg`` in place: writes the resolved profile name back to
+    ``cfg['system_class']`` (so ``"auto"`` is replaced with the
+    detected concrete class), and swaps any NMR-basis fields that still
+    hold their organic defaults to the profile's value. Operator-
+    supplied basis values pass through unchanged.
+
+    Returns the resolved class for logging convenience.
+
+    Raises :class:`ValueError` on an unknown class string. Auto-detect
+    failure (no upstream, can't read xyzs) falls back to ``"organic"``
+    — the conservative choice.
+    """
+    raw = str(cfg.get("system_class", "auto")).strip().lower()
+    if raw == "auto":
+        resolved = detect_system_class(_upstream_xyz_paths(ctx))
+        logging_utils.log_info(
+            f"orca-thermo: system_class=auto resolved to {resolved!r} "
+            "based on upstream element scan"
+        )
+    elif raw in SYSTEM_CLASSES_KNOWN:
+        resolved = raw
+        logging_utils.log_info(
+            f"orca-thermo: system_class={resolved!r} (operator-set)"
+        )
+    else:
+        raise ValueError(
+            f"unknown system_class={raw!r}; expected 'auto' or one of "
+            f"{sorted(SYSTEM_CLASSES_KNOWN)}"
+        )
+
+    profile = SYSTEM_CLASS_PROFILES[resolved]
+    organic = SYSTEM_CLASS_PROFILES["organic"]
+    cfg["system_class"] = resolved
+
+    # Swap NMR basis defaults to the profile's values when the operator
+    # left them at the organic defaults. Explicit operator overrides
+    # (different value from the organic default) pass through unchanged.
+    for key in ("shielding_basis_h", "shielding_basis_c", "coupling_basis"):
+        profile_value = profile[key]
+        if cfg.get(key) == organic[key] and profile_value != organic[key]:
+            cfg[key] = profile_value
+            logging_utils.log_info(
+                f"orca-thermo: profile {resolved!r} swapped {key} to "
+                f"{profile_value!r}"
+            )
+    return resolved
+
+
 def build_nmr_input_files(
     *,
     cfg: dict[str, Any],
@@ -403,6 +578,13 @@ def build_nmr_input_files(
     aux = str(cfg.get("nmr_aux_keywords", DEFAULT_NMR_AUX_KEYWORDS)).strip()
     aux_suffix = f" {aux}" if aux else ""
 
+    # Profile keyword prefix (e.g. ``ZORA`` for organopd). Prepended
+    # to every NMR job's ``!`` line so ORCA picks up the relativistic
+    # Hamiltonian alongside the basis swap that the resolver did.
+    # Empty string for the organic default — no prefix added.
+    prefix = (cfg.get("nmr_keywords_prefix") or "").strip()
+    prefix_part = f"{prefix} " if prefix else ""
+
     common = {
         "nprocs": cfg["nprocs"],
         "maxcore": cfg["maxcore"],
@@ -416,7 +598,7 @@ def build_nmr_input_files(
     if cfg.get("run_shielding_h"):
         h_method, h_extras = resolve_functional_alias(cfg["shielding_method_h"])
         files[ORCA_NMR_H_INP_NAME] = make_orca_simple_input(
-            keywords=f"NMR {h_method} {cfg['shielding_basis_h']}{aux_suffix}",
+            keywords=f"{prefix_part}NMR {h_method} {cfg['shielding_basis_h']}{aux_suffix}",
             extra_blocks=[*h_extras, nmr_shielding_block("all H")],
             **common,
         )
@@ -424,7 +606,7 @@ def build_nmr_input_files(
     if cfg.get("run_shielding_c"):
         c_method, c_extras = resolve_functional_alias(cfg["shielding_method_c"])
         files[ORCA_NMR_C_INP_NAME] = make_orca_simple_input(
-            keywords=f"NMR {c_method} {cfg['shielding_basis_c']}{aux_suffix}",
+            keywords=f"{prefix_part}NMR {c_method} {cfg['shielding_basis_c']}{aux_suffix}",
             extra_blocks=[*c_extras, nmr_shielding_block("all C")],
             **common,
         )
@@ -434,7 +616,7 @@ def build_nmr_input_files(
         thresh = cfg.get("coupling_thresh_angstrom")
         j_method, j_extras = resolve_functional_alias(cfg["coupling_method"])
         files[ORCA_NMR_J_INP_NAME] = make_orca_simple_input(
-            keywords=f"NMR {j_method} {cfg['coupling_basis']}{aux_suffix}",
+            keywords=f"{prefix_part}NMR {j_method} {cfg['coupling_basis']}{aux_suffix}",
             extra_blocks=[
                 *j_extras,
                 nmr_coupling_block(
@@ -762,6 +944,24 @@ SCHEMA = NodeSchema(
             ),
         ),
         ConfigField(
+            name="system_class",
+            type="str",
+            default="auto",
+            section="nmr",
+            coercer=normalize_optional_str,
+            description=(
+                "Chemistry class profile for the NMR shielding + "
+                "coupling jobs. ``auto`` scans the input geometry for "
+                "heavy-element triggers and picks the matching profile "
+                "(currently: Pd -> 'organopd', else 'organic'). The "
+                "'organopd' profile prepends ``ZORA`` to NMR keyword "
+                "lines and swaps the default shielding/coupling bases "
+                "to ``def2-ZORA-TZVPP`` so HALA contributions on H/C "
+                "near Pd are captured correctly. Explicit operator-set "
+                "bases pass through unchanged."
+            ),
+        ),
+        ConfigField(
             name="use_cache",
             type="bool",
             default=True,
@@ -846,6 +1046,21 @@ class OrcaThermoArray(Node):
             unpaired_electrons=cfg["unpaired_electrons"],
         )
 
+        # Resolve the NMR system_class profile EARLY — before set_inputs
+        # records the basis fields and before the cache check builds
+        # the PredictedRunKey. The resolver mutates cfg in place: maps
+        # ``system_class=auto`` to a concrete class via element scan of
+        # the upstream conformer xyzs, then swaps any NMR-basis fields
+        # still at their organic defaults to the profile's values. Doing
+        # this before set_inputs and before the cache check guarantees
+        # the manifest and the fingerprint both reflect what the NMR
+        # jobs actually receive.
+        try:
+            _resolve_system_class_profile(cfg, ctx=ctx)
+        except ValueError as e:
+            ctx.fail(f"bad_system_class: {e}")
+            return
+
         # Record resolved config in manifest.inputs FIRST — before
         # any cache check or compute. Anything that fails later (cache
         # helper raises, sbatch errors, ORCA crashes mid-array) still
@@ -884,6 +1099,7 @@ class OrcaThermoArray(Node):
             coupling_pairs=list(cfg["coupling_pairs"]),
             coupling_thresh_angstrom=cfg["coupling_thresh_angstrom"],
             nmr_aux_keywords=cfg["nmr_aux_keywords"],
+            system_class=cfg["system_class"],
             # Provenance: the operator-supplied / calibration-table
             # functional name (``shielding_method_*`` / ``coupling_method``)
             # may not be the literal ORCA 6 keyword we end up putting on
