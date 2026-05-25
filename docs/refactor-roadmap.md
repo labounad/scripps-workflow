@@ -133,6 +133,64 @@ Playwright smoke test marked `browser`. It stubs CDN-loaded 3Dmol/RDKit scripts
 so the test checks bundle bootstrap without requiring public internet access.
 It is skipped automatically when Playwright or a browser binary is unavailable.
 
+## Completed since the registry refactor
+
+### A. Per-stage producer-side self-registration to `nmr-data`
+
+**Change.** Each compute node now writes its own row + central-tree dir
+directly via `nmr_data.registry.register_<stage>(...)` after a successful
+run, rather than waiting for the terminal `wf-db-ingest` to bulk-ingest
+everything. `wf-db-ingest` survives as a fail-open backstop. See
+`docs/registry-design.md` and `docs/registry-verification.md` for
+rationale + verification protocol. `tools/inspect_registry_progress.py`
+prints the DB + tree state for a given SMILES.
+
+### B. `system_class` profile for organopalladium NMR
+
+**Change.** `wf-orca-thermo-array` auto-detects `Pd` in the upstream
+geometry and switches the NMR shielding + coupling jobs to ORCA's
+ZORA Hamiltonian + def2-ZORA-TZVPP, leaving the geometry-opt / freq /
+high-level SP unchanged. New `system_class` knob (auto / organic /
+organopd). Cache fingerprint naturally diverges between profiles via
+the basis-set field on `PredictedRunKey`.
+
+### C. Heteronuclear J auto-detection (¹⁹F / ³¹P)
+
+**Change.** When ¹⁹F or ³¹P is present in the upstream geometry,
+`wf-orca-thermo-array` auto-appends `"all F"` / `"all P"` to
+`coupling_pairs` so ORCA computes the cross-element J's;
+`wf-nmr-aggregate` mirrors the detection on its own upstream and
+auto-extends `mnova_heteronuclear_partners` so the simulated H/C
+spectra render with realistic splitting. New `auto_heteronuclear`
+knob (default true) on both nodes; set false for the {¹⁹F}/{³¹P}
+decoupled-spectrum view.
+
+### D. Equivalence-group annotations on aggregator CSVs
+
+**Change.** `predicted_shifts.csv` and `predicted_couplings.csv` carry
+per-atom rows (unchanged) plus per-group annotation columns:
+`group_label`, `group_tier`, `group_n_atoms`, `group_atom_indices`,
+and group-averaged σ/δ values. Collapse rows by `group_label` for a
+spectrum-comparison view. Singleton fallback when no SMILES is
+available so the CSV shape is invariant.
+
+### E. ¹³C lab-fit calibration default
+
+**Change.** Default ¹³C calibration for `wB97X-D/6-31G(d,p)/CHCl3`
+swapped from cheshire (-1.0501, 187.25) to a lab-fit recalibration
+(-0.9781, 197.67) against organopalladium experimental data
+(R²=0.9986, RMSE=1.51 ppm). The original cheshire row is still
+reachable by overriding solvent to e.g. `CHCl3_CHESHIRE_2006`. ¹H
+calibration retains the cheshire WP04 values.
+
+### F. SSH-driven HPC integration test scaffold
+
+**Change.** `tests/test_hpc_integration.py` adds a Playwright-style
+opt-in test layer that reaches over SSH to a real cluster. Gated by
+`@pytest.mark.hpc` plus a `SCRIPPS_WORKFLOW_HPC_HOST` env var; default
+`pytest` runs skip silently. Smoke layer covers SSH, env activation,
+DB connectivity, alembic schema head, and a `wf-embed` round-trip.
+
 ## Remaining refactor candidates
 
 ### 8. Remove stale GUI-viewer/inport-era artifacts
@@ -173,13 +231,19 @@ Do this incrementally, one node at a time, with tests passing after each split.
 ### 10. Consolidate shared conformer and XYZ utilities
 
 Several modules know how to split multi-frame XYZ files, select conformers,
-resolve artifacts, and infer labels. Move these shared utilities toward:
+resolve artifacts, and infer labels. The registry refactor doubled-down on
+this duplication: `_walk_upstream_for_step`, `_walk_upstream_for_smiles`,
+`_upstream_xyz_paths`, and element-detection scanners now exist in roughly
+five node modules (crest, orca_goat, orca_dft_array, orca_thermo_array,
+nmr_aggregate). Move these shared utilities toward:
 
 ```text
 src/scripps_workflow/conformers/
   xyz.py
   ensemble.py
   artifacts.py
+src/scripps_workflow/upstream_walk.py    # manifest-chain traversal
+src/scripps_workflow/element_detect.py   # xyz element scanning
 ```
 
 Then `artifact_resolver.py`, `extract_conformers.py`, and conformer-producing
@@ -219,6 +283,11 @@ orca_legacy_parsing.py
 ```
 
 Core code can then operate on normalized modern records.
+
+**Partial progress:** `nmr_data.ingest.ingest_nmr_aggregate_result` now
+delegates to `nmr_data.registry.register_*` and survives as a thin
+compatibility shim, but it still lives in `ingest.py` rather than a
+dedicated `legacy_*.py` module.
 
 ### 13. Remove the hardcoded JS atom-map fallback
 
@@ -269,7 +338,21 @@ Also clarify when GUI node re-import is required:
 
 ## Near-term recommended next steps
 
-1. Verify that the static-asset refactor produces identical viewer bundles.
-2. Decide whether to commit any generated node ZIPs or keep them entirely local.
-3. Remove or quarantine deprecated GUI-inport-era fixtures.
-4. Start splitting large chemistry node modules along their internal boundaries.
+1. Pull the duplicated upstream-walk + element-detect helpers into
+   `scripps_workflow.upstream_walk` + `scripps_workflow.element_detect`
+   (item 10). Five node modules share copies right now.
+2. Move the legacy `ingest_nmr_aggregate_result` compatibility shim into a
+   dedicated module so `nmr_data.ingest` only contains current-shape
+   helpers (item 12).
+3. Add DB-first calibration lookup so `nmr_aggregate` reads slope/intercept
+   from the `calibrations` table instead of the hardcoded `NMR_CALIBRATION`
+   dict. Removes the source-edit-redeploy loop for new calibrations.
+4. Build `wf-fit-calibration` CLI to fit slope/intercept from
+   (σ_calc, δ_exp) pairs and write a `Calibration` row; closes the loop
+   between predicted runs and experimental observations.
+5. Translate `docs/registry-verification.md` into pytest as an
+   "executable runbook" (the 4-claim end-to-end protocol). Currently
+   manual; should be automated.
+6. Decide whether to commit any generated node ZIPs or keep them entirely local
+   (item 14).
+7. Remove or quarantine deprecated GUI-inport-era fixtures (item 8).

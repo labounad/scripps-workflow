@@ -136,9 +136,11 @@ dependency for running the calculation.
 
 ```text
 src/scripps_workflow/
-    node.py             # Node base class + lifecycle
+    node.py             # Node base class + lifecycle + _try_register_to_nmr_data hook
     schema.py           # Manifest / artifact / pointer dataclasses
     pointer.py          # Pointer read/write helpers
+    nmr_calibration.py  # Linear-scaling table (cheshire + lab-fit) for shifts + J's
+    equivalence.py      # Three-tier chemical-equivalence detector (HARD/SOFT/NONE)
     contracts/          # Cross-node contracts
     nodes/              # Concrete process-node implementations
     output_viewers/     # Standalone viewer bundle builders and static assets
@@ -149,10 +151,17 @@ tools/
     gen_output_node_geometry_viewer.py  # GUI output-node bundle generator
     output_node_bundle.py               # shared output-node generator helpers
     gui_export_config.py                # shared GUI/HPC path config
+    inspect_registry_progress.py        # ad-hoc DB + central-tree inspector
+    check_group_portability.sh          # group-paths-vs-user-paths audit
 tests/
     pytest suite
+    test_hpc_integration.py             # SSH-driven HPC smoke tests (opt-in)
 docs/
-    developer notes and refactor roadmap
+    refactor-roadmap.md                 # ongoing software-structure roadmap
+    registry-design.md                  # per-stage self-registration design
+    registry-verification.md            # 4-claim runbook for the registry
+    hpc-database-setup.md               # PostgreSQL deployment notes
+    CONFIG_REFERENCE.md                 # auto-generated per-node config reference
 ```
 
 ## Install for development
@@ -236,6 +245,19 @@ python -m playwright install chromium
 python -m pytest -q tests/test_output_viewer_browser_smoke.py
 ```
 
+SSH-driven HPC integration tests live in `tests/test_hpc_integration.py` and are gated by both
+the `hpc` pytest marker and a `SCRIPPS_WORKFLOW_HPC_HOST` env var. Default `pytest` runs skip
+them silently. To run against a real cluster:
+
+```bash
+export SCRIPPS_WORKFLOW_HPC_HOST=garibaldihpc      # or whatever ~/.ssh/config alias
+python -m pytest -m hpc -v tests/test_hpc_integration.py
+```
+
+These probe SSH reachability, the workflow312 micromamba env, `NMR_DATABASE_URL` /
+`NMR_HPC_DATA_ROOT` activation hooks, alembic schema head, `inspect_registry_progress.py`, and a
+`wf-embed` round-trip. The opt-in flag is `pytest.mark.hpc`.
+
 ## Available nodes
 
 | Entry point             | Purpose                                                       |
@@ -257,19 +279,77 @@ python -m pytest -q tests/test_output_viewer_browser_smoke.py
 
 ## `wf-orca-thermo-array` NMR protocol
 
-`wf-orca-thermo-array` runs a per-conformer compound protocol inside a Slurm array task. Each task may
-invoke ORCA multiple times sequentially:
+`wf-orca-thermo-array` runs a per-conformer compound protocol inside a Slurm array task. Each task
+invokes ORCA multiple times sequentially:
 
-- `orca_thermo.inp` for frequency / thermochemistry / high-level SP
-- `orca_nmr_h.inp` for proton shieldings
-- `orca_nmr_c.inp` for carbon shieldings
-- `orca_nmr_j.inp` for J-couplings
+- `orca_thermo.inp` — r2scan-3c frequency / thermochemistry
+- `orca_thermo_sp.inp` — wB97M-V/def2-TZVPP high-level single point, output concatenated into the
+  thermo `.out` after completion. Run as a separate ORCA process to avoid `$new_job` method-state
+  leakage between the two functionals.
+- `orca_nmr_h.inp` — proton shieldings (WP04 / 6-311++G(2d,p) by default)
+- `orca_nmr_c.inp` — carbon shieldings (wB97X-D / 6-31G(d,p) by default)
+- `orca_nmr_j.inp` — J-couplings (mPW1PW91 / pcJ-2 by default)
 
 The NMR calculations are separate ORCA processes so method-state flags, dispersion settings,
 nonlocal correlation flags, and basis choices do not leak between chemically unrelated functionals.
 
 The node emits raw ORCA outputs. `wf-nmr-aggregate` handles parsing, Boltzmann population weighting,
 and linear-scaling calibration.
+
+### `system_class` profile (organopalladium / ZORA)
+
+A `system_class` config knob switches the NMR-job recipe based on the chemistry of the input:
+
+| Profile     | When it fires                                  | What changes                                                                                   |
+|-------------|------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `organic`   | Default for molecules with no `Pd`             | WP04 / wB97X-D / mPW1PW91 with the organic basis sets. No relativistic Hamiltonian             |
+| `organopd`  | Auto-selected when `Pd` is detected in input   | Same functionals, but ORCA's `! ZORA` Hamiltonian + def2-ZORA-TZVPP basis on all three NMR jobs |
+
+Geometry opt + freq + high-level SP are unchanged across profiles — def2 ECPs already handle Pd's
+scalar relativistic contraction. The ZORA path is only needed for NMR shieldings, where the HALA
+effect on ¹H/¹³C near a heavy metal is missing without a relativistic Hamiltonian (typically
+~0.5–2 ppm on ¹H, ~5–20 ppm on ¹³C, well above noise).
+
+`system_class=auto` (the default) reads the upstream conformer xyz and picks the matching profile;
+`system_class=organic` or `system_class=organopd` forces the choice. The cache fingerprint for
+`PredictedRun` naturally diverges between profiles because the basis-set fields are part of the
+fingerprint payload, so ZORA and non-ZORA runs don't collide.
+
+### Heteronuclear J auto-detection (¹⁹F / ³¹P)
+
+An `auto_heteronuclear` config knob (default `true`) extends the J-coupling job to include
+heteronuclear partners present in the molecule:
+
+- ¹⁹F detected → `"all F"` appended to `coupling_pairs`, so ORCA computes H–F / C–F / F–F J's.
+- ³¹P detected → `"all P"` appended, so H–P / C–P / P–P J's are computed.
+
+`wf-nmr-aggregate` mirrors the same detection on its own upstream chain and auto-expands
+`mnova_heteronuclear_partners`, so the simulated ¹H / ¹³C spectra render with realistic
+heteronuclear splitting rather than the {¹⁹F} or {³¹P} decoupled view. Set `auto_heteronuclear=false`
+on both nodes to force the decoupled spectrum.
+
+Other heavy nuclei (Pd, quadrupolar metals, etc.) are deliberately excluded — their J-coupling
+treatment requires a different methodology than mPW1PW91/pcJ-2.
+
+### Equivalence-grouped CSV output
+
+`wf-nmr-aggregate`'s `predicted_shifts.csv` and `predicted_couplings.csv` carry both per-atom rows
+(unchanged from earlier) and equivalence-group annotation columns: `group_label`, `group_tier`
+(`hard`/`soft`/`none`), `group_n_atoms`, `group_atom_indices`, and the group-averaged σ/δ values.
+Collapse the CSV by `group_label` in pandas / Excel for a spectrum-comparison view (one row per
+peak); use the atom-level columns for atom-by-atom analysis.
+
+When no SMILES is available and the conformer xyz can't be perceived by RDKit, each atom lands in
+its own NONE-tier singleton group labelled `atom_<idx>`. The CSV shape is invariant.
+
+### Calibration
+
+The default ¹³C linear-scaling calibration (`wB97X-D/6-31G(d,p)/CHCl3`) is a lab-fit recalibration
+of cheshire against organopalladium experimental data (slope `−0.9781`, intercept `197.67`,
+R²=0.9986, RMSE=1.51 ppm on the fit set). Reset to cheshire's original `−1.0501, 187.25` via an
+explicit `solvent=CHCl3_CHESHIRE_2006` override on the calibration lookup. ¹H calibration retains
+the published cheshire WP04 values. See `src/scripps_workflow/nmr_calibration.py` for the full
+table and provenance.
 
 ## Standalone output viewers
 
@@ -286,16 +366,47 @@ The viewer bundle is intended to be downloaded from the workflow run and opened 
 
 ## Cache and database behavior
 
-Cache-aware nodes may ask the `nmr-data` database whether an expensive deterministic result already
-exists. This is an optimization.
+Compute nodes both **read from** and **write to** the `nmr-data` database. Reads short-circuit
+expensive deterministic stages; writes populate the central tree as each stage finishes, rather
+than waiting for the terminal `wf-db-ingest` to ingest the whole pipeline at once.
 
-Required behavior:
+### Read side — cache lookup
 
-- cache hit: emit cached manifest / reuse existing artifacts
+Cache-aware nodes consult the `nmr-data` database at the top of `run()` to see whether an
+expensive deterministic result already exists:
+
+- cache hit: emit cached manifest / reuse existing artifacts, skip the SLURM array entirely
 - cache miss: compute normally
-- database unavailable: warn and compute normally
+- database unavailable: warn and compute normally (fail-open)
 
 This prevents temporary PostgreSQL outages from breaking calculations.
+
+### Write side — per-stage self-registration
+
+Each producing node calls `Node._try_register_to_nmr_data(stage, ...)` after a successful
+compute. The base-class helper delegates to the matching `nmr_data.registry.register_<stage>`
+function, which writes the row + copies artifacts into the central tree under
+`NMR_HPC_DATA_ROOT/<inchikey>/<stage>/<uuid>/`. The four stages:
+
+| Node                 | Stage          | Row table              | Central-tree dir                 |
+|----------------------|----------------|------------------------|----------------------------------|
+| `wf-crest`           | `ensemble`     | `conformer_ensembles`  | `ensembles/<uuid>/conformers/`   |
+| `wf-orca-goat`       | `ensemble`     | `conformer_ensembles`  | `ensembles/<uuid>/conformers/`   |
+| `wf-orca-dft-array`  | `dft_run`      | `dft_runs`             | `dft_runs/<uuid>/conformers/`    |
+| `wf-orca-thermo-array` | `thermo_run` | `thermo_runs`          | `thermo_runs/<uuid>/conformers/` |
+| `wf-nmr-aggregate`   | `predicted_run`| `predicted_runs`       | `predicted_runs/<uuid>/`         |
+
+Registration is fail-open, mirroring the cache read side: a degraded DB never breaks a running
+pipeline, the manifest just records `registry.<stage>.ok = false` for visibility.
+
+`wf-db-ingest` survives as a **backstop**: a fast no-op when the producing nodes already
+registered everything; a populator-of-last-resort if any stage's self-registration was skipped
+(transient DB outage, missing env, etc.). Its `[INFO]` lines distinguish "backstop wrote nothing
+— pipeline was healthy" from "backstop had to write — check why upstream skipped".
+
+See `docs/registry-design.md` for the rationale and `docs/registry-verification.md` for the
+end-to-end checklist + `tools/inspect_registry_progress.py` (a helper that prints the DB +
+central-tree state for a given SMILES).
 
 ## GUI node export
 

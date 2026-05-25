@@ -84,6 +84,20 @@ Cap on the number of conformers retained from CREST's ensemble. ``0`` (default) 
 
 Threads passed to CREST (``-T``). ``0`` auto-detects from SLURM if available, else 1.
 
+#### `use_cache`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+Consult the nmr-data ConformerEnsemble cache on entry. On hit, skip the CREST run entirely and emit a manifest pointing at the central-tree xyz files. Set to false to always re-run.
+
+#### `force_recompute`
+
+- **Type:** `bool`
+- **Default:** `False`
+
+Force a fresh CREST run even when the cache would hit. Useful when investigating non-determinism or after upgrading CREST. The cache row from the prior run stays in the DB; the new compute output gets a new predicted_run UUID at db_ingest time.
+
 ## `wf-db-ingest`
 
 - **Step:** `db_ingest`
@@ -421,6 +435,13 @@ Additional elements (e.g., ``F``, ``P``) to include as groups in EVERY primary-n
 
 Placeholder shift (ppm) for partner-element atoms whose σ wasn't parsed. Lands them outside typical primary-nucleus windows so the J-driven splitting on the primary spectrum is what shows.
 
+#### `auto_heteronuclear`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+When true (default), scan upstream conformer xyz files for ¹⁹F and ³¹P and auto-add the matching symbols to ``mnova_heteronuclear_partners`` if they aren't already there. Pairs with the same-named knob on ``orca_thermo_array`` so the ORCA J's and the mnova XML stay in sync without operator action. Set to false to force the {¹⁹F} / {³¹P} decoupled-spectrum view: only operator-supplied partners are emitted.
+
 #### Section: diagrams
 
 #### `diagrams_enabled`
@@ -583,6 +604,20 @@ Wall-clock cap on the monitor loop. ``0`` (default) = no cap, wait forever.
 
 Set ``OMPI_MCA_btl=^openib`` to silence the verbose Infiniband warnings on the Scripps cluster.
 
+#### `use_cache`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+Consult the nmr-data DftRun cache on entry. On hit, skip the SLURM DFT-opt array entirely — emit a manifest pointing at the parent ensemble's central-tree optimized xyzs so downstream nodes (orca_thermo_array etc.) see the geometries as if this node had just produced them. Set to false to always re-run.
+
+#### `force_recompute`
+
+- **Type:** `bool`
+- **Default:** `False`
+
+Force a fresh DFT-opt array even when the cache would hit. Useful when investigating ORCA non-determinism or after an ORCA version bump that should change the optimized geometries.
+
 ## `wf-orca-goat`
 
 - **Step:** `orca_goat`
@@ -658,6 +693,20 @@ Threads for the orca subprocess. ``0`` auto-detects from SLURM, else 1.
 - **Min:** `100`
 
 Per-process memory budget (MB) passed to ORCA via ``%maxcore``.
+
+#### `use_cache`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+Consult the nmr-data ConformerEnsemble cache on entry. On hit, skip the GOAT run entirely and emit a manifest pointing at the central-tree xyz files. Set to false to always re-run.
+
+#### `force_recompute`
+
+- **Type:** `bool`
+- **Default:** `False`
+
+Force a fresh GOAT run even when the cache would hit. Useful when investigating ORCA non-determinism or after upgrading the ORCA version.
 
 ## `wf-orca-thermo-array`
 
@@ -796,12 +845,48 @@ Wall-clock cap on the monitor loop. ``0`` (default) = no cap, wait forever.
 
 Set ``OMPI_MCA_btl=^openib`` to silence the verbose Infiniband warnings on the Scripps cluster.
 
+#### `use_cache`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+Consult the nmr-data DftRun cache on entry. On hit, skip the SLURM DFT-opt array entirely — emit a manifest pointing at the parent ensemble's central-tree optimized xyzs so downstream nodes (orca_thermo_array etc.) see the geometries as if this node had just produced them. Set to false to always re-run.
+
+#### `force_recompute`
+
+- **Type:** `bool`
+- **Default:** `False`
+
+Force a fresh DFT-opt array even when the cache would hit. Useful when investigating ORCA non-determinism or after an ORCA version bump that should change the optimized geometries.
+
 #### `singlepoint_keywords`
 
 - **Type:** `str`
 - **Default:** `"wB97M-V def2-TZVPP TightSCF DEFGRID3"`
 
 ORCA simple-input line for the high-level SP appended after the freq job via ``$new_job``. Combined with ``keywords`` (low-level freq), the downstream thermo aggregator computes a composite Gibbs energy. Set to ``none`` (or any of ``null``, ``auto``, ``""``) to disable the SP step entirely — the run degrades to pure freq+thermo at ``keywords``. For combobox widgets in the GUI use the literal string ``none`` rather than an empty option, since the engine drops empty tag tokens before they reach this node.
+
+#### `temperature_k`
+
+- **Type:** `float`
+- **Default:** `298.15`
+- **Min:** `0.0`
+
+Temperature (K) at which the thermochemistry is evaluated. Injected into ORCA's ``%freq Temp`` block so the printed thermal corrections (H_corr, TS, …) are computed at this T, and also used to build the v6.5 ThermoRun + PredictedRun cache keys at node entry. Must match ``thermo_aggregate.temperature_k`` downstream — wire a shared tag node into both ports when overriding, or the downstream Boltzmann math will use a different T than the ORCA freq calc.
+
+#### `use_cache`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+Consult the nmr-data ThermoRun + PredictedRun caches on entry. On hit, skip the whole SLURM array — decompress central-tree .out files into a local task_dir tree so thermo_aggregate + nmr_aggregate downstream walk them transparently. Set to false to always re-run the freq+SP and NMR jobs.
+
+#### `force_recompute`
+
+- **Type:** `bool`
+- **Default:** `False`
+
+Force a fresh SLURM array submission even when the cache would hit. Useful when investigating ORCA non-determinism or after a functional-alias bug fix that should change the values written to the database.
 
 #### Section: nmr
 
@@ -890,6 +975,20 @@ ORCA nuclei selectors for the J-coupling block. Accepts either a list (JSON conf
 - **Default:** `"TightSCF"`
 
 Extra simple-input fragment applied to each NMR job (alongside ``! NMR``). ``TightSCF`` keeps the SCF thresholds uniform with the freq/SP jobs.
+
+#### `auto_heteronuclear`
+
+- **Type:** `bool`
+- **Default:** `True`
+
+When true (default), scan the upstream geometry for ¹⁹F and ³¹P; append ``"all F"`` / ``"all P"`` to ``coupling_pairs`` so the ORCA J-coupling job computes the cross-element couplings needed for the H/C simulated spectra to show realistic heteronuclear splitting (¹H-¹⁹F, ¹³C-³¹P, etc.). Set to false to force decoupled-spectrum semantics: only the operator-supplied ``coupling_pairs`` entries are used.
+
+#### `system_class`
+
+- **Type:** `str`
+- **Default:** `"auto"`
+
+Chemistry class profile for the NMR shielding + coupling jobs. ``auto`` scans the input geometry for heavy-element triggers and picks the matching profile (currently: Pd -> 'organopd', else 'organic'). The 'organopd' profile prepends ``ZORA`` to NMR keyword lines and swaps the default shielding/coupling bases to ``def2-ZORA-TZVPP`` so HALA contributions on H/C near Pd are captured correctly. Explicit operator-set bases pass through unchanged.
 
 ## `wf-prism`
 
