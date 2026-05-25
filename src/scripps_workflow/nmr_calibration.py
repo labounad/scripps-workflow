@@ -66,19 +66,32 @@ NMR_CALIBRATION: dict[tuple[str, str, str, str], dict[str, Any]] = {
         "slope": -1.0698,
         "intercept": 31.8447,
         "source": "cheshire (Wiitala/Hoye/Cramer 2006)",
-        "valid_range_ppm": (0.0, 12.0),
+        "valid_range_ppm": (-2.0, 14.0),
     },
     ("WP04", "6-311++G(2d,p)", "PCM_CHCl3_DELTA50", "1H"): {
         "slope": -1.0311,
         "intercept": 32.2654,
         "source": "DELTA50 high-accuracy: GIAO-PCM-WP04/6-311++G(2d,p)//PCM-B3LYP-D3/6-311G(d,p)",
-        "valid_range_ppm": (0.0, 12.0),
+        "valid_range_ppm": (-2.0, 14.0),
     },
+    # ¹³C default: lab-fitted recalibration of cheshire's slope/intercept
+    # against organopalladium experimental data (R²=0.9986, RMSE=1.51 ppm
+    # on the original fit set). Composed from the cheshire baseline
+    # (slope=-1.0501, intercept=187.25) plus the residual linear fit
+    # δ_exp ≈ 1.073598 · δ_pred + 10.651605:
+    #
+    #     slope_new     = -1.0501 / 1.073598            = -0.9781
+    #     intercept_new = 187.25  - slope_new × 10.6516 = 197.67
+    #
+    # Replaces the cheshire default, which had systematic affine bias on
+    # this lab's Pd-containing test set. To force the original cheshire
+    # row, override solvent to e.g. ``CHCl3_CHESHIRE_2006`` (same
+    # solvent-token-as-discriminator trick used for the DELTA50 ¹H entry).
     ("wB97X-D", "6-31G(d,p)", "CHCl3", "13C"): {
-        "slope": -1.0501,
-        "intercept": 187.25,
-        "source": "cheshire",
-        "valid_range_ppm": (0.0, 220.0),
+        "slope": -0.9781,
+        "intercept": 197.67,
+        "source": "labounad 2026 (organopd recalibration; baseline=cheshire)",
+        "valid_range_ppm": (-20.0, 240.0),
     },
     ("mPW1PW91", "pcJ-2", "CHCl3", "1H-1H_J"): {
         "slope": 0.9105,

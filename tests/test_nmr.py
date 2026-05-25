@@ -125,7 +125,9 @@ class TestLookupCalibration:
             solvent="CHCl3", nucleus="13C",
         )
         assert cal is not None
-        assert cal["slope"] == pytest.approx(-1.0501)
+        # ¹³C default is the labounad 2026 recalibration of cheshire
+        # (slope_old/1.073598). Bump if the recalibration ever shifts.
+        assert cal["slope"] == pytest.approx(-0.9781)
 
     def test_miss_returns_none(self):
         assert lookup_calibration(
@@ -472,7 +474,9 @@ class TestNmrAggregateHappyPath:
             n_conformers=2,
             weights=[0.5, 0.5],
             h_shieldings=[(1, "H", 29.7051, 5.0), (2, "H", 30.1, 5.0)],
-            c_shieldings=[(0, "C", 61.238, 12.0)],
+            # σ chosen so the labounad-2026 ¹³C calibration maps it to
+            # δ = 120 ppm: σ = 120 × -0.9781 + 197.67 = 80.298.
+            c_shieldings=[(0, "C", 80.298, 12.0)],
             couplings=[(1, 2, "H", "H", 7.5)],
         )
         m = _run_aggregate(tmp_path, up)
@@ -495,7 +499,7 @@ class TestNmrAggregateHappyPath:
         # δ = (29.7051 − 31.8447) / -1.0698 ≈ 2.0
         assert float(h1["delta_predicted_ppm"]) == pytest.approx(2.0, abs=1e-3)
         c0 = next(r for r in rows if r["atom_index"] == "0")
-        # δ = (61.238 − 187.25) / -1.0501 ≈ 120.0
+        # δ = (80.298 − 197.67) / -0.9781 ≈ 120.0 (labounad 2026 ¹³C cal)
         assert float(c0["delta_predicted_ppm"]) == pytest.approx(120.0, abs=1e-2)
 
         # Couplings CSV: one H-H pair, scaled with mPW1PW91 / pcJ-2.
@@ -547,7 +551,7 @@ class TestNmrAggregateHHContract:
             n_conformers=1,
             weights=[1.0],
             h_shieldings=h_rows,
-            c_shieldings=[(0, "C", 61.238, 12.0)],
+            c_shieldings=[(0, "C", 80.298, 12.0)],
             couplings=[
                 (1, 2, "H", "H", 7.5),
                 (3, 4, "H", "H", 7.7),
@@ -588,7 +592,7 @@ class TestNmrAggregateHHContract:
             n_conformers=1,
             weights=[1.0],
             h_shieldings=[(1, "H", 29.7, 5.0), (2, "H", 29.8, 5.0)],
-            c_shieldings=[(0, "C", 61.238, 12.0)],
+            c_shieldings=[(0, "C", 80.298, 12.0)],
             couplings=[],  # no pairs in orca_nmr_j.out
         )
         m = _run_aggregate(tmp_path, up)
