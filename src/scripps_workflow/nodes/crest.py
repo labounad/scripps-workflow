@@ -767,7 +767,70 @@ class CrestConformerSearch(Node):
         if not ctx.manifest.artifacts.get("xyz"):
             ctx.fail("no_best_xyz_artifact_produced")
 
+        # ---- ensemble self-registration to nmr-data ------------------
+        # Fresh CREST run succeeded → register the ensemble row + copy
+        # xtb-level conformer xyzs into the central tree, so a future
+        # cache check finds them. Gated on use_cache so operators have
+        # a single knob to fully disable cache integration. Skipped
+        # silently if compute failed or upstream lacks SMILES.
+        if ctx.manifest.ok and cfg.get("use_cache", True):
+            self._maybe_register_ensemble(ctx, cfg)
+
     # -------------------- helpers --------------------
+
+    def _maybe_register_ensemble(
+        self, ctx: NodeContext, cfg: dict[str, Any]
+    ) -> None:
+        """Self-register this CREST ensemble to nmr-data, best-effort.
+
+        Build the cache key the same way the read-side check does
+        (``build_crest_ensemble_key``), read the conformer records back
+        out of the manifest (so the copy step has source xyz paths plus
+        ``rel_energy_kcal`` for the sidecar), and delegate to the
+        Node base-class helper. The helper handles env / import / DB
+        failure modes and stashes the result under
+        ``manifest.inputs.registry.ensemble``.
+        """
+        if not _HAS_NMR_DATA:
+            logging_utils.log_info(
+                f"crest registry: nmr_data not importable "
+                f"({_NMR_DATA_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        if not _HAS_RDKIT:
+            logging_utils.log_info(
+                f"crest registry: rdkit not importable "
+                f"({_RDKIT_IMPORT_ERROR}), skipping registration"
+            )
+            return
+        smiles = _find_upstream_smiles(ctx)
+        if not smiles:
+            logging_utils.log_info(
+                "crest registry: no SMILES in upstream chain, "
+                "skipping registration"
+            )
+            return
+        try:
+            ensemble_key = _build_ensemble_key(cfg, smiles)
+        except Exception as e:
+            logging_utils.log_warn(
+                f"crest registry: ensemble-key build failed, "
+                f"skipping registration: {type(e).__name__}: {e}"
+            )
+            return
+        if ensemble_key is None:
+            return
+
+        conformer_records = list(
+            ctx.manifest.artifacts.get("conformers", []) or []
+        )
+        self._try_register_to_nmr_data(
+            "ensemble",
+            ctx=ctx,
+            smiles=smiles,
+            ensemble_key=ensemble_key,
+            conformer_records=conformer_records,
+        )
 
     def _maybe_emit_cached_manifest(
         self, ctx: NodeContext, cfg: dict[str, Any]
