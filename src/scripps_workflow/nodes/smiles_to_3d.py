@@ -12,9 +12,10 @@ Config keys (all key=value tokens, or one JSON object):
                                     ``[A-Za-z0-9._-]``; spaces become ``_``;
                                     empty/illegal → ``molecule``.
     opt                  (optional)  Geometry optimization: ``none|uff|mmff``.
-                                    Default ``mmff`` (falls back to UFF if
-                                    MMFF parameters are unavailable for the
-                                    molecule).
+                                    Default ``mmff`` runs MMFF only when
+                                    parameters are available for every atom;
+                                    otherwise RDKit force-field cleanup is
+                                    skipped rather than falling back to UFF.
     seed                 (optional)  ETKDG random seed base. Default 0.
     max_embed_attempts   (optional)  How many seeds to try with deterministic
                                     coords before falling back to random
@@ -184,8 +185,10 @@ def build_3d_mol(
         * ``none`` — skip the cleanup step.
         * ``uff`` — UFF optimization with ``max_opt_iters`` cap.
         * ``mmff`` — MMFF if parameters are available for every atom in the
-          molecule (RDKit's ``MMFFHasAllMoleculeParams``); otherwise falls
-          back to UFF. Common for organics with weird heteroatoms.
+          molecule (RDKit's ``MMFFHasAllMoleculeParams``); otherwise skip
+          RDKit force-field cleanup. This is the default because UFF fallback
+          can badly distort metal complexes or molecules with unsupported
+          atom types.
 
     The function returns the RDKit ``Mol`` with one embedded conformer. It
     is the caller's job to turn that into a coordinate file; see
@@ -224,16 +227,63 @@ def build_3d_mol(
     if opt_norm not in {"none", "uff", "mmff"}:
         raise ValueError(f"opt must be one of: none, uff, mmff (got {opt!r})")
 
-    if opt_norm == "mmff":
-        if _AllChem.MMFFHasAllMoleculeParams(mol):
-            _AllChem.MMFFOptimizeMolecule(mol, maxIters=int(max_opt_iters))
-        else:
-            _AllChem.UFFOptimizeMolecule(mol, maxIters=int(max_opt_iters))
-    elif opt_norm == "uff":
-        _AllChem.UFFOptimizeMolecule(mol, maxIters=int(max_opt_iters))
-    # opt_norm == "none" is intentionally a no-op.
+    _apply_forcefield_cleanup(
+        mol,
+        opt=opt_norm,
+        max_opt_iters=int(max_opt_iters),
+    )
 
     return mol
+
+
+def _apply_forcefield_cleanup(
+    mol: Any,
+    *,
+    opt: str,
+    max_opt_iters: int,
+) -> str:
+    """Apply the requested RDKit force-field cleanup to an embedded molecule.
+
+    Returns a short method label for tests/logging:
+
+    * ``"none"`` when cleanup was explicitly disabled.
+    * ``"mmff"`` when MMFF was actually run.
+    * ``"mmff_skipped_missing_params"`` when ``opt=mmff`` but RDKit reports
+      incomplete MMFF coverage. This is intentionally *not* a UFF fallback,
+      because UFF cleanup can severely distort metal-containing complexes.
+    * ``"uff"`` when UFF was explicitly requested.
+    """
+    assert _AllChem is not None
+
+    opt_norm = (opt or "").lower().strip()
+    if opt_norm == "none":
+        return "none"
+
+    if opt_norm == "mmff":
+        try:
+            has_mmff = bool(_AllChem.MMFFHasAllMoleculeParams(mol))
+        except Exception as exc:
+            logging_utils.log_info(
+                "smiles_to_3d: MMFF parameter check failed; "
+                f"skipping RDKit force-field cleanup ({exc})"
+            )
+            return "mmff_skipped_missing_params"
+
+        if has_mmff:
+            _AllChem.MMFFOptimizeMolecule(mol, maxIters=int(max_opt_iters))
+            return "mmff"
+
+        logging_utils.log_info(
+            "smiles_to_3d: MMFF parameters unavailable for at least one atom; "
+            "skipping RDKit force-field cleanup instead of falling back to UFF"
+        )
+        return "mmff_skipped_missing_params"
+
+    if opt_norm == "uff":
+        _AllChem.UFFOptimizeMolecule(mol, maxIters=int(max_opt_iters))
+        return "uff"
+
+    raise ValueError(f"opt must be one of: none, uff, mmff (got {opt!r})")
 
 
 def mol_to_xyz_block(mol: Any, comment: str = "") -> str:
@@ -314,9 +364,11 @@ SCHEMA = NodeSchema(
             choices=("none", "uff", "mmff"),
             coercer=_opt_coercer,
             description=(
-                "Geometry optimization mode. ``mmff`` (default) falls "
-                "back to UFF automatically if MMFF parameters aren't "
-                "available for the molecule."
+                "Geometry optimization mode. ``mmff`` (default) runs "
+                "MMFF only when parameters are available for every atom; "
+                "otherwise RDKit force-field cleanup is skipped rather "
+                "than falling back to UFF. Use ``uff`` only when you "
+                "explicitly want UFF cleanup."
             ),
         ),
         ConfigField(

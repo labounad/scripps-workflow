@@ -1096,7 +1096,7 @@ Output filename stem. Sanitized to ``[A-Za-z0-9._-]``; spaces become ``_``. Whit
 - **Default:** `"mmff"`
 - **Choices:** `none`, `uff`, `mmff`
 
-Geometry optimization mode. ``mmff`` (default) falls back to UFF automatically if MMFF parameters aren't available for the molecule.
+Geometry optimization mode. ``mmff`` (default) runs MMFF only when parameters are available for every atom; otherwise RDKit force-field cleanup is skipped rather than falling back to UFF. Use ``uff`` only when you explicitly want UFF cleanup.
 
 #### `seed`
 

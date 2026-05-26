@@ -4,7 +4,7 @@
 Pipeline (left -> right):
 
     [SMILES widget]
-        -> wf-embed                 (RDKit ETKDG + MMFF)
+        -> wf-embed                 (RDKit ETKDG + optional MMFF)
         -> wf-xtb                   (xTB pre-opt)
         -> wf-crest                 (conformer search)
         -> wf-prism                 (conformer pruning)

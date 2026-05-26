@@ -32,6 +32,7 @@ import pytest
 from scripps_workflow.nodes import smiles_to_3d as s23
 from scripps_workflow.nodes.smiles_to_3d import (
     SmilesTo3D,
+    _apply_forcefield_cleanup,
     _unique_xyz_path,
     sanitize_filename,
 )
@@ -150,6 +151,76 @@ class TestUniqueXyzPath:
             (tmp_path / n).write_text("x")
         p = _unique_xyz_path(tmp_path, "benzene")
         assert p.name == "benzene_4.xyz"
+
+
+# --------------------------------------------------------------------
+# Force-field cleanup dispatch
+# --------------------------------------------------------------------
+
+
+class _FakeAllChemOptimizer:
+    def __init__(
+        self,
+        *,
+        has_mmff: bool = True,
+        mmff_check_error: Exception | None = None,
+    ):
+        self.has_mmff = has_mmff
+        self.mmff_check_error = mmff_check_error
+        self.calls: list[tuple[str, int]] = []
+
+    def MMFFHasAllMoleculeParams(self, mol):
+        if self.mmff_check_error is not None:
+            raise self.mmff_check_error
+        return self.has_mmff
+
+    def MMFFOptimizeMolecule(self, mol, *, maxIters):
+        self.calls.append(("mmff", int(maxIters)))
+        return 0
+
+    def UFFOptimizeMolecule(self, mol, *, maxIters):
+        self.calls.append(("uff", int(maxIters)))
+        return 0
+
+
+class TestForceFieldCleanupDispatch:
+    def test_default_mmff_runs_mmff_when_parameters_are_complete(self, monkeypatch):
+        fake = _FakeAllChemOptimizer(has_mmff=True)
+        monkeypatch.setattr(s23, "_AllChem", fake)
+
+        method = _apply_forcefield_cleanup(object(), opt="mmff", max_opt_iters=123)
+
+        assert method == "mmff"
+        assert fake.calls == [("mmff", 123)]
+
+    def test_default_mmff_skips_cleanup_when_parameters_are_missing(self, monkeypatch):
+        fake = _FakeAllChemOptimizer(has_mmff=False)
+        monkeypatch.setattr(s23, "_AllChem", fake)
+
+        method = _apply_forcefield_cleanup(object(), opt="mmff", max_opt_iters=123)
+
+        assert method == "mmff_skipped_missing_params"
+        assert fake.calls == []
+
+    def test_default_mmff_skips_cleanup_when_parameter_check_errors(self, monkeypatch):
+        fake = _FakeAllChemOptimizer(
+            mmff_check_error=RuntimeError("unsupported atom type")
+        )
+        monkeypatch.setattr(s23, "_AllChem", fake)
+
+        method = _apply_forcefield_cleanup(object(), opt="mmff", max_opt_iters=123)
+
+        assert method == "mmff_skipped_missing_params"
+        assert fake.calls == []
+
+    def test_explicit_uff_still_runs_uff(self, monkeypatch):
+        fake = _FakeAllChemOptimizer(has_mmff=False)
+        monkeypatch.setattr(s23, "_AllChem", fake)
+
+        method = _apply_forcefield_cleanup(object(), opt="uff", max_opt_iters=123)
+
+        assert method == "uff"
+        assert fake.calls == [("uff", 123)]
 
 
 # --------------------------------------------------------------------
