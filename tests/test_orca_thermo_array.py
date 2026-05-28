@@ -527,13 +527,16 @@ class TestSystemClassProfileBasisSwap:
         assert cfg["shielding_basis_h"] == "def2-ZORA-TZVPP"
 
     def test_explicit_organic_on_pd_geometry_keeps_organic_bases(self, tmp_path):
-        """Operator override beats auto-detection."""
+        """Operator override beats auto-detection, when paired with
+        ``on_uncovered_heavy_metal=warn`` (the default ``fail`` would
+        raise — see :class:`TestOnUncoveredHeavyMetal`)."""
         ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=True)
         cfg = {
             "system_class": "organic",
             "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
             "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
             "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
+            "on_uncovered_heavy_metal": "warn",
         }
         resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
         assert resolved == "organic"
@@ -566,6 +569,269 @@ class TestSystemClassProfileBasisSwap:
         }
         with pytest.raises(ValueError, match="unknown system_class"):
             ota._resolve_system_class_profile(cfg, ctx=ctx)
+
+
+class TestOnUncoveredHeavyMetal:
+    """Tier 2 element + explicit ``system_class=organic``: the
+    ``on_uncovered_heavy_metal`` knob controls fail / warn /
+    auto-promote behavior. Default is ``fail``."""
+
+    def _ctx_with_upstream_xyzs(self, tmp_path: Path, *, heavy_metal: str = "Pd"):
+        from scripps_workflow.node import NodeContext
+
+        xyz = tmp_path / "input.xyz"
+        xyz.write_text(
+            f"2\nfoo\n{heavy_metal} 0 0 0\nC 1.8 0 0\n",
+            encoding="utf-8",
+        )
+        upstream = Manifest.skeleton(step="orca_dft_array", cwd=tmp_path)
+        upstream.artifacts["conformers"] = [
+            {"path_abs": str(xyz.resolve()), "index": 1}
+        ]
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        return NodeContext(
+            cwd=tmp_path,
+            outputs_dir=outputs_dir,
+            manifest_path=outputs_dir / "manifest.json",
+            raw_argv=[],
+            config={},
+            upstream_pointer=None,
+            upstream_manifest=upstream,
+            manifest=Manifest.skeleton(step="orca_thermo_array", cwd=tmp_path),
+            started_at_unix=0,
+            started_at_perf=0.0,
+        )
+
+    def _organic_cfg(self, **over):
+        cfg = {
+            "system_class": "organic",
+            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
+            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
+            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
+        }
+        cfg.update(over)
+        return cfg
+
+    def test_fail_policy_raises(self, tmp_path):
+        ctx = self._ctx_with_upstream_xyzs(tmp_path)
+        cfg = self._organic_cfg(on_uncovered_heavy_metal="fail")
+        with pytest.raises(ValueError, match="Tier 2 element"):
+            ota._resolve_system_class_profile(cfg, ctx=ctx)
+
+    def test_default_policy_is_fail(self, tmp_path):
+        ctx = self._ctx_with_upstream_xyzs(tmp_path)
+        cfg = self._organic_cfg()    # no on_uncovered_heavy_metal set
+        with pytest.raises(ValueError, match="Tier 2 element"):
+            ota._resolve_system_class_profile(cfg, ctx=ctx)
+
+    def test_warn_policy_continues(self, tmp_path, caplog):
+        ctx = self._ctx_with_upstream_xyzs(tmp_path)
+        cfg = self._organic_cfg(on_uncovered_heavy_metal="warn")
+        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
+        assert resolved == "organic"
+        # Bases unchanged — organic profile, no swap.
+        assert cfg["shielding_basis_h"] == ota.DEFAULT_SHIELDING_BASIS_H
+
+    def test_auto_switch_promotes_to_organopd_for_pd(self, tmp_path):
+        ctx = self._ctx_with_upstream_xyzs(tmp_path, heavy_metal="Pd")
+        cfg = self._organic_cfg(on_uncovered_heavy_metal="auto_switch_profile")
+        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
+        assert resolved == "organopd"
+        assert cfg["system_class"] == "organopd"
+        # Bases got swapped after promotion.
+        assert cfg["shielding_basis_h"] == "def2-ZORA-TZVPP"
+
+    def test_auto_switch_promotes_to_organopt_for_pt(self, tmp_path):
+        ctx = self._ctx_with_upstream_xyzs(tmp_path, heavy_metal="Pt")
+        cfg = self._organic_cfg(on_uncovered_heavy_metal="auto_switch_profile")
+        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
+        assert resolved == "organopt"
+
+    def test_no_tier2_in_geometry_is_noop(self, tmp_path):
+        """Pure organic geometry — the policy never fires."""
+        from scripps_workflow.node import NodeContext
+
+        xyz = tmp_path / "input.xyz"
+        xyz.write_text("2\nfoo\nC 0 0 0\nC 1.5 0 0\n", encoding="utf-8")
+        upstream = Manifest.skeleton(step="orca_dft_array", cwd=tmp_path)
+        upstream.artifacts["conformers"] = [
+            {"path_abs": str(xyz.resolve()), "index": 1}
+        ]
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        ctx = NodeContext(
+            cwd=tmp_path,
+            outputs_dir=outputs_dir,
+            manifest_path=outputs_dir / "manifest.json",
+            raw_argv=[],
+            config={},
+            upstream_pointer=None,
+            upstream_manifest=upstream,
+            manifest=Manifest.skeleton(step="orca_thermo_array", cwd=tmp_path),
+            started_at_unix=0,
+            started_at_perf=0.0,
+        )
+        cfg = self._organic_cfg(on_uncovered_heavy_metal="fail")
+        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
+        assert resolved == "organic"
+
+
+class TestBuildNmrInputFilesCoverage:
+    """``build_nmr_input_files`` injects ``%basis newgto`` blocks when
+    given an ``elements`` set containing atoms uncovered by the
+    configured basis. Without ``elements`` (legacy callers), no
+    coverage check runs and inputs render exactly as before."""
+
+    def _cfg(self, **over):
+        base = {
+            "nprocs": 8, "maxcore": 4000, "charge": 0, "smd_solvent": None,
+            "solvent": "CHCl3", "run_shielding_h": True,
+            "run_shielding_c": True, "run_couplings": True,
+            "shielding_method_h": "WP04",
+            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
+            "shielding_method_c": "wB97X-D",
+            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
+            "coupling_method": "mPW1PW91",
+            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
+            "coupling_pairs": ["all H"],
+            "coupling_thresh_angstrom": 8.0,
+            "nmr_aux_keywords": "TightSCF",
+            "nmr_keywords_prefix": "",
+            "heavy_atom_basis": ota.DEFAULT_HEAVY_ATOM_BASIS,
+        }
+        base.update(over)
+        return base
+
+    def test_no_elements_arg_is_legacy_behavior(self):
+        """Passing ``elements=None`` (the default) disables the coverage
+        check entirely — rendered input must match the old shape."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1,
+        )
+        for text in files.values():
+            assert "newgto" not in text
+
+    def test_organic_elements_organic_basis_is_noop(self):
+        """C/H/N/O molecule in organic basis: no %basis block injected."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1,
+            elements={"C", "H", "N", "O"},
+        )
+        for text in files.values():
+            assert "newgto" not in text
+
+    def test_bromine_supplements_h_and_j_but_not_c(self):
+        """The aryl-bromide case. Per-basis coverage:
+          * H basis (6-311++G(2d,p)) — diffuse Pople, stops at Ar.
+            Br uncovered → supplement.
+          * C basis (6-31G(d,p)) — Pople H–Kr. Br covered → no block.
+          * J basis (pcJ-2) — organic main-group. Br uncovered → supplement.
+        """
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1,
+            elements={"C", "H", "Br"},
+        )
+        h_text = files[ota.ORCA_NMR_H_INP_NAME]
+        c_text = files[ota.ORCA_NMR_C_INP_NAME]
+        j_text = files[ota.ORCA_NMR_J_INP_NAME]
+        assert 'newgto Br "def2-TZVPP" end' in h_text
+        assert "newgto" not in c_text
+        assert 'newgto Br "def2-TZVPP" end' in j_text
+
+    def test_iodine_supplements_all_three_pople_jobs(self):
+        """I (Z=53) sits above Kr — outside every Pople / pcJ coverage
+        set. All three NMR inputs need supplementation."""
+        cfg = self._cfg()
+        files = ota.build_nmr_input_files(
+            cfg=cfg, multiplicity=1, elements={"C", "H", "I"},
+        )
+        for name in (
+            ota.ORCA_NMR_H_INP_NAME,
+            ota.ORCA_NMR_C_INP_NAME,
+            ota.ORCA_NMR_J_INP_NAME,
+        ):
+            assert 'newgto I "def2-TZVPP" end' in files[name]
+
+    def test_supplement_block_appears_before_eprnmr(self):
+        """The %basis block must appear pre-xyz (before %eprnmr can
+        come post-xyz). Sanity check by string position."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1, elements={"C", "H", "Br"},
+        )
+        j_text = files[ota.ORCA_NMR_J_INP_NAME]
+        # %basis comes before * xyzfile, %eprnmr comes after.
+        assert j_text.index("%basis") < j_text.index("* xyzfile")
+        assert j_text.index("* xyzfile") < j_text.index("%eprnmr")
+
+    def test_custom_heavy_atom_basis_threads_through(self):
+        """Operator-set ``heavy_atom_basis`` is used for the supplement."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(heavy_atom_basis="SARC-ZORA-TZVPP"),
+            multiplicity=1,
+            elements={"C", "H", "Br"},
+        )
+        j_text = files[ota.ORCA_NMR_J_INP_NAME]
+        assert 'newgto Br "SARC-ZORA-TZVPP" end' in j_text
+
+
+class TestComputeBasisFingerprints:
+    """``compute_basis_fingerprints`` returns supplemented strings
+    suitable for set_inputs / cache fingerprint use. The base cfg is
+    NOT mutated."""
+
+    def test_organic_elements_returns_empty_dict(self):
+        cfg = {
+            "shielding_basis_h": "6-311++G(2d,p)",
+            "shielding_basis_c": "6-31G(d,p)",
+            "coupling_basis": "pcJ-2",
+            "heavy_atom_basis": "def2-TZVPP",
+        }
+        fps = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "F"})
+        assert fps == {}
+
+    def test_bromine_supplementation_per_basis(self):
+        """Br is the canonical Tier 1 case. Coverage outcome depends on
+        which basis is on each NMR job:
+
+          * 6-311++G(2d,p) — diffuse Pople, stops at Ar. Br uncovered.
+          * 6-31G(d,p)    — Pople H–Kr. Br covered.
+          * pcJ-2         — organic main-group. Br uncovered.
+        """
+        cfg = {
+            "shielding_basis_h": "6-311++G(2d,p)",
+            "shielding_basis_c": "6-31G(d,p)",
+            "coupling_basis": "pcJ-2",
+            "heavy_atom_basis": "def2-TZVPP",
+        }
+        fps = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "Br"})
+        assert fps["shielding_basis_h"] == "6-311++G(2d,p)+def2-TZVPP/heavy"
+        assert "shielding_basis_c" not in fps   # 6-31G(d,p) covers Br
+        assert fps["coupling_basis"] == "pcJ-2+def2-TZVPP/heavy"
+
+    def test_iodine_supplements_all_three(self):
+        """I (Z=53) is above Kr — outside every Pople / pcJ set."""
+        cfg = {
+            "shielding_basis_h": "6-311++G(2d,p)",
+            "shielding_basis_c": "6-31G(d,p)",
+            "coupling_basis": "pcJ-2",
+            "heavy_atom_basis": "def2-TZVPP",
+        }
+        fps = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "I"})
+        for key in ("shielding_basis_h", "shielding_basis_c", "coupling_basis"):
+            assert key in fps
+            assert fps[key].endswith("+def2-TZVPP/heavy")
+
+    def test_cfg_is_not_mutated(self):
+        cfg = {
+            "shielding_basis_h": "6-311++G(2d,p)",
+            "shielding_basis_c": "6-31G(d,p)",
+            "coupling_basis": "pcJ-2",
+            "heavy_atom_basis": "def2-TZVPP",
+        }
+        snapshot = dict(cfg)
+        _ = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "Br"})
+        assert cfg == snapshot
 
 
 class TestBuildNmrInputFilesZora:

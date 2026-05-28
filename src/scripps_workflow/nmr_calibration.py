@@ -292,13 +292,24 @@ def lookup_calibration(
     Matching is case-insensitive after stripping leading/trailing
     whitespace, so e.g. ``"wb97x-d"`` matches ``"wB97X-D"``.
 
+    Heavy-atom supplemented basis names (``"6-31G(d,p)+def2-TZVPP/heavy"``)
+    are stripped back to their base form before lookup — the calibration
+    is for the calibrated light-atom basis, and per-element supplementation
+    on heavy atoms doesn't invalidate it (the supplement only acts on the
+    heavy atom itself, which isn't the calibrated nucleus). See
+    :func:`scripps_workflow.basis_coverage.extract_base_basis`.
+
     Returns ``None`` if no match — the aggregator decides whether to
     fall back to raw σ output or to surface a structured failure.
     """
+    # Local import to avoid an import cycle through the basis_coverage
+    # module (which is in src/scripps_workflow/ alongside this file).
+    from .basis_coverage import extract_base_basis
+
     src = table if table is not None else NMR_CALIBRATION
     key = (
         str(functional).strip(),
-        str(basis).strip(),
+        extract_base_basis(str(basis).strip()),
         str(solvent).strip(),
         str(nucleus).strip(),
     )

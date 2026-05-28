@@ -82,12 +82,48 @@ three flags to ``false`` to degrade back to a pure freq[+SP] run):
     coupling_thresh_angstrom  ``SpinSpinRThresh`` cap                  [8.0]
     nmr_aux_keywords          extra ``!`` tokens added to every NMR    ["TightSCF"]
                               job line
+    system_class              chemistry-class profile (organic /       ["auto"]
+                              organopd / organopt / organorh / ...);
+                              auto-detected from geometry
+    heavy_atom_basis          per-element ``%basis newgto`` supplement ["def2-TZVPP"]
+                              for Tier 1 heavy atoms (Br, I, Se, ...)
+                              uncovered by the configured basis
+    on_uncovered_heavy_metal  policy when Tier 2 metals (Pd, Pt, Rh,   ["fail"]
+                              ...) appear under a non-relativistic
+                              profile: ``fail``/``warn``/
+                              ``auto_switch_profile``
 
 Each enabled NMR job is appended after the freq+SP via ``$new_job``,
 producing a single ``orca_thermo.out`` containing every block. The
 matching :mod:`scripps_workflow.nodes.nmr_aggregate` reads back the
 shielding / coupling tables, Boltzmann-averages over the conformer
-ensemble, and applies the cheshire / Bally-Rablen linear scaling.
+ensemble, and applies the lab-fit / Bally-Rablen linear scaling.
+
+Heavy-atom basis coverage
+-------------------------
+The default shielding/coupling bases (6-311++G(2d,p), 6-31G(d,p),
+pcJ-2) don't define basis functions for elements past Kr / Ar / Cl
+respectively. The node addresses this in two layers:
+
+1. **Tier 1 — per-atom supplementation.** Light-heavy atoms (Br, I,
+   Se, Sn, ...) get a ``%basis newgto <Elem> "def2-TZVPP" end`` block
+   appended to each NMR input that needs it, leaving the calibrated
+   light-atom basis untouched. The supplement is auto-detected from
+   the upstream geometry by :mod:`scripps_workflow.basis_coverage`;
+   no operator action required for the common aryl-bromide /
+   selenoether / iodoaromatic case.
+2. **Tier 2 — full ZORA profile.** Transition-metal / lanthanide
+   elements (Pd, Pt, Rh, Ir, Au, Hg, ...) need a relativistic
+   Hamiltonian on the whole molecule. ``system_class=auto`` picks the
+   matching profile (``organopd``, ``organopt``, ...) automatically.
+   An explicit ``system_class=organic`` on a heavy-metal complex
+   triggers ``on_uncovered_heavy_metal`` policy (fails by default).
+
+The supplemented basis string is encoded into the cached basis
+identity (e.g. ``"6-31G(d,p)+def2-TZVPP/heavy"``) so the
+PredictedRun cache distinguishes supplemented runs from
+unsupplemented ones. The ORCA ``!`` line still carries the base
+basis name; supplementation is added via the ``%basis`` block.
 
 Ports the legacy ``orca_thermo_freq_array`` script onto the new
 framework, and extends it with the composite SP step. The on-disk
@@ -362,6 +398,32 @@ DEFAULT_NMR_AUX_KEYWORDS: str = "TightSCF"
 DEFAULT_COUPLING_PAIRS: tuple[str, ...] = ("all H",)
 DEFAULT_COUPLING_THRESH_ANGSTROM: float = 8.0
 
+#: Supplement basis attached per-element via ``%basis newgto`` for
+#: heavy atoms (Br, I, Se, ...) that the configured shielding /
+#: coupling basis doesn't cover. ``def2-TZVPP`` spans Z=1..86 with
+#: built-in ECPs for Z >= 37, matches the high-level SP recipe
+#: (:data:`DEFAULT_SINGLEPOINT_KEYWORDS`), and is the conservative
+#: default for organic + light-heavy systems.
+DEFAULT_HEAVY_ATOM_BASIS: str = "def2-TZVPP"
+
+#: Policy for handling Tier 2 elements (transition metals,
+#: lanthanides) detected in the molecule but NOT covered by the
+#: resolved profile's basis. Three modes:
+#:
+#:   - ``"fail"`` (default): raise at config-resolution time. Refuses
+#:     to silently run a half-baked NMR job on a heavy-metal complex
+#:     where HALA / scalar-relativistic effects would dominate.
+#:   - ``"warn"``: log a warning and continue. The job will likely
+#:     abort at ORCA read time or produce nonsensical shieldings.
+#:   - ``"auto_switch_profile"``: promote ``system_class`` to the
+#:     matching Tier 2 profile (e.g. ``organopd`` for Pd). Mutates
+#:     the resolved cfg so downstream cache fingerprints reflect the
+#:     promoted class.
+DEFAULT_ON_UNCOVERED_HEAVY_METAL: str = "fail"
+_ON_UNCOVERED_HEAVY_METAL_CHOICES: tuple[str, ...] = (
+    "fail", "warn", "auto_switch_profile",
+)
+
 
 # --------------------------------------------------------------------
 # System-class profiles for the NMR shielding + coupling jobs
@@ -385,19 +447,50 @@ DEFAULT_COUPLING_THRESH_ANGSTROM: float = 8.0
 #
 #   organic   — current default. Organic basis sets (6-311++G(2d,p)
 #               on H, 6-31G(d,p) on C, pcJ-2 for J). No relativistic
-#               Hamiltonian. Matches the cheshire + Bally/Rablen
+#               Hamiltonian. Matches the lab-fit + Bally/Rablen
 #               calibration tuples.
 #   organopd  — for Pd-containing molecules. Switches all three NMR
 #               bases to def2-ZORA-TZVPP and prepends ``ZORA`` to the
 #               NMR job's ``!`` line so ORCA enables scalar
 #               relativistic with HALA contributions.
+#   organopt / organorh / organoir / organoau / organohg /
+#   organoru / organoag / organomo / organore / organoos / organow
+#               — same content as ``organopd``, distinct profile names
+#               so manifest provenance + future per-metal calibration
+#               tables (TODO #89) can fork without renaming. Auto-
+#               detected by :func:`detect_system_class` from the
+#               element-trigger map below.
+#   organotm  — generic transition-metal umbrella. Auto-detection
+#               falls here for Tier 2 elements without a dedicated
+#               entry (e.g. Tc, Cd, mixed-metal clusters,
+#               lanthanides).
 #
-# Adding more profiles (organotm_3d, organotm_4d, etc.) is purely
-# additive — register a new entry in this dict + extend
-# :func:`detect_system_class` if you want auto-detection for that
-# element class. The cache fingerprint for PredictedRun naturally
-# diverges between profiles because shielding_basis_* are part of
-# the PredictedRunKey payload — no schema change required.
+# Adding more profiles is purely additive — register a new entry in
+# this dict + extend :data:`_PROFILE_ELEMENT_TRIGGERS`. The cache
+# fingerprint for PredictedRun naturally diverges between profiles
+# because shielding_basis_* are part of the PredictedRunKey payload —
+# no schema change required.
+#
+# Tier 1 heavy atoms (Br, I, Se, ...) DO NOT need their own profile.
+# They're supplemented per-atom via ``%basis newgto`` blocks emitted
+# by :mod:`scripps_workflow.basis_coverage` — the calibrated light-
+# atom basis stays put. See ``heavy_atom_basis`` and
+# ``on_uncovered_heavy_metal`` config knobs.
+
+# ZORA / def2-ZORA-TZVPP — shared content for every Tier 2 profile.
+# Per-metal profile names exist as named handles for cache provenance
+# and operator-explicit configs (``system_class=organopt``, etc.),
+# but the underlying ORCA setup is identical: scalar-relativistic ZORA
+# Hamiltonian + all-electron def2 recontracted basis on every atom.
+# Different metals warrant the same TREATMENT; only the calibration
+# tuple may eventually differ per metal class (TODO #89, system_class
+# column on the calibration table).
+_TIER2_PROFILE_CONTENT: dict[str, Any] = {
+    "nmr_keywords_prefix": "ZORA",
+    "shielding_basis_h": "def2-ZORA-TZVPP",
+    "shielding_basis_c": "def2-ZORA-TZVPP",
+    "coupling_basis": "def2-ZORA-TZVPP",
+}
 
 SYSTEM_CLASS_PROFILES: dict[str, dict[str, Any]] = {
     "organic": {
@@ -406,12 +499,23 @@ SYSTEM_CLASS_PROFILES: dict[str, dict[str, Any]] = {
         "shielding_basis_c": DEFAULT_SHIELDING_BASIS_C,
         "coupling_basis": DEFAULT_COUPLING_BASIS,
     },
-    "organopd": {
-        "nmr_keywords_prefix": "ZORA",
-        "shielding_basis_h": "def2-ZORA-TZVPP",
-        "shielding_basis_c": "def2-ZORA-TZVPP",
-        "coupling_basis": "def2-ZORA-TZVPP",
-    },
+    # 4d transition-metal complexes.
+    "organopd": dict(_TIER2_PROFILE_CONTENT),
+    "organorh": dict(_TIER2_PROFILE_CONTENT),
+    "organoru": dict(_TIER2_PROFILE_CONTENT),
+    "organoag": dict(_TIER2_PROFILE_CONTENT),
+    "organomo": dict(_TIER2_PROFILE_CONTENT),
+    # 5d transition-metal complexes.
+    "organopt": dict(_TIER2_PROFILE_CONTENT),
+    "organoir": dict(_TIER2_PROFILE_CONTENT),
+    "organoau": dict(_TIER2_PROFILE_CONTENT),
+    "organohg": dict(_TIER2_PROFILE_CONTENT),
+    "organore": dict(_TIER2_PROFILE_CONTENT),
+    "organoos": dict(_TIER2_PROFILE_CONTENT),
+    "organow":  dict(_TIER2_PROFILE_CONTENT),
+    # Generic transition-metal umbrella for mixed or otherwise
+    # uncategorized Tier 2 elements (lanthanides, less-common metals).
+    "organotm": dict(_TIER2_PROFILE_CONTENT),
 }
 
 #: Recognized profile names. ``"auto"`` triggers detection; anything
@@ -422,8 +526,27 @@ SYSTEM_CLASSES_KNOWN: frozenset[str] = frozenset(SYSTEM_CLASS_PROFILES.keys())
 #: :func:`detect_system_class` to pick a profile from input geometry.
 #: First match wins, in dict-iteration order — keep more specific /
 #: heavier profiles first as new ones land.
+#:
+#: Coverage rule: every element in
+#: :data:`scripps_workflow.basis_coverage.TIER2_REQUIRES_RELATIVISTIC`
+#: SHOULD appear in some entry below; missing elements fall back to
+#: ``organotm`` via :func:`detect_system_class`'s default branch.
 _PROFILE_ELEMENT_TRIGGERS: dict[str, frozenset[str]] = {
+    # 4d (in periodic-table order, but iteration order doesn't matter
+    # since each element is unique to one profile).
     "organopd": frozenset({"Pd"}),
+    "organorh": frozenset({"Rh"}),
+    "organoru": frozenset({"Ru"}),
+    "organoag": frozenset({"Ag"}),
+    "organomo": frozenset({"Mo"}),
+    # 5d
+    "organopt": frozenset({"Pt"}),
+    "organoir": frozenset({"Ir"}),
+    "organoau": frozenset({"Au"}),
+    "organohg": frozenset({"Hg"}),
+    "organore": frozenset({"Re"}),
+    "organoos": frozenset({"Os"}),
+    "organow":  frozenset({"W"}),
 }
 
 
@@ -508,32 +631,34 @@ def detect_system_class(xyz_paths: list[Path]) -> str:
     """Scan input geometries for heavy-element triggers; return the
     matching :data:`SYSTEM_CLASS_PROFILES` key.
 
-    First-match-wins on the trigger dict. Returns ``"organic"`` when
-    no triggers fire. Reads at most the first few xyz files — the
-    element composition is the same across all conformers of one
-    molecule, so we don't need to scan a 50-conformer ensemble.
+    First-match-wins on the trigger dict. Tier 2 elements (transition
+    metals, lanthanides) without a dedicated profile fall back to the
+    generic ``organotm`` umbrella so the relativistic Hamiltonian
+    fires even for less-common metals. Returns ``"organic"`` when no
+    Tier 2 triggers fire.
+
+    Reads at most the first few xyz files — the element composition
+    is the same across all conformers of one molecule, so we don't
+    need to scan a 50-conformer ensemble.
 
     Robust to per-file read errors: a single unreadable xyz just gets
     skipped, the rest of the scan continues.
     """
-    elements_seen: set[str] = set()
-    for xyz in xyz_paths[:3]:
-        try:
-            text = xyz.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        # XYZ format: line 1 = atom count, line 2 = comment, lines 3+
-        # are ``Elem  x  y  z`` rows. We accept any whitespace-leading
-        # token as the element symbol; numbers / blank lines get
-        # filtered out naturally because they don't appear as keys in
-        # any trigger set.
-        for line in text.splitlines():
-            tokens = line.split()
-            if tokens:
-                elements_seen.add(tokens[0])
+    from ..basis_coverage import (
+        TIER2_REQUIRES_RELATIVISTIC,
+        scan_elements_from_xyz_paths,
+    )
+
+    elements_seen = scan_elements_from_xyz_paths(xyz_paths)
     for profile_name, triggers in _PROFILE_ELEMENT_TRIGGERS.items():
         if elements_seen & triggers:
             return profile_name
+    # No dedicated profile matched. If a Tier 2 element is still
+    # present (rare metal, lanthanide, ...), promote to the generic
+    # transition-metal umbrella so the run picks up ZORA + def2-ZORA
+    # treatment rather than silently failing on missing basis funcs.
+    if elements_seen & TIER2_REQUIRES_RELATIVISTIC:
+        return "organotm"
     return "organic"
 
 
@@ -573,12 +698,25 @@ def _resolve_system_class_profile(
     hold their organic defaults to the profile's value. Operator-
     supplied basis values pass through unchanged.
 
+    After profile selection, scans the upstream geometry for Tier 2
+    elements (transition metals, lanthanides). If any are present AND
+    the resolved profile is still ``organic`` (i.e. the operator
+    explicitly set ``system_class=organic`` despite a heavy metal in
+    the molecule), applies the ``on_uncovered_heavy_metal`` policy:
+    fail / warn / auto-promote to the matching Tier 2 profile.
+
     Returns the resolved class for logging convenience.
 
-    Raises :class:`ValueError` on an unknown class string. Auto-detect
-    failure (no upstream, can't read xyzs) falls back to ``"organic"``
-    — the conservative choice.
+    Raises :class:`ValueError` on an unknown class string or on a
+    Tier 2 element under ``on_uncovered_heavy_metal=fail``. Auto-
+    detect failure (no upstream, can't read xyzs) falls back to
+    ``"organic"`` — the conservative choice.
     """
+    from ..basis_coverage import (
+        TIER2_REQUIRES_RELATIVISTIC,
+        scan_elements_from_xyz_paths,
+    )
+
     raw = str(cfg.get("system_class", "auto")).strip().lower()
     if raw == "auto":
         resolved = detect_system_class(_upstream_xyz_paths(ctx))
@@ -596,6 +734,56 @@ def _resolve_system_class_profile(
             f"unknown system_class={raw!r}; expected 'auto' or one of "
             f"{sorted(SYSTEM_CLASSES_KNOWN)}"
         )
+
+    # Operator-set 'organic' + Tier 2 element in molecule = misconfig.
+    # Apply the on_uncovered_heavy_metal policy. (Skipped for 'auto'
+    # detections because detect_system_class already promotes — and
+    # skipped for any already-Tier-2 profile because those use ZORA +
+    # def2-ZORA-TZVPP which covers every heavy element anyway.)
+    if resolved == "organic":
+        elements_seen = scan_elements_from_xyz_paths(_upstream_xyz_paths(ctx))
+        tier2_present = sorted(elements_seen & TIER2_REQUIRES_RELATIVISTIC)
+        if tier2_present:
+            policy = str(
+                cfg.get(
+                    "on_uncovered_heavy_metal",
+                    DEFAULT_ON_UNCOVERED_HEAVY_METAL,
+                )
+            ).strip().lower()
+            if policy == "fail":
+                raise ValueError(
+                    f"system_class={resolved!r} but Tier 2 element(s) "
+                    f"{tier2_present!r} detected in upstream geometry. "
+                    "These need a relativistic Hamiltonian (ZORA) for "
+                    "accurate NMR. Set system_class=auto or pick a "
+                    "Tier 2 profile (e.g. 'organopd'), or override "
+                    "with on_uncovered_heavy_metal=warn / "
+                    "auto_switch_profile."
+                )
+            if policy == "warn":
+                logging_utils.log_warn(
+                    f"orca-thermo: system_class={resolved!r} but Tier 2 "
+                    f"element(s) {tier2_present!r} are present — NMR "
+                    "shieldings near these atoms will likely be "
+                    "inaccurate (no ZORA / def2-ZORA-TZVPP). Continuing "
+                    "per on_uncovered_heavy_metal=warn policy."
+                )
+            elif policy == "auto_switch_profile":
+                # Use the first detected Tier 2 element to pick a
+                # profile. Look it up in _PROFILE_ELEMENT_TRIGGERS;
+                # fall back to 'organotm' for unmapped elements.
+                promoted = "organotm"
+                for prof, triggers in _PROFILE_ELEMENT_TRIGGERS.items():
+                    if set(tier2_present) & triggers:
+                        promoted = prof
+                        break
+                logging_utils.log_warn(
+                    f"orca-thermo: system_class={resolved!r} but Tier 2 "
+                    f"element(s) {tier2_present!r} present; promoting "
+                    f"system_class to {promoted!r} per "
+                    "on_uncovered_heavy_metal=auto_switch_profile."
+                )
+                resolved = promoted
 
     profile = SYSTEM_CLASS_PROFILES[resolved]
     organic = SYSTEM_CLASS_PROFILES["organic"]
@@ -620,6 +808,7 @@ def build_nmr_input_files(
     cfg: dict[str, Any],
     multiplicity: int,
     xyz_filename: str = "input.xyz",
+    elements: set[str] | frozenset[str] | None = None,
 ) -> dict[str, str]:
     """Translate the NMR config knobs into standalone ORCA ``.inp`` files.
 
@@ -647,9 +836,24 @@ def build_nmr_input_files(
     config keys; functional aliases (e.g. ``WP04``, ``wB97X-D``) are
     resolved via :func:`scripps_workflow.orca.resolve_functional_alias`.
 
+    Args:
+        cfg: resolved config dict (system_class profile already
+            applied).
+        multiplicity: spin multiplicity (2S+1).
+        xyz_filename: filename for ``* xyzfile``.
+        elements: set of element symbols actually present in the
+            molecule. When provided, drives the basis-coverage check
+            via :mod:`scripps_workflow.basis_coverage`: heavy atoms
+            uncovered by the configured basis get a ``%basis newgto``
+            supplement using ``cfg['heavy_atom_basis']``. ``None``
+            (the default) disables the coverage check — useful for
+            unit-testing the function in isolation.
+
     Pure function — no I/O — so it's easy to unit-test against
     config dicts.
     """
+    from ..basis_coverage import compute_coverage_decision, format_basis_fingerprint
+
     files: dict[str, str] = {}
 
     aux = str(cfg.get("nmr_aux_keywords", DEFAULT_NMR_AUX_KEYWORDS)).strip()
@@ -661,6 +865,29 @@ def build_nmr_input_files(
     # Empty string for the organic default — no prefix added.
     prefix = (cfg.get("nmr_keywords_prefix") or "").strip()
     prefix_part = f"{prefix} " if prefix else ""
+
+    supplement_basis = (
+        cfg.get("heavy_atom_basis") or DEFAULT_HEAVY_ATOM_BASIS
+    )
+
+    def _coverage_blocks(basis: str) -> list[str]:
+        """Return ``%basis newgto`` blocks for elements not covered by
+        ``basis``. Logs warnings from the coverage decision. No-op when
+        ``elements`` is ``None`` (legacy / unit-test callers).
+        """
+        if elements is None:
+            return []
+        decision = compute_coverage_decision(
+            elements, basis=basis, supplement_basis=supplement_basis,
+        )
+        for w in decision.warnings:
+            logging_utils.log_warn(f"basis-coverage: {w}")
+        if decision.has_supplementation:
+            logging_utils.log_info(
+                f"basis-coverage: supplementing {decision.supplemented_elements!r} "
+                f"with {supplement_basis!r} over the {basis!r} base"
+            )
+        return decision.extra_blocks
 
     common = {
         "nprocs": cfg["nprocs"],
@@ -674,17 +901,19 @@ def build_nmr_input_files(
 
     if cfg.get("run_shielding_h"):
         h_method, h_extras = resolve_functional_alias(cfg["shielding_method_h"])
+        cov_blocks = _coverage_blocks(cfg["shielding_basis_h"])
         files[ORCA_NMR_H_INP_NAME] = make_orca_simple_input(
             keywords=f"{prefix_part}NMR {h_method} {cfg['shielding_basis_h']}{aux_suffix}",
-            extra_blocks=[*h_extras, nmr_shielding_block("all H")],
+            extra_blocks=[*cov_blocks, *h_extras, nmr_shielding_block("all H")],
             **common,
         )
 
     if cfg.get("run_shielding_c"):
         c_method, c_extras = resolve_functional_alias(cfg["shielding_method_c"])
+        cov_blocks = _coverage_blocks(cfg["shielding_basis_c"])
         files[ORCA_NMR_C_INP_NAME] = make_orca_simple_input(
             keywords=f"{prefix_part}NMR {c_method} {cfg['shielding_basis_c']}{aux_suffix}",
-            extra_blocks=[*c_extras, nmr_shielding_block("all C")],
+            extra_blocks=[*cov_blocks, *c_extras, nmr_shielding_block("all C")],
             **common,
         )
 
@@ -692,9 +921,11 @@ def build_nmr_input_files(
         pairs = list(cfg.get("coupling_pairs") or DEFAULT_COUPLING_PAIRS)
         thresh = cfg.get("coupling_thresh_angstrom")
         j_method, j_extras = resolve_functional_alias(cfg["coupling_method"])
+        cov_blocks = _coverage_blocks(cfg["coupling_basis"])
         files[ORCA_NMR_J_INP_NAME] = make_orca_simple_input(
             keywords=f"{prefix_part}NMR {j_method} {cfg['coupling_basis']}{aux_suffix}",
             extra_blocks=[
+                *cov_blocks,
                 *j_extras,
                 nmr_coupling_block(
                     pairs,
@@ -708,6 +939,52 @@ def build_nmr_input_files(
         )
 
     return files
+
+
+def compute_basis_fingerprints(
+    cfg: dict[str, Any],
+    *,
+    elements: set[str] | frozenset[str],
+) -> dict[str, str]:
+    """Return supplemented basis strings for cache-fingerprint use.
+
+    Pure function — does NOT mutate ``cfg``. Returns a dict mapping
+    ``shielding_basis_h`` / ``shielding_basis_c`` / ``coupling_basis``
+    keys to their supplemented forms (e.g.
+    ``"6-31G(d,p)+def2-TZVPP/heavy"``) when the configured basis
+    doesn't cover all elements in the molecule. Keys whose basis was
+    already adequate are omitted from the returned dict.
+
+    The returned strings are intended for
+    :func:`NodeContext.set_inputs` — so the manifest + downstream
+    PredictedRunKey reflect what ORCA actually computed against,
+    including the heavy-atom supplements. The ORCA ``!`` line itself
+    continues to use the BASE basis name (the ``%basis newgto`` block
+    added separately by :func:`build_nmr_input_files` supplies the
+    supplementation at input-read time).
+
+    This split — base basis on the ``!`` line, supplemented basis in
+    the manifest/cache fingerprint — keeps the ORCA input syntactically
+    valid while still distinguishing supplemented from unsupplemented
+    runs at cache-key level.
+    """
+    from ..basis_coverage import compute_coverage_decision, format_basis_fingerprint
+
+    supplement_basis = (
+        cfg.get("heavy_atom_basis") or DEFAULT_HEAVY_ATOM_BASIS
+    )
+    out: dict[str, str] = {}
+
+    for key in ("shielding_basis_h", "shielding_basis_c", "coupling_basis"):
+        base = cfg.get(key)
+        if not isinstance(base, str) or not base:
+            continue
+        decision = compute_coverage_decision(
+            elements, basis=base, supplement_basis=supplement_basis,
+        )
+        if decision.has_supplementation:
+            out[key] = format_basis_fingerprint(base, decision)
+    return out
 
 
 # --------------------------------------------------------------------
@@ -1046,13 +1323,56 @@ SCHEMA = NodeSchema(
             description=(
                 "Chemistry class profile for the NMR shielding + "
                 "coupling jobs. ``auto`` scans the input geometry for "
-                "heavy-element triggers and picks the matching profile "
-                "(currently: Pd -> 'organopd', else 'organic'). The "
-                "'organopd' profile prepends ``ZORA`` to NMR keyword "
-                "lines and swaps the default shielding/coupling bases "
-                "to ``def2-ZORA-TZVPP`` so HALA contributions on H/C "
-                "near Pd are captured correctly. Explicit operator-set "
-                "bases pass through unchanged."
+                "heavy-element triggers and picks the matching "
+                "profile (Pd -> 'organopd', Pt -> 'organopt', Rh -> "
+                "'organorh', Ir -> 'organoir', Au -> 'organoau', "
+                "Hg -> 'organohg', Ru/Ag/Mo/Re/Os/W also covered; "
+                "other Tier 2 metals fall back to 'organotm'). All "
+                "Tier 2 profiles prepend ``ZORA`` to the NMR ``!`` "
+                "line and swap default bases to ``def2-ZORA-TZVPP`` "
+                "so HALA contributions on neighboring H/C are "
+                "captured. ``organic`` is the no-relativistic-"
+                "Hamiltonian default. Explicit operator-set bases "
+                "pass through unchanged."
+            ),
+        ),
+        ConfigField(
+            name="heavy_atom_basis",
+            type="str",
+            default=DEFAULT_HEAVY_ATOM_BASIS,
+            section="nmr",
+            coercer=normalize_optional_str,
+            description=(
+                "Per-element basis attached via ``%basis newgto`` for "
+                "Tier 1 heavy atoms (Br, I, Se, Sn, ...) that the "
+                "configured shielding / coupling basis doesn't cover. "
+                "Keeps the calibrated light-atom basis intact while "
+                "supplementing only the elements that need it. "
+                "``def2-TZVPP`` spans Z=1..86 with built-in ECPs for "
+                "Z >= 37 — the safe default for organic + light-heavy "
+                "systems. The supplemented basis identity is recorded "
+                "into the cached basis string as e.g. "
+                "``6-31G(d,p)+def2-TZVPP/heavy`` so the cache "
+                "distinguishes supplemented from unsupplemented runs."
+            ),
+        ),
+        ConfigField(
+            name="on_uncovered_heavy_metal",
+            type="enum",
+            default=DEFAULT_ON_UNCOVERED_HEAVY_METAL,
+            section="nmr",
+            choices=_ON_UNCOVERED_HEAVY_METAL_CHOICES,
+            description=(
+                "Policy when a Tier 2 element (transition metal, "
+                "lanthanide) is present but the resolved "
+                "``system_class`` profile doesn't cover it. "
+                "``fail`` (default) refuses to launch — safest, "
+                "since Tier 2 NMR without ZORA is meaningless. "
+                "``warn`` logs and continues (likely to abort at "
+                "ORCA read time). ``auto_switch_profile`` promotes "
+                "``system_class`` to the matching Tier 2 profile "
+                "(e.g. ``organopd`` for Pd) so a misconfigured "
+                "``system_class=organic`` on a Pd complex still runs."
             ),
         ),
         ConfigField(
@@ -1176,6 +1496,29 @@ class OrcaThermoArray(Node):
                         f"heteronuclear J's"
                     )
 
+        # Scan upstream elements ONCE and stash for two downstream uses:
+        # (a) :func:`compute_basis_fingerprints` rewrites the basis
+        #     strings recorded in the manifest + used by the cache
+        #     fingerprint to encode any heavy-atom supplementation.
+        # (b) :func:`build_nmr_input_files` reads the same set to know
+        #     which elements need %basis newgto blocks in the ORCA
+        #     input.
+        # Pulled from the upstream conformer xyzs because element
+        # composition is the same in any ensemble member; this avoids
+        # waiting for the local input-staging step.
+        from ..basis_coverage import scan_elements_from_xyz_paths
+        molecule_elements = scan_elements_from_xyz_paths(
+            _upstream_xyz_paths(ctx)
+        )
+
+        # Compute supplemented basis fingerprints (e.g.
+        # "6-31G(d,p)+def2-TZVPP/heavy") for the cache key + manifest.
+        # Empty dict when no supplementation is needed — typical
+        # organic case.
+        basis_fingerprints = compute_basis_fingerprints(
+            cfg, elements=molecule_elements,
+        )
+
         # Record resolved config in manifest.inputs FIRST — before
         # any cache check or compute. Anything that fails later (cache
         # helper raises, sbatch errors, ORCA crashes mid-array) still
@@ -1206,16 +1549,36 @@ class OrcaThermoArray(Node):
             run_shielding_c=cfg["run_shielding_c"],
             run_couplings=cfg["run_couplings"],
             shielding_method_h=cfg["shielding_method_h"],
-            shielding_basis_h=cfg["shielding_basis_h"],
+            # When a Tier 1 heavy atom (Br, I, ...) was supplemented
+            # via %basis newgto, the recorded basis includes the
+            # supplement suffix (e.g. "6-31G(d,p)+def2-TZVPP/heavy")
+            # so the downstream PredictedRunKey distinguishes
+            # supplemented from unsupplemented runs. The ORCA ``!``
+            # line on the input file still uses the BASE basis;
+            # supplementation is added via the %basis block by
+            # :func:`build_nmr_input_files`.
+            shielding_basis_h=basis_fingerprints.get(
+                "shielding_basis_h", cfg["shielding_basis_h"],
+            ),
             shielding_method_c=cfg["shielding_method_c"],
-            shielding_basis_c=cfg["shielding_basis_c"],
+            shielding_basis_c=basis_fingerprints.get(
+                "shielding_basis_c", cfg["shielding_basis_c"],
+            ),
             coupling_method=cfg["coupling_method"],
-            coupling_basis=cfg["coupling_basis"],
+            coupling_basis=basis_fingerprints.get(
+                "coupling_basis", cfg["coupling_basis"],
+            ),
             coupling_pairs=list(cfg["coupling_pairs"]),
             auto_heteronuclear=bool(cfg.get("auto_heteronuclear", True)),
             coupling_thresh_angstrom=cfg["coupling_thresh_angstrom"],
             nmr_aux_keywords=cfg["nmr_aux_keywords"],
             system_class=cfg["system_class"],
+            heavy_atom_basis=cfg.get(
+                "heavy_atom_basis", DEFAULT_HEAVY_ATOM_BASIS,
+            ),
+            on_uncovered_heavy_metal=cfg.get(
+                "on_uncovered_heavy_metal", DEFAULT_ON_UNCOVERED_HEAVY_METAL,
+            ),
             # Provenance: the operator-supplied / calibration-table
             # functional name (``shielding_method_*`` / ``coupling_method``)
             # may not be the literal ORCA 6 keyword we end up putting on
@@ -1245,7 +1608,8 @@ class OrcaThermoArray(Node):
         # can proceed.
         try:
             cache_hit = self._maybe_emit_cached_manifest_thermo(
-                ctx, cfg, multiplicity
+                ctx, cfg, multiplicity,
+                basis_fingerprints=basis_fingerprints,
             )
         except Exception as e:
             logging_utils.log_warn(
@@ -1355,7 +1719,10 @@ class OrcaThermoArray(Node):
             )
 
         nmr_inputs = build_nmr_input_files(
-            cfg=cfg, multiplicity=multiplicity, xyz_filename="input.xyz",
+            cfg=cfg,
+            multiplicity=multiplicity,
+            xyz_filename="input.xyz",
+            elements=molecule_elements,
         )
         extra_inputs.update(nmr_inputs)
         build_thermo_task_dirs(
@@ -1594,7 +1961,12 @@ class OrcaThermoArray(Node):
     # ------------------------------------------------------------------
 
     def _maybe_emit_cached_manifest_thermo(
-        self, ctx: NodeContext, cfg: dict[str, Any], multiplicity: int
+        self,
+        ctx: NodeContext,
+        cfg: dict[str, Any],
+        multiplicity: int,
+        *,
+        basis_fingerprints: dict[str, str] | None = None,
     ) -> bool:
         """Joint ThermoRun + PredictedRun cache check.
 
@@ -1668,10 +2040,15 @@ class OrcaThermoArray(Node):
         dft_inputs = (dft_dict.get("inputs") if dft_dict else None) or {}
 
         # Construct the same set of inputs the writer side will see in
-        # this node's manifest. set_inputs hasn't fired yet (we return
-        # *before* it), so build the dict from cfg in the same shape.
+        # this node's manifest. Build from cfg + multiplicity + the
+        # supplemented basis fingerprints (when heavy-atom
+        # supplementation is active). The supplemented strings are what
+        # set_inputs records into manifest.inputs, so the reader and
+        # writer sides agree on the cache key.
         own_inputs: dict[str, Any] = dict(cfg)
         own_inputs["multiplicity"] = multiplicity
+        if basis_fingerprints:
+            own_inputs.update(basis_fingerprints)
 
         # Build the four keys + their fingerprints in dependency order.
         # ConformerEnsemble (from CREST/GOAT) → DftRun (from this
@@ -2103,7 +2480,12 @@ __all__ = [
     "DEFAULT_SHIELDING_METHOD_C",
     "DEFAULT_SHIELDING_METHOD_H",
     "DEFAULT_SINGLEPOINT_KEYWORDS",
+    "DEFAULT_HEAVY_ATOM_BASIS",
+    "DEFAULT_ON_UNCOVERED_HEAVY_METAL",
     "HETERONUCLEAR_J_PARTNERS",
+    "SYSTEM_CLASS_PROFILES",
+    "SYSTEM_CLASSES_KNOWN",
+    "compute_basis_fingerprints",
     "ORCA_INP_NAME",
     "ORCA_OUT_NAME",
     "OrcaThermoArray",

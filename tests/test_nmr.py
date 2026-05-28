@@ -154,6 +154,23 @@ class TestLookupCalibration:
         # Default table untouched.
         assert "X" not in {k[0] for k in NMR_CALIBRATION}
 
+    def test_supplemented_basis_strips_back_to_base(self):
+        """Heavy-atom supplemented basis names (e.g.
+        ``"6-31G(d,p)+def2-TZVPP/heavy"``) must look up the same row
+        as the unsupplemented base, since the calibration is for the
+        light-atom basis and the supplement only acts on heavies."""
+        base = lookup_calibration(
+            functional="wB97X-D", basis="6-31G(d,p)",
+            solvent="CHCl3", nucleus="13C",
+        )
+        supp = lookup_calibration(
+            functional="wB97X-D",
+            basis="6-31G(d,p)+def2-TZVPP/heavy",
+            solvent="CHCl3", nucleus="13C",
+        )
+        assert base is not None
+        assert supp is base
+
 
 # --------------------------------------------------------------------
 # orca: resolve_functional_alias
