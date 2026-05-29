@@ -145,14 +145,28 @@ everything. `wf-db-ingest` survives as a fail-open backstop. See
 rationale + verification protocol. `tools/inspect_registry_progress.py`
 prints the DB + tree state for a given SMILES.
 
-### B. `system_class` profile for organopalladium NMR
+### B. Element-driven basis selection (heavy atoms + ZORA)
 
-**Change.** `wf-orca-thermo-array` auto-detects `Pd` in the upstream
-geometry and switches the NMR shielding + coupling jobs to ORCA's
-ZORA Hamiltonian + def2-ZORA-TZVPP, leaving the geometry-opt / freq /
-high-level SP unchanged. New `system_class` knob (auto / organic /
-organopd). Cache fingerprint naturally diverges between profiles via
-the basis-set field on `PredictedRunKey`.
+**Change.** `wf-orca-thermo-array` scans the upstream geometry for
+element symbols and routes each NMR job through
+`scripps_workflow.basis_coverage.compute_coverage_decision`:
+
+* HALA-relevant elements (4d/5d TMs, lanthanides, actinides) trigger
+  a global swap to `relativistic_basis` (default `def2-ZORA-TZVPP`)
+  + `! ZORA` prefix on the job's `!` line. The operator's configured
+  basis is discarded for that job.
+* Light-heavy elements (Br, I, Se, Sn, ...) outside the configured
+  basis trigger per-atom `%basis newgto` supplementation using
+  `heavy_atom_basis` (default `def2-TZVPP`). The calibrated light-
+  atom basis stays put.
+
+No `system_class` profile — the decision is purely per-element. Two
+config knobs (`heavy_atom_basis`, `relativistic_basis`) tune the
+supplement / swap targets. The cache identity recorded for
+`PredictedRun` distinguishes the three regimes via the basis string
+(`6-31G(d,p)` / `6-31G(d,p)+def2-TZVPP/heavy` /
+`def2-ZORA-TZVPP`), so the existing basis-keyed `PredictedRunKey`
+naturally invalidates without DB changes.
 
 ### C. Heteronuclear J auto-detection (¹⁹F / ³¹P)
 

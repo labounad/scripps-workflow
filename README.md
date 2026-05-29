@@ -296,47 +296,46 @@ nonlocal correlation flags, and basis choices do not leak between chemically unr
 The node emits raw ORCA outputs. `wf-nmr-aggregate` handles parsing, Boltzmann population weighting,
 and linear-scaling calibration.
 
-### `system_class` profile (organopalladium and other heavy-metal NMR)
+### Element-driven basis selection (heavy atoms + relativistic Hamiltonian)
 
-A `system_class` config knob switches the NMR-job recipe based on the chemistry of the input:
+There's no `system_class` profile — the basis decision is purely per-element. The element scan of
+the upstream geometry drives one of three outcomes for each NMR job:
 
-| Profile     | When it fires                                  | What changes                                                                                   |
-|-------------|------------------------------------------------|------------------------------------------------------------------------------------------------|
-| `organic`   | Default for molecules with no Tier 2 metal     | WP04 / wB97X-D / mPW1PW91 with the organic basis sets. No relativistic Hamiltonian             |
-| `organopd`  | Auto-selected when `Pd` is in input            | Same functionals, but ORCA's `! ZORA` Hamiltonian + def2-ZORA-TZVPP basis on all three NMR jobs |
-| `organopt` / `organorh` / `organoir` / `organoau` / `organohg` / `organoru` / `organoag` / `organomo` / `organore` / `organoos` / `organow` | Auto-selected per metal (Pt, Rh, Ir, Au, Hg, ...) | Same ZORA + def2-ZORA-TZVPP treatment as `organopd`; distinct profile names so future per-metal calibration tables (TODO #89) can fork |
-| `organotm`  | Generic transition-metal umbrella — fallback for Tier 2 elements without a dedicated profile (Tc, Cd, lanthanides) | Same ZORA + def2-ZORA-TZVPP treatment |
+| Outcome | When it fires | Effect on the NMR job |
+|---|---|---|
+| **No-op** | All elements in molecule are covered by the operator's configured basis | ORCA input renders verbatim with the configured `shielding_basis_h` / `_c` / `coupling_basis` |
+| **Tier 1 supplementation** | A light-heavy element (Br, I, Se, Sn, As, Sb, Ge, Pb, ...) sits outside the configured basis | The configured basis stays on the `!` line; a `%basis newgto <Elem> "<heavy_atom_basis>" end` block is auto-injected per uncovered element. The calibrated light-atom basis is preserved |
+| **Tier 2 relativistic swap** | A HALA-relevant element is present (4d/5d transition metals, lanthanides, actinides — see `ELEMENT_REQUIRES_RELATIVISTIC` in `basis_coverage.py`) | The configured basis is DISCARDED for that job. `relativistic_basis` (default `def2-ZORA-TZVPP`) goes on the `!` line on EVERY atom, and `ZORA` is prepended. ORCA's ZORA implementation is only consistent under a fully ZORA-recontracted basis, so the swap is global |
 
-Geometry opt + freq + high-level SP are unchanged across profiles — def2 ECPs already handle the
-scalar relativistic contraction. The ZORA path is only needed for NMR shieldings, where the HALA
-effect on ¹H/¹³C near a heavy metal is missing without a relativistic Hamiltonian (typically
-~0.5–2 ppm on ¹H, ~5–20 ppm on ¹³C, well above noise).
+Geometry opt + freq + high-level SP are unaffected — def2 ECPs already handle scalar relativistic
+contraction in those steps. The relativistic Hamiltonian is only needed for the NMR shieldings,
+where the spin-orbit-driven HALA effect on ¹H/¹³C near a heavy metal (~0.5–2 ppm on ¹H, ~5–20 ppm
+on ¹³C) is otherwise missing.
 
-`system_class=auto` (the default) reads the upstream conformer xyz and picks the matching profile;
-explicit settings (`system_class=organic`, `organopd`, `organopt`, ...) force the choice. The cache
-fingerprint for `PredictedRun` naturally diverges between profiles because the basis-set fields are
-part of the fingerprint payload, so ZORA and non-ZORA runs don't collide.
+Two config knobs control the supplements:
 
-### Tier 1 heavy-atom basis supplementation (Br, I, Se, Sn, ...)
+- `heavy_atom_basis` (default `def2-TZVPP`) — per-element basis for Tier 1 supplementation.
+  `def2-TZVPP` spans Z=1..86 with built-in Stuttgart ECPs for Z≥37.
+- `relativistic_basis` (default `def2-ZORA-TZVPP`) — global basis for Tier 2 swap. ZORA-recontracted,
+  all-electron, Z=1..86.
 
-Light-heavy elements that don't need full ZORA but DO need a basis the configured set doesn't cover
-(Br outside `pcJ-2`'s organic-main-group set, I outside Pople through Kr, Sn outside `6-311++G(2d,p)`'s
-diffuse augmentation, etc.) are auto-supplemented per-element using ORCA's `%basis newgto` block.
-The calibrated light-atom basis stays put; only the heavy atom gets the override.
+The basis identity recorded into the `PredictedRun` cache fingerprint reflects which path fired:
 
-Two knobs control the behavior:
+| Path | `shielding_basis_h` recorded as |
+|---|---|
+| No-op | `6-31G(d,p)` (operator's config, unchanged) |
+| Tier 1 supplementation | `6-31G(d,p)+def2-TZVPP/heavy` |
+| Tier 2 relativistic swap | `def2-ZORA-TZVPP` |
 
-- `heavy_atom_basis` (default `def2-TZVPP`) — the basis attached to each uncovered Tier 1 element.
-  `def2-TZVPP` spans Z=1..86 with built-in Stuttgart ECPs for Z≥37, matching the high-level SP recipe.
-- `on_uncovered_heavy_metal` (default `fail`) — policy when a Tier 2 metal slips through despite an
-  explicit `system_class=organic`. `fail` raises immediately. `warn` logs and continues (likely to
-  abort at ORCA read time). `auto_switch_profile` promotes the system_class to the matching Tier 2
-  profile (e.g. `organopd` for Pd).
+So the cache cleanly distinguishes the three regimes. `nmr_calibration.lookup_calibration` strips
+the `+...heavy` suffix to find the calibrated row for supplemented runs; the ZORA-swapped form
+falls through and either matches a separately lab-fit ZORA calibration row or returns `None` (the
+aggregator then falls back to raw σ).
 
-The supplemented basis is recorded into the cached basis identity as e.g.
-`6-31G(d,p)+def2-TZVPP/heavy`, so a re-run with a different `heavy_atom_basis` correctly invalidates.
-The element coverage tables live in `src/scripps_workflow/basis_coverage.py`; extend
-`BASIS_ELEMENT_COVERAGE` when adding a new named basis to the defaults.
+Element coverage tables live in `src/scripps_workflow/basis_coverage.py`:
+
+- Add a new basis: insert it into `BASIS_ELEMENT_COVERAGE` with its element set.
+- Add a new HALA-relevant element: insert into `ELEMENT_REQUIRES_RELATIVISTIC`.
 
 ### Heteronuclear J auto-detection (¹⁹F / ³¹P)
 

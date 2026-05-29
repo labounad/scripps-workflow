@@ -983,12 +983,19 @@ Extra simple-input fragment applied to each NMR job (alongside ``! NMR``). ``Tig
 
 When true (default), scan the upstream geometry for ¹⁹F and ³¹P; append ``"all F"`` / ``"all P"`` to ``coupling_pairs`` so the ORCA J-coupling job computes the cross-element couplings needed for the H/C simulated spectra to show realistic heteronuclear splitting (¹H-¹⁹F, ¹³C-³¹P, etc.). Set to false to force decoupled-spectrum semantics: only the operator-supplied ``coupling_pairs`` entries are used.
 
-#### `system_class`
+#### `heavy_atom_basis`
 
 - **Type:** `str`
-- **Default:** `"auto"`
+- **Default:** `"def2-TZVPP"`
 
-Chemistry class profile for the NMR shielding + coupling jobs. ``auto`` scans the input geometry for heavy-element triggers and picks the matching profile (currently: Pd -> 'organopd', else 'organic'). The 'organopd' profile prepends ``ZORA`` to NMR keyword lines and swaps the default shielding/coupling bases to ``def2-ZORA-TZVPP`` so HALA contributions on H/C near Pd are captured correctly. Explicit operator-set bases pass through unchanged.
+Per-element basis attached via ``%basis newgto`` for Tier 1 heavy atoms (Br, I, Se, Sn, ...) that the configured shielding / coupling basis doesn't cover. Keeps the calibrated light-atom basis intact while supplementing only the elements that need it. ``def2-TZVPP`` spans Z=1..86 with built-in ECPs for Z >= 37 — the safe default. Recorded into the cached basis string as e.g. ``6-31G(d,p)+def2-TZVPP/heavy`` so the cache distinguishes supplemented runs.
+
+#### `relativistic_basis`
+
+- **Type:** `str`
+- **Default:** `"def2-ZORA-TZVPP"`
+
+Basis used globally when any HALA-relevant element (4d/5d transition metals, lanthanides, actinides — see ``ELEMENT_REQUIRES_RELATIVISTIC`` in ``scripps_workflow.basis_coverage``) is detected in the molecule. The operator-configured ``shielding_basis_*`` / ``coupling_basis`` is DISCARDED for that job and ``! ZORA`` is prepended to the ``!`` line. ``def2-ZORA-TZVPP`` is the safe default — ZORA-recontracted, all-electron, covers Z=1..86. The full swap is mandatory because ORCA's ZORA implementation is only consistent when every atom carries a ZORA-recontracted basis.
 
 ## `wf-prism`
 

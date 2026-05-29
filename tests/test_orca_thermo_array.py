@@ -385,296 +385,12 @@ def _make_fake_sbatch(
 
 
 # --------------------------------------------------------------------
-# system_class profile — element detection + basis swap
+# Element-driven basis selection (replaces the dropped system_class
+# profile concept). All decisions flow through
+# :func:`scripps_workflow.basis_coverage.compute_coverage_decision`
+# based on the molecule's element set, not on operator labels.
 # --------------------------------------------------------------------
 
-
-class TestDetectSystemClass:
-    """``detect_system_class`` scans element symbols out of xyz files
-    and returns a profile name. First-match-wins on the trigger dict;
-    no triggers → 'organic'."""
-
-    def _write_xyz(self, path: Path, atoms: list[tuple[str, float, float, float]]) -> None:
-        lines = [str(len(atoms)), "comment"]
-        for sym, x, y, z in atoms:
-            lines.append(f"{sym} {x:.4f} {y:.4f} {z:.4f}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    def test_pure_organic_returns_organic(self, tmp_path):
-        xyz = tmp_path / "ethanol.xyz"
-        self._write_xyz(xyz, [
-            ("C", 0.0, 0.0, 0.0), ("C", 1.5, 0.0, 0.0),
-            ("O", 2.4, 0.0, 0.0),
-            ("H", -0.5, 0.9, 0.0), ("H", -0.5, -0.9, 0.0), ("H", -0.5, 0.0, 0.9),
-        ])
-        assert ota.detect_system_class([xyz]) == "organic"
-
-    def test_pd_present_returns_organopd(self, tmp_path):
-        xyz = tmp_path / "pd_complex.xyz"
-        self._write_xyz(xyz, [
-            ("Pd", 0.0, 0.0, 0.0),
-            ("C", 1.8, 0.0, 0.0), ("C", -1.8, 0.0, 0.0),
-            ("H", 2.5, 0.8, 0.0), ("H", -2.5, -0.8, 0.0),
-        ])
-        assert ota.detect_system_class([xyz]) == "organopd"
-
-    def test_unreadable_file_does_not_raise(self, tmp_path):
-        """A missing / unreadable xyz is skipped silently — detection
-        falls back to whatever the remaining files say."""
-        missing = tmp_path / "nope.xyz"
-        present = tmp_path / "ok.xyz"
-        self._write_xyz(present, [("Pd", 0, 0, 0), ("C", 1.8, 0, 0)])
-        # Should not raise on the missing file, should still see the Pd
-        # in the present file.
-        assert ota.detect_system_class([missing, present]) == "organopd"
-
-    def test_empty_list_returns_organic(self):
-        assert ota.detect_system_class([]) == "organic"
-
-    def test_only_scans_first_few_conformers(self, tmp_path):
-        """Element composition is the same across conformers of one
-        molecule; the helper caps at 3 to avoid O(N) work on 50-conf
-        ensembles. Verify the cap by hiding a Pd-containing conformer
-        at index 5."""
-        for i in range(5):
-            self._write_xyz(tmp_path / f"conf_{i}.xyz", [("C", 0, 0, 0)])
-        # The "secret" Pd conformer at index 5 is BEYOND the scan cap.
-        self._write_xyz(tmp_path / "conf_5.xyz", [("Pd", 0, 0, 0)])
-        paths = sorted(tmp_path.glob("conf_*.xyz"))
-        # The first 3 only contain C; the late Pd file is ignored.
-        assert ota.detect_system_class(paths) == "organic"
-
-
-class TestSystemClassProfileBasisSwap:
-    """``_resolve_system_class_profile`` mutates cfg in place: maps
-    ``auto`` to a concrete class via element scan, then swaps basis
-    fields still at the organic defaults to the profile's values.
-    Operator-set bases pass through unchanged."""
-
-    def _ctx_with_upstream_xyzs(self, tmp_path: Path, *, has_pd: bool):
-        """Build a minimal ctx with an upstream manifest whose
-        conformer artifacts point at a Pd or pure-organic xyz."""
-        from scripps_workflow.node import NodeContext
-
-        xyz = tmp_path / "input.xyz"
-        if has_pd:
-            xyz.write_text("2\nfoo\nPd 0 0 0\nC 1.8 0 0\n", encoding="utf-8")
-        else:
-            xyz.write_text("2\nfoo\nC 0 0 0\nC 1.5 0 0\n", encoding="utf-8")
-
-        upstream = Manifest.skeleton(step="orca_dft_array", cwd=tmp_path)
-        upstream.artifacts["conformers"] = [
-            {"path_abs": str(xyz.resolve()), "index": 1}
-        ]
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
-        return NodeContext(
-            cwd=tmp_path,
-            outputs_dir=outputs_dir,
-            manifest_path=outputs_dir / "manifest.json",
-            raw_argv=[],
-            config={},
-            upstream_pointer=None,
-            upstream_manifest=upstream,
-            manifest=Manifest.skeleton(step="orca_thermo_array", cwd=tmp_path),
-            started_at_unix=0,
-            started_at_perf=0.0,
-        )
-
-    def test_auto_organic_keeps_organic_defaults(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=False)
-        cfg = {
-            "system_class": "auto",
-            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-        }
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organic"
-        assert cfg["system_class"] == "organic"
-        # Bases unchanged.
-        assert cfg["shielding_basis_h"] == ota.DEFAULT_SHIELDING_BASIS_H
-        assert cfg["coupling_basis"] == ota.DEFAULT_COUPLING_BASIS
-
-    def test_auto_pd_resolves_to_organopd_and_swaps_bases(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=True)
-        cfg = {
-            "system_class": "auto",
-            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-        }
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organopd"
-        assert cfg["system_class"] == "organopd"
-        # All three NMR bases swapped to def2-ZORA-TZVPP.
-        assert cfg["shielding_basis_h"] == "def2-ZORA-TZVPP"
-        assert cfg["shielding_basis_c"] == "def2-ZORA-TZVPP"
-        assert cfg["coupling_basis"] == "def2-ZORA-TZVPP"
-
-    def test_explicit_organopd_works_without_pd_in_geometry(self, tmp_path):
-        """Operator can force the organopd profile even on a non-Pd
-        molecule (e.g., for method development)."""
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=False)
-        cfg = {
-            "system_class": "organopd",
-            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-        }
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organopd"
-        assert cfg["shielding_basis_h"] == "def2-ZORA-TZVPP"
-
-    def test_explicit_organic_on_pd_geometry_keeps_organic_bases(self, tmp_path):
-        """Operator override beats auto-detection, when paired with
-        ``on_uncovered_heavy_metal=warn`` (the default ``fail`` would
-        raise — see :class:`TestOnUncoveredHeavyMetal`)."""
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=True)
-        cfg = {
-            "system_class": "organic",
-            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-            "on_uncovered_heavy_metal": "warn",
-        }
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organic"
-        assert cfg["shielding_basis_h"] == ota.DEFAULT_SHIELDING_BASIS_H
-
-    def test_operator_override_basis_passes_through(self, tmp_path):
-        """A non-default basis the operator passed in must NOT be
-        clobbered by the profile."""
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=True)
-        cfg = {
-            "system_class": "auto",
-            "shielding_basis_h": "pcSseg-2",     # operator's choice
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-        }
-        ota._resolve_system_class_profile(cfg, ctx=ctx)
-        # H basis preserved (operator-set, not the organic default).
-        assert cfg["shielding_basis_h"] == "pcSseg-2"
-        # C and J bases swapped (they were at organic defaults).
-        assert cfg["shielding_basis_c"] == "def2-ZORA-TZVPP"
-        assert cfg["coupling_basis"] == "def2-ZORA-TZVPP"
-
-    def test_unknown_class_raises(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, has_pd=False)
-        cfg = {
-            "system_class": "uranium_carbide_v2",
-            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-        }
-        with pytest.raises(ValueError, match="unknown system_class"):
-            ota._resolve_system_class_profile(cfg, ctx=ctx)
-
-
-class TestOnUncoveredHeavyMetal:
-    """Tier 2 element + explicit ``system_class=organic``: the
-    ``on_uncovered_heavy_metal`` knob controls fail / warn /
-    auto-promote behavior. Default is ``fail``."""
-
-    def _ctx_with_upstream_xyzs(self, tmp_path: Path, *, heavy_metal: str = "Pd"):
-        from scripps_workflow.node import NodeContext
-
-        xyz = tmp_path / "input.xyz"
-        xyz.write_text(
-            f"2\nfoo\n{heavy_metal} 0 0 0\nC 1.8 0 0\n",
-            encoding="utf-8",
-        )
-        upstream = Manifest.skeleton(step="orca_dft_array", cwd=tmp_path)
-        upstream.artifacts["conformers"] = [
-            {"path_abs": str(xyz.resolve()), "index": 1}
-        ]
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
-        return NodeContext(
-            cwd=tmp_path,
-            outputs_dir=outputs_dir,
-            manifest_path=outputs_dir / "manifest.json",
-            raw_argv=[],
-            config={},
-            upstream_pointer=None,
-            upstream_manifest=upstream,
-            manifest=Manifest.skeleton(step="orca_thermo_array", cwd=tmp_path),
-            started_at_unix=0,
-            started_at_perf=0.0,
-        )
-
-    def _organic_cfg(self, **over):
-        cfg = {
-            "system_class": "organic",
-            "shielding_basis_h": ota.DEFAULT_SHIELDING_BASIS_H,
-            "shielding_basis_c": ota.DEFAULT_SHIELDING_BASIS_C,
-            "coupling_basis": ota.DEFAULT_COUPLING_BASIS,
-        }
-        cfg.update(over)
-        return cfg
-
-    def test_fail_policy_raises(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path)
-        cfg = self._organic_cfg(on_uncovered_heavy_metal="fail")
-        with pytest.raises(ValueError, match="Tier 2 element"):
-            ota._resolve_system_class_profile(cfg, ctx=ctx)
-
-    def test_default_policy_is_fail(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path)
-        cfg = self._organic_cfg()    # no on_uncovered_heavy_metal set
-        with pytest.raises(ValueError, match="Tier 2 element"):
-            ota._resolve_system_class_profile(cfg, ctx=ctx)
-
-    def test_warn_policy_continues(self, tmp_path, caplog):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path)
-        cfg = self._organic_cfg(on_uncovered_heavy_metal="warn")
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organic"
-        # Bases unchanged — organic profile, no swap.
-        assert cfg["shielding_basis_h"] == ota.DEFAULT_SHIELDING_BASIS_H
-
-    def test_auto_switch_promotes_to_organopd_for_pd(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, heavy_metal="Pd")
-        cfg = self._organic_cfg(on_uncovered_heavy_metal="auto_switch_profile")
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organopd"
-        assert cfg["system_class"] == "organopd"
-        # Bases got swapped after promotion.
-        assert cfg["shielding_basis_h"] == "def2-ZORA-TZVPP"
-
-    def test_auto_switch_promotes_to_organopt_for_pt(self, tmp_path):
-        ctx = self._ctx_with_upstream_xyzs(tmp_path, heavy_metal="Pt")
-        cfg = self._organic_cfg(on_uncovered_heavy_metal="auto_switch_profile")
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organopt"
-
-    def test_no_tier2_in_geometry_is_noop(self, tmp_path):
-        """Pure organic geometry — the policy never fires."""
-        from scripps_workflow.node import NodeContext
-
-        xyz = tmp_path / "input.xyz"
-        xyz.write_text("2\nfoo\nC 0 0 0\nC 1.5 0 0\n", encoding="utf-8")
-        upstream = Manifest.skeleton(step="orca_dft_array", cwd=tmp_path)
-        upstream.artifacts["conformers"] = [
-            {"path_abs": str(xyz.resolve()), "index": 1}
-        ]
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
-        ctx = NodeContext(
-            cwd=tmp_path,
-            outputs_dir=outputs_dir,
-            manifest_path=outputs_dir / "manifest.json",
-            raw_argv=[],
-            config={},
-            upstream_pointer=None,
-            upstream_manifest=upstream,
-            manifest=Manifest.skeleton(step="orca_thermo_array", cwd=tmp_path),
-            started_at_unix=0,
-            started_at_perf=0.0,
-        )
-        cfg = self._organic_cfg(on_uncovered_heavy_metal="fail")
-        resolved = ota._resolve_system_class_profile(cfg, ctx=ctx)
-        assert resolved == "organic"
 
 
 class TestBuildNmrInputFilesCoverage:
@@ -697,8 +413,8 @@ class TestBuildNmrInputFilesCoverage:
             "coupling_pairs": ["all H"],
             "coupling_thresh_angstrom": 8.0,
             "nmr_aux_keywords": "TightSCF",
-            "nmr_keywords_prefix": "",
             "heavy_atom_basis": ota.DEFAULT_HEAVY_ATOM_BASIS,
+            "relativistic_basis": ota.DEFAULT_RELATIVISTIC_BASIS,
         }
         base.update(over)
         return base
@@ -833,11 +549,42 @@ class TestComputeBasisFingerprints:
         _ = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "Br"})
         assert cfg == snapshot
 
+    def test_pd_returns_relativistic_basis_for_all_three(self):
+        """When a Tier-2 metal is present, every job's fingerprint
+        is the relativistic_basis (full swap)."""
+        cfg = {
+            "shielding_basis_h": "6-311++G(2d,p)",
+            "shielding_basis_c": "6-31G(d,p)",
+            "coupling_basis": "pcJ-2",
+            "heavy_atom_basis": "def2-TZVPP",
+            "relativistic_basis": "def2-ZORA-TZVPP",
+        }
+        fps = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "Pd"})
+        for key in ("shielding_basis_h", "shielding_basis_c", "coupling_basis"):
+            assert fps[key] == "def2-ZORA-TZVPP"
 
-class TestBuildNmrInputFilesZora:
-    """``build_nmr_input_files`` prepends ``ZORA`` to NMR keyword lines
-    when ``cfg['nmr_keywords_prefix']`` is set (which the organopd
-    profile does). Organic stays unchanged."""
+    def test_pd_with_operator_set_zora_basis_is_noop(self):
+        """If the operator already picked def2-ZORA-TZVPP, no fingerprint
+        change is needed even when Pd is present (the basis IS the
+        identity)."""
+        cfg = {
+            "shielding_basis_h": "def2-ZORA-TZVPP",
+            "shielding_basis_c": "def2-ZORA-TZVPP",
+            "coupling_basis": "def2-ZORA-TZVPP",
+            "heavy_atom_basis": "def2-TZVPP",
+            "relativistic_basis": "def2-ZORA-TZVPP",
+        }
+        fps = ota.compute_basis_fingerprints(cfg, elements={"H", "C", "Pd"})
+        # All three keys absent from the dict (no change from operator's cfg).
+        assert fps == {}
+
+
+class TestBuildNmrInputFilesElementDrivenZora:
+    """Element-driven ZORA: when ``elements`` contains a HALA-relevant
+    metal (Pd, Pt, Rh, ...), ``build_nmr_input_files`` swaps the whole
+    job's basis to ``relativistic_basis`` and prepends ``ZORA`` on the
+    ``!`` line. The operator's configured ``shielding_basis_*`` is
+    DISCARDED for that job."""
 
     def _cfg(self, **over):
         base = {
@@ -853,28 +600,29 @@ class TestBuildNmrInputFilesZora:
             "coupling_pairs": ["all H"],
             "coupling_thresh_angstrom": 8.0,
             "nmr_aux_keywords": "TightSCF",
-            "nmr_keywords_prefix": "",
+            "heavy_atom_basis": ota.DEFAULT_HEAVY_ATOM_BASIS,
+            "relativistic_basis": ota.DEFAULT_RELATIVISTIC_BASIS,
         }
         base.update(over)
         return base
 
     def test_organic_no_prefix(self):
-        files = ota.build_nmr_input_files(cfg=self._cfg(), multiplicity=1)
-        h_text = files[ota.ORCA_NMR_H_INP_NAME]
-        # First non-empty ``!`` line should start with NMR, not ZORA.
-        first = next(ln for ln in h_text.splitlines() if ln.startswith("!"))
-        assert first.startswith("! NMR")
-        assert "ZORA" not in first
-
-    def test_organopd_prefix_zora(self):
+        """Pure organic elements: no ``ZORA`` on the keyword line,
+        operator's basis stays."""
         files = ota.build_nmr_input_files(
-            cfg=self._cfg(
-                nmr_keywords_prefix="ZORA",
-                shielding_basis_h="def2-ZORA-TZVPP",
-                shielding_basis_c="def2-ZORA-TZVPP",
-                coupling_basis="def2-ZORA-TZVPP",
-            ),
-            multiplicity=1,
+            cfg=self._cfg(), multiplicity=1, elements={"C", "H", "N", "O"},
+        )
+        for text in files.values():
+            first = next(ln for ln in text.splitlines() if ln.startswith("!"))
+            assert first.startswith("! NMR"), first
+            assert "ZORA" not in first
+
+    def test_pd_triggers_zora_and_basis_swap_on_all_three_jobs(self):
+        """Pd in the molecule → every NMR job's keyword line gets a
+        ``ZORA`` prefix and ``def2-ZORA-TZVPP`` as the basis; the
+        operator's configured base bases are discarded."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1, elements={"C", "H", "Pd"},
         )
         for inp_name in (
             ota.ORCA_NMR_H_INP_NAME,
@@ -883,11 +631,60 @@ class TestBuildNmrInputFilesZora:
         ):
             text = files[inp_name]
             first = next(ln for ln in text.splitlines() if ln.startswith("!"))
-            # ZORA appears before NMR.
             assert "ZORA" in first
             assert first.index("ZORA") < first.index("NMR")
-            # Basis is the ZORA-recontracted variant.
             assert "def2-ZORA-TZVPP" in first
+            # The operator's base bases must NOT appear on the swapped
+            # job's `!` line.
+            assert ota.DEFAULT_SHIELDING_BASIS_H not in first
+            assert ota.DEFAULT_COUPLING_BASIS not in first
+            # And no per-atom %basis newgto block (the swap covers
+            # everything).
+            assert "newgto" not in text
+
+    def test_pt_also_triggers_zora(self):
+        """Same behavior for Pt (5d transition metal)."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1, elements={"C", "H", "Pt"},
+        )
+        h_text = files[ota.ORCA_NMR_H_INP_NAME]
+        first = next(ln for ln in h_text.splitlines() if ln.startswith("!"))
+        assert "ZORA" in first
+        assert "def2-ZORA-TZVPP" in first
+
+    def test_mixed_tier1_and_tier2_uses_zora_swap(self):
+        """When Tier 1 (Br) and Tier 2 (Pd) coexist, Tier 2 wins and
+        the full ZORA swap subsumes any per-atom supplementation."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1, elements={"C", "H", "Br", "Pd"},
+        )
+        j_text = files[ota.ORCA_NMR_J_INP_NAME]
+        first = next(ln for ln in j_text.splitlines() if ln.startswith("!"))
+        assert "ZORA" in first
+        assert "def2-ZORA-TZVPP" in first
+        assert "newgto" not in j_text   # no Tier-1 block when ZORA fires
+
+    def test_first_row_tm_does_not_trigger_zora(self):
+        """First-row transition metals (Fe, Cu, ...) are deliberately
+        OUTSIDE ``ELEMENT_REQUIRES_RELATIVISTIC`` — scalar relativistic
+        effects are small enough that they shouldn't force ZORA."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(), multiplicity=1, elements={"C", "H", "Fe"},
+        )
+        for text in files.values():
+            first = next(ln for ln in text.splitlines() if ln.startswith("!"))
+            assert "ZORA" not in first
+
+    def test_custom_relativistic_basis_threads_through(self):
+        """Operator-set ``relativistic_basis`` is used in the swap."""
+        files = ota.build_nmr_input_files(
+            cfg=self._cfg(relativistic_basis="SARC-ZORA-TZVPP"),
+            multiplicity=1,
+            elements={"C", "H", "Pd"},
+        )
+        h_text = files[ota.ORCA_NMR_H_INP_NAME]
+        first = next(ln for ln in h_text.splitlines() if ln.startswith("!"))
+        assert "SARC-ZORA-TZVPP" in first
 
 
 # --------------------------------------------------------------------

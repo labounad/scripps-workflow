@@ -2,13 +2,12 @@
 
 Three concerns:
 
-1. Coverage decisions across the realistic basis × element matrix
-   (organic basis + organic atoms = no-op; organic basis + Br = Tier 1
-   supplementation; organic basis + Pd = Tier 2 escalation; relativistic
-   basis + Pd = no-op).
+1. Coverage decisions across the realistic element × basis matrix
+   (organic atoms = no-op; light-heavy + organic basis = Tier 1
+   supplementation; HALA-relevant element = full ZORA swap; mixed
+   case = ZORA wins).
 2. ``%basis newgto`` block formatting + fingerprint encoding.
-3. Robustness: unknown basis names → warning + skip; empty inputs; xyz
-   scan helper.
+3. Robustness: unknown basis names, empty inputs, xyz scan helper.
 """
 
 from __future__ import annotations
@@ -26,121 +25,153 @@ from scripps_workflow import basis_coverage as bc
 
 
 class TestCoverageDecision:
-    """Element × basis matrix — make sure each cell behaves correctly."""
+    """Element × basis matrix — every cell behaves correctly."""
 
     def test_organic_atoms_organic_basis_is_noop(self):
-        """Bread-and-butter case: C/H/N/O/F in 6-31G(d,p) — nothing to do."""
         d = bc.compute_coverage_decision(
-            {"H", "C", "N", "O", "F"}, basis="6-31G(d,p)",
+            {"H", "C", "N", "O", "F"}, base_basis="6-31G(d,p)",
         )
+        assert d.effective_basis == "6-31G(d,p)"
+        assert d.fingerprint_basis == "6-31G(d,p)"
+        assert d.nmr_keywords_prefix == ""
         assert not d.has_supplementation
-        assert not d.has_tier2
+        assert not d.has_relativistic_treatment
         assert d.extra_blocks == []
-        assert d.fingerprint_suffix == ""
-        assert d.warnings == []
 
     def test_bromine_in_pople_dp_is_covered(self):
-        """Br (Z=35) IS in the 6-31G(d,p) coverage table (Pople H–Kr)."""
+        """Br (Z=35) IS in 6-31G(d,p) (Pople H–Kr)."""
         d = bc.compute_coverage_decision(
-            {"H", "C", "Br"}, basis="6-31G(d,p)",
+            {"H", "C", "Br"}, base_basis="6-31G(d,p)",
         )
         assert not d.has_supplementation
-        assert not d.has_tier2
+        assert not d.has_relativistic_treatment
 
     def test_bromine_in_pcj2_needs_supplementation(self):
-        """pcJ-2 is organic-main-group only — Br must get supplemented."""
         d = bc.compute_coverage_decision(
-            {"H", "C", "Br"}, basis="pcJ-2",
+            {"H", "C", "Br"}, base_basis="pcJ-2",
         )
         assert d.has_supplementation
         assert d.supplemented_elements == ["Br"]
-        assert not d.has_tier2
+        assert not d.has_relativistic_treatment
+        assert d.effective_basis == "pcJ-2"   # operator basis stays
+        assert d.nmr_keywords_prefix == ""
         assert "Br" in d.extra_blocks[0]
         assert "def2-TZVPP" in d.extra_blocks[0]
-        assert d.fingerprint_suffix == "+def2-TZVPP/heavy"
+        assert d.fingerprint_basis == "pcJ-2+def2-TZVPP/heavy"
 
-    def test_iodine_in_pople_diffuse_needs_supplementation(self):
-        """6-311++G(2d,p) diffuse stops at Ar — I must get supplemented."""
+    def test_iodine_in_diffuse_pople_needs_supplementation(self):
         d = bc.compute_coverage_decision(
-            {"H", "C", "I"}, basis="6-311++G(2d,p)",
+            {"H", "C", "I"}, base_basis="6-311++G(2d,p)",
         )
         assert d.supplemented_elements == ["I"]
         assert d.extra_blocks[0].count("newgto") == 1
 
-    def test_multiple_heavies_get_one_block(self):
-        """One %basis block with multiple newgto lines."""
+    def test_multiple_tier1_heavies_one_block(self):
         d = bc.compute_coverage_decision(
-            {"H", "C", "Br", "I", "Se"}, basis="pcJ-2",
+            {"H", "C", "Br", "I", "Se"}, base_basis="pcJ-2",
         )
         assert d.supplemented_elements == ["Br", "I", "Se"]
         assert len(d.extra_blocks) == 1
         block = d.extra_blocks[0]
-        assert block.count("newgto") == 3
         for elem in ("Br", "I", "Se"):
             assert f'newgto {elem} "def2-TZVPP" end' in block
 
-    def test_pd_in_organic_basis_escalates_to_tier2(self):
-        """Pd is Tier 2 — NOT supplemented, surfaced via tier2_elements."""
+    def test_pd_triggers_full_zora_swap(self):
+        """Pd → effective_basis becomes the relativistic basis, the
+        operator's base_basis is discarded for this job."""
         d = bc.compute_coverage_decision(
-            {"H", "C", "Pd"}, basis="6-31G(d,p)",
+            {"H", "C", "Pd"}, base_basis="6-31G(d,p)",
         )
-        assert not d.has_supplementation
-        assert d.has_tier2
+        assert d.has_relativistic_treatment
         assert d.tier2_elements == ["Pd"]
-        assert d.fingerprint_suffix == ""
-
-    def test_pd_with_zora_basis_is_noop(self):
-        """def2-ZORA-TZVPP covers Pd natively — no-op."""
-        d = bc.compute_coverage_decision(
-            {"H", "C", "Pd"}, basis="def2-ZORA-TZVPP",
-        )
+        assert d.effective_basis == "def2-ZORA-TZVPP"
+        assert d.fingerprint_basis == "def2-ZORA-TZVPP"
+        assert d.nmr_keywords_prefix == "ZORA"
+        assert d.extra_blocks == []   # no per-atom block in the swap path
         assert not d.has_supplementation
-        assert not d.has_tier2
 
-    def test_pd_in_def2_tzvpp_is_noop(self):
-        """def2-TZVPP also covers Pd via ECPs — no supplementation needed."""
+    def test_pt_also_triggers_zora(self):
         d = bc.compute_coverage_decision(
-            {"H", "C", "Pd"}, basis="def2-TZVPP",
+            {"H", "C", "Pt"}, base_basis="pcJ-2",
         )
+        assert d.has_relativistic_treatment
+        assert d.nmr_keywords_prefix == "ZORA"
+        assert d.effective_basis == "def2-ZORA-TZVPP"
+
+    def test_lanthanide_triggers_zora(self):
+        """Lanthanides also need a relativistic Hamiltonian."""
+        d = bc.compute_coverage_decision(
+            {"H", "C", "Eu"}, base_basis="6-31G(d,p)",
+        )
+        assert d.has_relativistic_treatment
+
+    def test_first_row_tm_does_NOT_trigger_zora(self):
+        """3d transition metals (Sc–Zn) are deliberately outside the
+        relativistic set — ECPs / no-ECP organic basis handle them."""
+        d = bc.compute_coverage_decision(
+            {"H", "C", "Fe"}, base_basis="def2-TZVPP",
+        )
+        assert not d.has_relativistic_treatment
+
+    def test_tier2_subsumes_tier1(self):
+        """When Tier 1 (Br) and Tier 2 (Pd) both present: full ZORA
+        swap covers Br via def2-ZORA-TZVPP, no per-atom block."""
+        d = bc.compute_coverage_decision(
+            {"H", "C", "Br", "Pd"}, base_basis="pcJ-2",
+        )
+        assert d.has_relativistic_treatment
         assert not d.has_supplementation
-        assert not d.has_tier2
+        assert d.extra_blocks == []
+        assert d.effective_basis == "def2-ZORA-TZVPP"
 
-    def test_mixed_tier1_and_tier2(self):
-        """Br + Pd in 6-31G(d,p): Br is OK (Pople covers Z=35), Pd is Tier 2."""
+    def test_custom_relativistic_basis_threads_through(self):
         d = bc.compute_coverage_decision(
-            {"H", "C", "Br", "Pd"}, basis="6-31G(d,p)",
+            {"H", "C", "Pd"},
+            base_basis="pcJ-2",
+            relativistic_basis="SARC-ZORA-TZVPP",
         )
-        assert d.supplemented_elements == []
-        assert d.tier2_elements == ["Pd"]
-
-    def test_tier1_and_tier2_in_pcj2(self):
-        """In pcJ-2: Br needs supplement, Pd needs profile escalation."""
-        d = bc.compute_coverage_decision(
-            {"H", "C", "Br", "Pd"}, basis="pcJ-2",
-        )
-        assert d.supplemented_elements == ["Br"]
-        assert d.tier2_elements == ["Pd"]
-        # Block should NOT contain Pd — only Tier 1 elements.
-        assert "Pd" not in d.extra_blocks[0]
+        assert d.effective_basis == "SARC-ZORA-TZVPP"
+        assert d.fingerprint_basis == "SARC-ZORA-TZVPP"
 
     def test_case_insensitive_basis_lookup(self):
-        """Lookups are case-insensitive — 6-31G(d,p) and 6-31g(d,p) match."""
-        d1 = bc.compute_coverage_decision({"Br"}, basis="6-31G(D,P)")
-        d2 = bc.compute_coverage_decision({"Br"}, basis="6-31g(d,p)")
-        assert d1.supplemented_elements == d2.supplemented_elements
+        d1 = bc.compute_coverage_decision({"Br"}, base_basis="6-31G(D,P)")
+        d2 = bc.compute_coverage_decision({"Br"}, base_basis="6-31g(d,p)")
+        assert d1.has_supplementation == d2.has_supplementation
 
     def test_unknown_basis_emits_warning_only(self):
-        """Unknown basis → no supplementation but a warning surfaces."""
         d = bc.compute_coverage_decision(
-            {"H", "C", "Br"}, basis="my-custom-basis-2026",
+            {"H", "C", "Br"}, base_basis="my-custom-basis-2026",
         )
         assert not d.has_supplementation
-        assert not d.has_tier2
+        assert not d.has_relativistic_treatment
         assert any("BASIS_ELEMENT_COVERAGE" in w for w in d.warnings)
 
 
+class TestNeedsRelativisticTreatment:
+    """The standalone predicate matches what compute_coverage_decision
+    uses internally."""
+
+    def test_organic_false(self):
+        assert not bc.needs_relativistic_treatment({"H", "C", "N", "O"})
+
+    def test_first_row_tm_false(self):
+        assert not bc.needs_relativistic_treatment({"H", "C", "Fe"})
+
+    def test_pd_true(self):
+        assert bc.needs_relativistic_treatment({"H", "C", "Pd"})
+
+    def test_lanthanide_true(self):
+        assert bc.needs_relativistic_treatment({"H", "C", "Eu"})
+
+    def test_actinide_true(self):
+        assert bc.needs_relativistic_treatment({"H", "C", "U"})
+
+    def test_empty_false(self):
+        assert not bc.needs_relativistic_treatment(set())
+
+
 # --------------------------------------------------------------------
-# Block formatting + fingerprint encoding
+# Block formatting + fingerprint extraction
 # --------------------------------------------------------------------
 
 
@@ -169,15 +200,24 @@ class TestBlockFormatting:
         block = bc.build_newgto_block(["Br"], "SARC-ZORA-TZVPP")
         assert 'newgto Br "SARC-ZORA-TZVPP" end' in block
 
-    def test_format_basis_fingerprint_with_supplementation(self):
-        d = bc.compute_coverage_decision({"Br"}, basis="pcJ-2")
-        fp = bc.format_basis_fingerprint("pcJ-2", d)
-        assert fp == "pcJ-2+def2-TZVPP/heavy"
 
-    def test_format_basis_fingerprint_no_supplementation(self):
-        d = bc.compute_coverage_decision({"H", "C"}, basis="pcJ-2")
-        fp = bc.format_basis_fingerprint("pcJ-2", d)
-        assert fp == "pcJ-2"
+class TestExtractBaseBasis:
+    """Calibration lookup uses this to strip a supplemented basis back
+    to its calibrated base form."""
+
+    def test_supplemented_strips_to_base(self):
+        assert bc.extract_base_basis(
+            "6-31G(d,p)+def2-TZVPP/heavy"
+        ) == "6-31G(d,p)"
+
+    def test_unchanged_passes_through(self):
+        assert bc.extract_base_basis("6-31G(d,p)") == "6-31G(d,p)"
+
+    def test_zora_full_swap_passes_through(self):
+        """The Tier-2 full-swap basis IS the identity — no suffix to
+        strip. The calibration lookup will then either find a separately
+        lab-fit ZORA row or return None."""
+        assert bc.extract_base_basis("def2-ZORA-TZVPP") == "def2-ZORA-TZVPP"
 
 
 # --------------------------------------------------------------------
@@ -188,19 +228,15 @@ class TestBlockFormatting:
 class TestRobustness:
 
     def test_empty_elements_is_noop(self):
-        d = bc.compute_coverage_decision(set(), basis="6-31G(d,p)")
+        d = bc.compute_coverage_decision(set(), base_basis="6-31G(d,p)")
         assert not d.has_supplementation
-        assert not d.has_tier2
+        assert not d.has_relativistic_treatment
 
     def test_supplement_basis_uncovered_emits_warning(self):
-        """If user picks a supplement basis that doesn't cover the
-        heavies they're being routed to, warn loudly."""
-        # pcJ-2 doesn't cover Br, so using it as a supplement basis
-        # for Br would fail at ORCA read time.
         d = bc.compute_coverage_decision(
             {"H", "C", "Br"},
-            basis="pcS-2",          # base also doesn't cover Br
-            supplement_basis="pcJ-2",  # supplement also doesn't cover Br
+            base_basis="pcS-2",
+            heavy_atom_basis="pcJ-2",   # also doesn't cover Br
         )
         assert d.supplemented_elements == ["Br"]
         assert any("does not cover" in w for w in d.warnings)
@@ -221,8 +257,6 @@ class TestXyzScan:
         assert elements == {"C", "H", "Br"}
 
     def test_scan_skips_header_and_numerics(self, tmp_path: Path):
-        """Atom-count header line and numeric tokens shouldn't be
-        misread as element symbols."""
         xyz = tmp_path / "mol.xyz"
         xyz.write_text(
             "2\n"
@@ -231,7 +265,6 @@ class TestXyzScan:
             "H  1.0  0.0  0.0\n"
         )
         elements = bc.scan_elements_from_xyz_paths([xyz])
-        # No bogus "2" or numeric atoms picked up.
         assert elements == {"C", "H"}
 
     def test_scan_handles_missing_file(self, tmp_path: Path):
@@ -239,8 +272,6 @@ class TestXyzScan:
         assert elements == set()
 
     def test_scan_caps_at_max_files(self, tmp_path: Path):
-        """Scanning a huge ensemble should not read every file —
-        element composition is invariant across conformers."""
         for i in range(10):
             xyz = tmp_path / f"conf_{i}.xyz"
             xyz.write_text(
@@ -250,7 +281,6 @@ class TestXyzScan:
             )
         paths = sorted(tmp_path.glob("*.xyz"))
         elements = bc.scan_elements_from_xyz_paths(paths, max_files=3)
-        # Only first 3 files scanned — they all have C, never Br.
         assert elements == {"C"}
 
 
@@ -260,28 +290,30 @@ class TestXyzScan:
 
 
 @pytest.mark.parametrize(
-    "basis,elements,expects_supplement,expects_tier2",
+    "basis,elements,expect_supp,expect_zora",
     [
         # Organic baseline — no-ops.
         ("6-31G(d,p)",     {"H", "C", "N", "O"},      False, False),
         ("6-311++G(2d,p)", {"H", "C", "N", "O", "F"}, False, False),
         ("pcJ-2",          {"H", "C", "F", "P"},      False, False),
-        # Tier 1 supplementation cases — the original bug Lucas hit.
+        # Tier 1 supplementation cases.
         ("pcJ-2",          {"H", "C", "Br"},          True,  False),
         ("pcJ-2",          {"H", "C", "I"},           True,  False),
         ("6-311++G(2d,p)", {"H", "C", "Br"},          True,  False),
         ("6-311++G(2d,p)", {"H", "C", "Se"},          True,  False),
-        # Tier 2 cases — must be flagged for profile escalation.
+        # Tier 2 — full swap.
         ("6-31G(d,p)",     {"H", "C", "Pd"},          False, True),
         ("pcJ-2",          {"H", "C", "Pt"},          False, True),
         ("pcJ-2",          {"H", "C", "Rh"},          False, True),
-        # Relativistic basis — covers everything we care about.
-        ("def2-ZORA-TZVPP", {"H", "C", "Pd"},         False, False),
-        ("def2-ZORA-TZVPP", {"H", "C", "Pt", "Br"},   False, False),
-        ("def2-TZVPP",      {"H", "C", "Pd"},         False, False),
+        ("6-31G(d,p)",     {"H", "C", "Eu"},          False, True),
+        # Tier 2 subsumes Tier 1.
+        ("pcJ-2",          {"H", "C", "Br", "Pd"},    False, True),
+        # Relativistic basis already → no-op.
+        ("def2-ZORA-TZVPP", {"H", "C", "Pd"},         False, True),
+        ("def2-TZVPP",      {"H", "C", "Pd"},         False, True),
     ],
 )
-def test_coverage_matrix(basis, elements, expects_supplement, expects_tier2):
-    d = bc.compute_coverage_decision(elements, basis=basis)
-    assert d.has_supplementation == expects_supplement
-    assert d.has_tier2 == expects_tier2
+def test_coverage_matrix(basis, elements, expect_supp, expect_zora):
+    d = bc.compute_coverage_decision(elements, base_basis=basis)
+    assert d.has_supplementation == expect_supp, d
+    assert d.has_relativistic_treatment == expect_zora, d
